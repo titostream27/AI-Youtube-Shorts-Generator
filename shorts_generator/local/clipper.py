@@ -39,7 +39,18 @@ def _cut_subclip(source_path: str, start: float, end: float, out_path: str) -> s
 
 
 def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
-    """Crop the cut clip to the target aspect ratio, tracking faces if possible."""
+    """Crop the cut clip to the target aspect ratio, tracking faces if possible.
+
+    Face tracking is DUAL-MODE: YuNet (ONNX DNN, stable) is tried first per
+    frame; Haar cascades are the fallback when YuNet fails to load or returns
+    no faces. Detections go through anti-shake post-processing so the crop
+    window glides smoothly instead of shaking:
+      - median of recent detection history (kills single-frame outliers)
+      - motion-adaptive EMA (slow when the face is still, fast when it moves)
+      - dead-zone (ignore sub-threshold movement -> no micro-jitter)
+      - hold on miss (keep last center when no face is found), with a gentle
+        drift back to frame center after a long absence instead of a snap.
+    """
     try:
         import cv2  # type: ignore
     except ImportError as e:
@@ -67,40 +78,215 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
     crop_w = max(2, crop_w - (crop_w % 2))
     crop_h = max(2, crop_h - (crop_h % 2))
 
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    # ------------------------------------------------------------------
+    # Dual-mode face tracker
+    # ------------------------------------------------------------------
+    tracker_mode = os.getenv("RENDER_FACE_MODE", "dual").lower()  # dual|yunet|haar|off
+    lip_detect = os.getenv("RENDER_LIP_DETECT", "1") != "0"       # 0 disables
+
+    # YuNet DNN detector (primary). Model ships locally next to this file.
+    yunet = None
+    if tracker_mode in ("dual", "yunet"):
+        try:
+            model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "face_detection_yunet_2023mar.onnx")
+            if os.path.exists(model_path):
+                yunet = cv2.FaceDetectorYN.create(model_path, "", (src_w, src_h), 0.6, 0.3, 5000)
+        except Exception:
+            yunet = None
+
+    # Haar cascade (fallback / explicit mode).
+    haar = None
+    if tracker_mode in ("dual", "haar"):
+        try:
+            haar = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        except Exception:
+            haar = None
+
+    last_center: Optional[Tuple[float, float]] = None   # smoothed center
+    history: List[Tuple[float, float]] = []             # recent raw detections
+    HISTORY_N = 7
+    DEAD_ZONE = 6.0          # px; ignore movement below this (anti micro-jitter)
+    MAX_ALPHA = 0.45         # EMA weight when the face moves fast
+    MIN_ALPHA = 0.08         # EMA weight when the face is nearly still
+    HOLD_FRAMES = int(fps * 1.2)   # how long to hold on a missed detection
+    DRIFT_ALPHA = 0.03       # gentle drift toward center after long absence
+    miss_count = 0
+    prev_det: Optional[Tuple[float, float]] = None
+
+    # Lip-movement speaker selection state (only used when lip_detect is on
+    # and YuNet landmarks are available).
+    prev_gray = None
+    face_tracks: List[Dict] = []   # [{cx, cy, score, idx}] from previous frame
+    speaker_id: Optional[int] = None
+    speaker_pos: Optional[Tuple[float, float]] = None
+    speaker_conf = 0.0
+    SWITCH_FACTOR = 1.35      # new face must beat current speaker by this much
+    SCORE_EMA = 0.8           # how much history weighs vs current frame activity
+
+    def _detect_yunet_faces(frame) -> Optional[List[Dict]]:
+        """Return ALL YuNet faces: {cx, cy, w, h, lm:[(x,y)*5]}.
+
+        YuNet row layout: [x, y, w, h, rightEye, leftEye, nose,
+        rightMouth, leftMouth, score] — landmarks at cols 4..13.
+        """
+        if yunet is None:
+            return None
+        try:
+            yunet.setInputSize((src_w, src_h))
+            _, faces = yunet.detect(frame)
+            if faces is None or len(faces) == 0:
+                return None
+            out: List[Dict] = []
+            for f in faces:
+                x, y, w, h = float(f[0]), float(f[1]), float(f[2]), float(f[3])
+                lm = [
+                    (float(f[4]), float(f[5])),   # right eye
+                    (float(f[6]), float(f[7])),   # left eye
+                    (float(f[8]), float(f[9])),   # nose
+                    (float(f[10]), float(f[11])), # right mouth corner
+                    (float(f[12]), float(f[13])), # left mouth corner
+                ]
+                out.append({"cx": x + w / 2, "cy": y + h / 2, "w": w, "h": h, "lm": lm})
+            return out
+        except Exception:
+            return None
+
+    def _mouth_activity(gray, face: Dict) -> float:
+        """Mean abs diff in the mouth ROI between this frame and the previous.
+
+        Uses YuNet mouth-corner landmarks to define a box around the mouth;
+        lips moving (speaking) produce a high diff, a still face ~0.
+        """
+        if prev_gray is None:
+            return 0.0
+        (mx1, my1), (mx2, my2) = face["lm"][3], face["lm"][4]
+        cx = (mx1 + mx2) / 2
+        cy = (my1 + my2) / 2
+        d = ((mx2 - mx1) ** 2 + (my2 - my1) ** 2) ** 0.5
+        if d < 4:
+            return 0.0
+        roi_w = max(8, int(d * 1.6))
+        roi_h = max(6, int(d * 0.8))
+        x0 = max(0, min(src_w - roi_w, int(cx - roi_w / 2)))
+        y0 = max(0, min(src_h - roi_h, int(cy - roi_h / 2)))
+        cur = gray[y0:y0 + roi_h, x0:x0 + roi_w]
+        prev = prev_gray[y0:y0 + roi_h, x0:x0 + roi_w]
+        if cur.shape != prev.shape:
+            return 0.0
+        return float(cv2.absdiff(cur, prev).mean())
+
+    def _pick_speaker(frame) -> Optional[Tuple[float, float]]:
+        """Choose the face to track. Lip detection picks the active speaker;
+        without it (or when YuNet is unavailable) we fall back to the largest
+        face. Returns the detection center or None."""
+        nonlocal prev_gray, face_tracks, speaker_id, speaker_pos, speaker_conf
+        faces = _detect_yunet_faces(frame) if tracker_mode in ("dual", "yunet") else None
+
+        if faces and lip_detect:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            new_tracks: List[Dict] = []
+            used = [False] * len(face_tracks)
+            for fi, face in enumerate(faces):
+                act = _mouth_activity(gray, face)
+                # Match to nearest previous track so activity carries over.
+                best_j, best_d = -1, 80.0
+                for j, tr in enumerate(face_tracks):
+                    if used[j]:
+                        continue
+                    d = ((tr["cx"] - face["cx"]) ** 2 + (tr["cy"] - face["cy"]) ** 2) ** 0.5
+                    if d < best_d:
+                        best_d, best_j = d, j
+                if best_j >= 0:
+                    used[best_j] = True
+                    score = face_tracks[best_j]["score"] * SCORE_EMA + act * (1 - SCORE_EMA)
+                else:
+                    score = act
+                new_tracks.append({"cx": face["cx"], "cy": face["cy"], "score": score, "idx": fi})
+
+            best = max(new_tracks, key=lambda t: t["score"])
+            # Hysteresis: only switch speakers when the newcomer clearly beats
+            # the current speaker; otherwise keep whoever we were following.
+            if speaker_id is not None and best["score"] < speaker_conf * SWITCH_FACTOR:
+                sp = next((t for t in new_tracks if t["idx"] == speaker_id), None)
+                if sp is None and speaker_pos is not None:
+                    sp = min(new_tracks, key=lambda t: (t["cx"] - speaker_pos[0]) ** 2 + (t["cy"] - speaker_pos[1]) ** 2)
+                if sp is not None:
+                    best = sp
+            speaker_track = best
+            speaker_id = speaker_track["idx"]
+            speaker_pos = (speaker_track["cx"], speaker_track["cy"])
+            speaker_conf = speaker_track["score"]
+            face_tracks = new_tracks
+            prev_gray = gray
+            return speaker_pos
+
+        if faces:
+            # No lip detection: pick the largest face (speaker heuristic).
+            face = max(faces, key=lambda f: f["w"] * f["h"])
+            return (face["cx"], face["cy"])
+
+        # Fallback: Haar cascade (no landmarks).
+        if tracker_mode in ("dual", "haar") and haar is not None:
+            try:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                hfaces = haar.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+                if len(hfaces) > 0:
+                    x, y, w, h = max(hfaces, key=lambda f: f[2] * f[3])
+                    return (x + w / 2, y + h / 2)
+            except Exception:
+                pass
+        return None
 
     silent_path = out_path + ".silent.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(silent_path, fourcc, fps, (crop_w, crop_h))
 
-    last_center: Optional[Tuple[int, int]] = None
-    smoothing = 0.15  # how aggressively to chase a new face position
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
-        if len(faces) > 0:
-            # Pick the largest face — usually the speaker.
-            x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-            cx = x + w // 2
-            cy = y + h // 2
+        det = _pick_speaker(frame)
+
+        if det is not None:
+            # Anti-shake stage 1: median of recent detections (kills outliers).
+            history.append(det)
+            if len(history) > HISTORY_N:
+                history.pop(0)
+            mcx = sorted(p[0] for p in history)[len(history) // 2]
+            mcy = sorted(p[1] for p in history)[len(history) // 2]
+            det = (float(mcx), float(mcy))
+
+            # Anti-shake stage 2: motion-adaptive EMA + dead-zone.
             if last_center is None:
-                last_center = (cx, cy)
+                last_center = det
             else:
-                lx, ly = last_center
-                last_center = (
-                    int(lx + (cx - lx) * smoothing),
-                    int(ly + (cy - ly) * smoothing),
-                )
+                dx = det[0] - last_center[0]
+                dy = det[1] - last_center[1]
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist > DEAD_ZONE:
+                    speed = dist
+                    if prev_det is not None:
+                        speed = min(dist + 1.0, ((prev_det[0] - det[0]) ** 2 + (prev_det[1] - det[1]) ** 2) ** 0.5 + dist)
+                    alpha = min(MAX_ALPHA, MIN_ALPHA + speed / 120.0)
+                    last_center = (last_center[0] + dx * alpha, last_center[1] + dy * alpha)
+            prev_det = det
+            miss_count = 0
+        else:
+            # No face this frame: hold last position; drift toward center only
+            # after a long absence so the camera doesn't snap around.
+            miss_count += 1
+            if last_center is not None and miss_count > HOLD_FRAMES:
+                cx0, cy0 = last_center
+                tx, ty = src_w / 2.0, src_h / 2.0
+                last_center = (cx0 + (tx - cx0) * DRIFT_ALPHA, cy0 + (ty - cy0) * DRIFT_ALPHA)
+
         if last_center is None:
-            last_center = (src_w // 2, src_h // 2)
+            last_center = (src_w / 2.0, src_h / 2.0)
 
         cx, cy = last_center
-        x0 = max(0, min(src_w - crop_w, cx - crop_w // 2))
-        y0 = max(0, min(src_h - crop_h, cy - crop_h // 2))
+        x0 = int(max(0, min(src_w - crop_w, cx - crop_w / 2)))
+        y0 = int(max(0, min(src_h - crop_h, cy - crop_h / 2)))
         cropped = frame[y0:y0 + crop_h, x0:x0 + crop_w]
         writer.write(cropped)
 
