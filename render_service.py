@@ -49,11 +49,25 @@ async def strip_path_prefix(request: Request, call_next):
     return await call_next(request)
 
 
-class CaptionRequest(BaseModel):
-    """A caption line in ABSOLUTE video coordinates (seconds from video start)."""
+class CaptionWord(BaseModel):
+    """A single word with precise timing (faster-whisper word timestamps)."""
     start_sec: float
     end_sec: float
     text: str
+
+
+class CaptionRequest(BaseModel):
+    """A caption line in ABSOLUTE video coordinates (seconds from video start).
+
+    `words` is optional: when present it carries per-word timestamps from
+    faster-whisper so the karaoke reveal matches the actual speech rhythm.
+    When absent, the render service falls back to evenly distributing the
+    line's span across its words.
+    """
+    start_sec: float
+    end_sec: float
+    text: str
+    words: List[CaptionWord] = Field(default_factory=list)
 
 
 class ClipRequest(BaseModel):
@@ -163,7 +177,7 @@ CAPTION_HOLD_MS = int(os.getenv("RENDER_CAPTION_HOLD_MS", "400"))
 # the BOTTOM. Lower value = higher on screen. Many source videos carry their
 # own burned-in lower-third text/watermarks, so the default sits in the lower-
 # middle area rather than hugging the bottom edge.
-CAPTION_BOTTOM_MARGIN = float(os.getenv("RENDER_CAPTION_BOTTOM_MARGIN", "0.22"))
+CAPTION_BOTTOM_MARGIN = float(os.getenv("RENDER_CAPTION_BOTTOM_MARGIN", "0.18"))
 
 
 def _word_events(captions: List[CaptionRequest], clip_start: float) -> List[Dict]:
@@ -233,10 +247,10 @@ def _normalize_cues(captions: List[CaptionRequest], clip_start: float) -> List[D
     shows two caption lines at once. This merges overlapping cues so exactly
     one line is on screen at any moment.
 
-    Each word keeps its OWN timing: within its source cue the cue's span is
-    distributed across its words. Merging only groups words into the same
-    visual line — it does NOT re-average timing across the merged span, which
-    would make captions drift from the actual speech.
+    Each word keeps its OWN timing. When the caption carries whisper word
+    timestamps (`words`), those precise timings are used — the karaoke reveal
+    then matches the actual speech rhythm. Otherwise the cue's span is
+    distributed evenly across its words as a fallback.
 
     Returns lines with: words (each with start/end in local coords), start, end.
     """
@@ -251,17 +265,25 @@ def _normalize_cues(captions: List[CaptionRequest], clip_start: float) -> List[D
         words = text.split()
         if not words:
             continue
+
+        # Prefer whisper word timestamps when present (absolute video coords).
+        word_times: Optional[List[Tuple[float, float]]] = None
+        if cap.words and len(cap.words) == len(words):
+            word_times = [
+                (max(w.start_sec, s), min(w.end_sec, e))
+                for w in cap.words
+            ]
+
         # If the cue started BEFORE the clip window, drop the words that were
-        # spoken before the clip. Without word-level timing we estimate by
-        # proportion: the fraction of the cue inside the clip determines how
-        # many trailing words are kept. This prevents half-sentences from the
-        # previous scene leaking into the start of the clip.
+        # spoken before the clip (also drop their timestamps).
         if s < clip_start:
             inside_frac = (e - clip_start) / max(e - s, 0.05)
             keep = max(1, int(round(len(words) * inside_frac)))
             words = words[-keep:] if keep < len(words) else words
+            if word_times is not None:
+                word_times = word_times[-keep:] if keep < len(word_times) else word_times
             s = clip_start
-        cues.append({"s": s, "e": e, "words": words})
+        cues.append({"s": s, "e": e, "words": words, "word_times": word_times})
 
     if not cues:
         return []
@@ -286,23 +308,37 @@ def _normalize_cues(captions: List[CaptionRequest], clip_start: float) -> List[D
             continue
 
         # Flatten all words in speech order (the merged line's concatenation).
+        # When whisper word timestamps are available they are used verbatim
+        # (shifted to local coords) so the reveal matches real speech rhythm;
+        # otherwise the merged span is distributed evenly as a fallback.
         word_items: List[Dict] = []
+        has_times = all(cue.get("word_times") is not None for cue in m["cues"])
         for cue in m["cues"]:
-            for word in cue["words"]:
-                word_items.append({"word": word})
+            times = cue.get("word_times")
+            for i, word in enumerate(cue["words"]):
+                if has_times and times is not None and i < len(times):
+                    ws, we = times[i]
+                    word_items.append({
+                        "word": word,
+                        "start": max(0.0, ws - clip_start),
+                        "end": max(0.0, we - clip_start),
+                    })
+                else:
+                    word_items.append({"word": word})
 
         if not word_items:
             continue
 
-        # Monotonic timing: distribute the MERGED span evenly across all words
-        # in order. Overlapping ASR cues share time, so per-cue timing would
-        # interleave words out of order (random-looking reveal). Flat, ordered
-        # timing keeps the reveal strictly left-to-right.
-        span = max(local_end - local_start, 0.05)
-        per_word = span / len(word_items)
-        for i, wi in enumerate(word_items):
-            wi["start"] = local_start + i * per_word
-            wi["end"] = local_start + (i + 1) * per_word
+        if not has_times:
+            # Monotonic timing fallback: distribute the MERGED span evenly
+            # across all words in order. Overlapping ASR cues share time, so
+            # per-cue timing would interleave words out of order (random-looking
+            # reveal). Flat, ordered timing keeps the reveal left-to-right.
+            span = max(local_end - local_start, 0.05)
+            per_word = span / len(word_items)
+            for i, wi in enumerate(word_items):
+                wi["start"] = local_start + i * per_word
+                wi["end"] = local_start + (i + 1) * per_word
 
         lines.append({
             "words": word_items,
@@ -310,6 +346,89 @@ def _normalize_cues(captions: List[CaptionRequest], clip_start: float) -> List[D
             "end": local_end,
         })
     return lines
+
+
+WHISPER_MODEL = os.getenv("RENDER_WHISPER_MODEL", "base")
+WHISPER_DEVICE = os.getenv("RENDER_WHISPER_DEVICE", "cpu")
+_whisper_model = None
+
+
+def _get_whisper_model():
+    """Lazily load the faster-whisper model once per process."""
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        _whisper_model = WhisperModel(
+            WHISPER_MODEL, device=WHISPER_DEVICE, compute_type="int8"
+        )
+    return _whisper_model
+
+
+def _transcribe_with_whisper(
+    source_path: str,
+    clip_start: float,
+    clip_end: float,
+    work_dir: str,
+) -> List[CaptionRequest]:
+    """Transcribe the clip window with faster-whisper word timestamps.
+
+    Extracts the clip's audio (ffmpeg), runs faster-whisper with
+    word_timestamps=True, and returns one CaptionRequest per whisper segment.
+    Each word carries its precise start/end (absolute video coords) so the
+    karaoke reveal matches the actual speech rhythm — not an even estimate.
+
+    Whisper segments are natural utterance boundaries, so a second speaker
+    becomes its own segment -> its own caption line, instead of being merged
+    into the first speaker's line.
+    """
+    import subprocess as sp
+
+    audio_path = os.path.join(work_dir, "clip_audio.wav")
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-ss", f"{clip_start:.3f}",
+        "-i", source_path,
+        "-to", f"{max(clip_end - clip_start, 0.05):.3f}",
+        "-vn", "-ac", "1", "-ar", "16000",
+        audio_path,
+    ]
+    sp.run(cmd, check=True)
+
+    model = _get_whisper_model()
+    segments, _info = model.transcribe(
+        audio_path,
+        language="en",
+        word_timestamps=True,
+        vad_filter=True,
+        beam_size=5,
+    )
+
+    captions: List[CaptionRequest] = []
+    for seg in segments:
+        text = " ".join(seg.text.split()).strip()
+        if not text:
+            continue
+        words: List[CaptionWord] = []
+        for w in (seg.words or []):
+            wt = " ".join(w.word.split()).strip()
+            if wt:
+                words.append(CaptionWord(
+                    start_sec=clip_start + float(w.start),
+                    end_sec=clip_start + float(w.end),
+                    text=wt,
+                ))
+        captions.append(CaptionRequest(
+            start_sec=clip_start + float(seg.start),
+            end_sec=clip_start + float(seg.end),
+            text=text,
+            words=words,
+        ))
+
+    try:
+        os.remove(audio_path)
+    except OSError:
+        pass
+    return captions
 
 
 def _burn_karaoke_captions(
@@ -518,17 +637,34 @@ def _render(request: RenderRequest) -> RenderResponse:
             )
 
             if c.captions:
-                burned = _burn_karaoke_captions(
-                    out_path,
-                    c.captions,
-                    float(c.start_sec),
-                    out_path,
-                    job_dir,
-                )
-                if burned > 0:
-                    item["caption_lines"] = burned
-                else:
-                    print(f"[render] clip {i}: no captions inside window, skipping burn", flush=True)
+                # Phase 4: transcribe the clip with faster-whisper for precise
+                # word-level timing (karaoke reveal syncs to real speech) and
+                # natural segment boundaries (each speaker = own line). Fall
+                # back to the miner's ASR cues if transcription fails.
+                try:
+                    transcript_captions = _transcribe_with_whisper(
+                        source,
+                        float(c.start_sec),
+                        float(c.end_sec),
+                        job_dir,
+                    )
+                    print(f"[render] clip {i}: whisper -> {len(transcript_captions)} segments", flush=True)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[render] clip {i}: whisper failed ({e}), using ASR cues", flush=True)
+                    transcript_captions = c.captions
+
+                if transcript_captions:
+                    burned = _burn_karaoke_captions(
+                        out_path,
+                        transcript_captions,
+                        float(c.start_sec),
+                        out_path,
+                        job_dir,
+                    )
+                    if burned > 0:
+                        item["caption_lines"] = burned
+                    else:
+                        print(f"[render] clip {i}: no captions inside window, skipping burn", flush=True)
 
             item["status"] = "ok"
             item["clip_path"] = os.path.abspath(out_path)
