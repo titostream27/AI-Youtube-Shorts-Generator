@@ -1259,10 +1259,38 @@ def _render(request: RenderRequest) -> RenderResponse:
     )
 
 
+# Serial render queue: only ONE render job runs at a time. Concurrent
+# requests (e.g. batch render-all + a manual re-render) would otherwise start
+# parallel downloads/encodes and overload the CPU/disk — the exact failure we
+# saw. The lock serializes them; waiters simply block until their turn.
+_render_lock = threading.Lock()
+_render_busy = False
+
+
+@app.get("/api/render/status")
+def render_status():
+    """Report whether a render job is currently running (queue status)."""
+    return {"busy": _render_busy}
+
+
 @app.post("/api/render", response_model=RenderResponse)
 def render(request: RenderRequest):
-    """Render clips synchronously. Long videos download first — poll client-side."""
-    return _render(request)
+    """Render clips synchronously. Long videos download first — poll client-side.
+
+    Serialized by a process-wide lock so concurrent render requests never run
+    in parallel (downloads of multi-hundred-MB sources and OpenCV encodes are
+    CPU/disk heavy; parallelism just slows everything down and crashes).
+    """
+    global _render_busy
+    # Block until the current job finishes (true FIFO queue) — a 503 timeout
+    # would just push the error back to the client, not serialize the work.
+    _render_lock.acquire()
+    _render_busy = True
+    try:
+        return _render(request)
+    finally:
+        _render_busy = False
+        _render_lock.release()
 
 
 if __name__ == "__main__":

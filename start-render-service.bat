@@ -10,5 +10,6 @@ set RENDER_PATH_PREFIX=short
 set RENDER_FACE_ZOOM=0.6
 set RENDER_FORMAT=1080
 set HF_HUB_OFFLINE=1
+set PYTHONIOENCODING=utf-8
 
 ".venv\Scripts\python.exe" render_service.py >> D:\homelab\hermes-workspace\AI-Youtube-Shorts-Generator\render-service.log 2>&1

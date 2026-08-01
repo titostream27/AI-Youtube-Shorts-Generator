@@ -93,10 +93,31 @@ def _resolve_local_path(source: str) -> Optional[str]:
 
 
 def _existing_download(out_dir: str, video_id: str) -> Optional[str]:
-    """Return a cached download path if we already have this YouTube id."""
-    for ext in (".mp4", ".mkv", ".webm"):
-        candidate = os.path.join(out_dir, f"source_{video_id}{ext}")
-        if os.path.exists(candidate):
+    """Return a cached download path if we already have this YouTube id.
+
+    Only considers the MERGED file (source_<id>.mp4). A leftover stream file
+    like source_<id>.f399.mp4 is a partial bestvideo-only download that never
+    merged with audio — treating it as a cache hit yields silent videos.
+    """
+    candidate = os.path.join(out_dir, f"source_{video_id}.mp4")
+    if os.path.exists(candidate):
+        # Extra safety: reject a merged file that somehow has no audio stream.
+        try:
+            import subprocess
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", candidate],
+                capture_output=True, text=True, timeout=20,
+            )
+            if probe.returncode == 0 and probe.stdout.strip():
+                return candidate
+            # No audio stream — remove the broken cache so we re-download.
+            try:
+                os.remove(candidate)
+            except OSError:
+                pass
+            print(f"[download/local] cached file has no audio, removing: {candidate}", flush=True)
+        except Exception:  # noqa: BLE001
             return candidate
     return None
 
@@ -119,7 +140,7 @@ def download_youtube_local(video_url: str, fmt: str = "720", out_dir: Optional[s
             print(f"[download/local] reusing cached download: {cached}", flush=True)
             return cached
 
-    print(f"[download/local] {video_url} @ {fmt}p → {out_dir}/", flush=True)
+    print(f"[download/local] {video_url} @ {fmt}p -> {out_dir}/", flush=True)
     ydl_opts = {
         "format": _format_for(fmt),
         "outtmpl": os.path.join(out_dir, "source_%(id)s.%(ext)s"),
