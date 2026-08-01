@@ -24,12 +24,18 @@ def _ratio(aspect_ratio: str) -> float:
 
 
 def _cut_subclip(source_path: str, start: float, end: float, out_path: str) -> str:
-    """ffmpeg -ss start -to end → re-encoded mp4 with audio."""
+    """ffmpeg -ss start -to end → re-encoded mp4 with audio.
+
+    `-ss` is placed BEFORE `-i` so ffmpeg fast-seeks to the start instead of
+    decoding from the beginning of the source. For long source videos (90+
+    minutes) output-seeking can take many minutes just to reach the clip
+    window; input-seeking makes the cut start almost instantly.
+    """
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
-        "-i", source_path,
         "-ss", f"{start:.3f}",
-        "-to", f"{end:.3f}",
+        "-i", source_path,
+        "-to", f"{end - start:.3f}",
         "-c:v", "libx264", "-preset", "fast", "-crf", "20",
         "-c:a", "aac", "-b:a", "128k",
         out_path,
