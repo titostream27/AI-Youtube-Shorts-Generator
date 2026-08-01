@@ -24,14 +24,23 @@ def _import_ytdlp():
 
 
 def _format_for(fmt: str) -> str:
-    """Map our '720' / '1080' shorthand to a yt-dlp format selector."""
+    """Map our '720' / '1080' shorthand to a yt-dlp format selector.
+
+    Ordered fallbacks: prefer separate video+audio streams (best quality),
+    then progressive single-file formats (mp4 18/22), then anything.
+    YouTube's anti-bot layer intermittently refuses the separate-stream
+    URLs with HTTP 403 while the progressive formats still work, so the
+    fallback chain matters for reliability, not just quality.
+    """
     try:
         height = int(fmt)
     except ValueError:
         height = 720
     return (
         f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
-        f"best[height<={height}][ext=mp4]/best"
+        f"best[height<={height}][ext=mp4]/"
+        f"best[height<={height}]/"
+        f"18/best"
     )
 
 
