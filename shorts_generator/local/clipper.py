@@ -8,6 +8,7 @@ Two stages per highlight:
 """
 import os
 import subprocess
+import time
 from typing import Dict, List, Optional, Tuple
 
 from ..config import LOCAL_OUTPUT_DIR
@@ -105,6 +106,12 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
 
     cap.release()
     writer.release()
+    # Windows keeps the file handle alive until the cv2 objects are garbage
+    # collected — release references explicitly before any os.remove() below.
+    del cap
+    del writer
+    import gc
+    gc.collect()
 
     # Mux audio from the cut clip back onto the silent reframed video.
     cmd = [
@@ -136,7 +143,13 @@ def crop_clip_local(
         _reframe_vertical(cut_path, out_path, aspect_ratio)
     finally:
         if os.path.exists(cut_path):
-            os.remove(cut_path)
+            # Retry — Windows can briefly hold the handle (AV/scan/indexers).
+            for _attempt in range(5):
+                try:
+                    os.remove(cut_path)
+                    break
+                except PermissionError:
+                    time.sleep(0.5)
     return out_path
 
 
