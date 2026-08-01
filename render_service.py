@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -76,6 +76,10 @@ class ClipRequest(BaseModel):
     start_sec: float
     end_sec: float
     captions: List[CaptionRequest] = Field(default_factory=list)
+    # Phase 5: attention-grabbing hook line for the intro scene. When present
+    # the render service prepends a ~2-3s intro (first frame + hook text +
+    # Edge-TTS voiceover) before the actual content.
+    hook: str = ""
 
 
 class RenderRequest(BaseModel):
@@ -178,6 +182,18 @@ CAPTION_HOLD_MS = int(os.getenv("RENDER_CAPTION_HOLD_MS", "400"))
 # own burned-in lower-third text/watermarks, so the default sits in the lower-
 # middle area rather than hugging the bottom edge.
 CAPTION_BOTTOM_MARGIN = float(os.getenv("RENDER_CAPTION_BOTTOM_MARGIN", "0.18"))
+
+# Phase 5: hook intro scene. When a clip carries a hook line we prepend a
+# short intro: first frame of the clip, darkened, with the hook rendered large
+# and read aloud by an Edge-TTS voice. Duration = the voiceover length (we let
+# TTS set it, but clamp to sane bounds).
+HOOK_ENABLED = os.getenv("RENDER_HOOK_ENABLED", "1") != "0"
+HOOK_TTS_VOICE = os.getenv("RENDER_HOOK_TTS_VOICE", "en-US-AvaNeural")
+HOOK_TTS_RATE = os.getenv("RENDER_HOOK_TTS_RATE", "-5%")
+HOOK_MAX_SEC = float(os.getenv("RENDER_HOOK_MAX_SEC", "6.0"))
+HOOK_MIN_SEC = float(os.getenv("RENDER_HOOK_MIN_SEC", "1.5"))
+HOOK_DIM_ALPHA = float(os.getenv("RENDER_HOOK_DIM_ALPHA", "0.55"))  # black overlay
+HOOK_FONT_SCALE = float(os.getenv("RENDER_HOOK_FONT_SCALE", "0.055"))  # of frame height
 
 
 def _word_events(captions: List[CaptionRequest], clip_start: float) -> List[Dict]:
@@ -595,6 +611,128 @@ def _burn_karaoke_captions(
     return len(lines)
 
 
+def _build_hook_intro(video_path: str, hook: str, work_dir: str) -> Optional[str]:
+    """Build the hook intro video (frame + dim + hook text + TTS voiceover).
+
+    Returns the path to an mp4 (video + voiceover audio) or None if the hook
+    is empty / disabled / a step fails. The intro is prepended to the rendered
+    short; its duration is the voiceover length clamped to [HOOK_MIN_SEC,
+    HOOK_MAX_SEC].
+
+    Pipeline:
+      1. ffmpeg: extract the FIRST frame of the clip at output resolution.
+      2. Pillow: darken the frame, wrap the hook text large and centered.
+      3. Edge-TTS: synthesize the voiceover (mp3).
+      4. ffmpeg: loop the still image for the voiceover duration, mux audio.
+    """
+    hook = " ".join(hook.split()).strip()
+    if not HOOK_ENABLED or not hook:
+        return None
+    import subprocess as sp
+    from PIL import Image, ImageDraw, ImageFont
+
+    # 1. First frame at native size.
+    frame_path = os.path.join(work_dir, "hook_frame.jpg")
+    sp.run([
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", video_path, "-frames:v", "1",
+        frame_path,
+    ], check=True)
+
+    # 2. Darkened frame + wrapped hook text.
+    img = Image.open(frame_path).convert("RGB")
+    w, h = img.size
+    dark = Image.new("RGB", (w, h), (0, 0, 0))
+    img = Image.blend(img, dark, HOOK_DIM_ALPHA)
+    draw = ImageDraw.Draw(img)
+
+    base_size = max(int(h * HOOK_FONT_SCALE), 18)
+    # Eye-catching display font: Anton (Google Fonts, shipped locally) with
+    # fallbacks to Impact / Arial Black / Arial Bold.
+    font_candidates = [
+        "C:/Windows/Fonts/impact.ttf",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "Anton-Regular.ttf"),
+        "C:/Windows/Fonts/ariblk.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+    ]
+    font = None
+    for fp in font_candidates:
+        try:
+            font = ImageFont.truetype(fp, base_size)
+            break
+        except Exception:  # noqa: BLE001
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+
+    # Wrap text: max ~70% width per line, center vertically.
+    max_w = int(w * 0.70)
+    lines: List[str] = []
+    for word in hook.split():
+        if not lines:
+            lines.append(word)
+            continue
+        trial = lines[-1] + " " + word
+        if draw.textlength(trial, font=font) <= max_w:
+            lines[-1] = trial
+        else:
+            lines.append(word)
+    line_h = base_size * 1.25
+    total_h = line_h * len(lines)
+    y = (h - total_h) // 2
+    outline_w = max(3, base_size // 10)  # thick outline for punch
+    for line in lines:
+        lw = draw.textlength(line, font=font)
+        x = (w - lw) // 2
+        # Thick black outline (offset by outline_w in 8 directions) for a bold
+        # shorts-style look that stays readable over any background.
+        for dx in range(-outline_w, outline_w + 1):
+            for dy in range(-outline_w, outline_w + 1):
+                if dx * dx + dy * dy <= outline_w * outline_w:
+                    draw.text((x + dx, y + dy), line, font=font, fill=(0, 0, 0))
+        draw.text((x, y), line, font=font, fill=(255, 255, 255))
+        y += line_h
+    img.save(frame_path, quality=92)
+
+    # 3. Edge-TTS voiceover.
+    audio_path = os.path.join(work_dir, "hook_voice.mp3")
+    try:
+        import asyncio
+        import edge_tts
+        communicate = edge_tts.Communicate(hook, HOOK_TTS_VOICE, rate=HOOK_TTS_RATE)
+        asyncio.run(communicate.save(audio_path))
+    except Exception as e:  # noqa: BLE001
+        print(f"[hook] TTS failed: {e}", flush=True)
+        return None
+
+    # Measure voiceover duration.
+    try:
+        probe = sp.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", audio_path],
+            capture_output=True, text=True, check=True,
+        )
+        dur = float(probe.stdout.strip())
+    except Exception:  # noqa: BLE001
+        dur = 2.5
+    dur = max(HOOK_MIN_SEC, min(dur, HOOK_MAX_SEC))
+
+    # 4. Loop still + mux voiceover. `-t` on both inputs bounds the output;
+    # `-shortest` additionally stops at the shorter stream (edge-tts mp3 can
+    # carry a bloated duration in its header, so never trust its stream length).
+    intro_path = os.path.join(work_dir, "hook_intro.mp4")
+    sp.run([
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-loop", "1", "-t", f"{dur:.3f}", "-i", frame_path,
+        "-i", audio_path,
+        "-vf", "format=yuv420p",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+        "-c:a", "aac", "-b:a", "128k", "-shortest",
+        intro_path,
+    ], check=True)
+    return intro_path
+
+
 def _render(request: RenderRequest) -> RenderResponse:
     job_id = uuid.uuid4().hex[:10]
     job_dir = RENDER_ROOT / job_id
@@ -612,6 +750,7 @@ def _render(request: RenderRequest) -> RenderResponse:
 
     # 2. Render each clip as a vertical short, burning captions if provided.
     from shorts_generator.local.clipper import crop_clip_local
+    import subprocess as sp
 
     start = time.time()
     rendered = []
@@ -669,6 +808,37 @@ def _render(request: RenderRequest) -> RenderResponse:
             item["status"] = "ok"
             item["clip_path"] = os.path.abspath(out_path)
             item["clip_url"] = f"{job_id}/{os.path.basename(out_path)}"
+
+            # Phase 5: prepend the hook intro (frame + dim + hook text + TTS).
+            if c.hook:
+                try:
+                    intro_path = _build_hook_intro(out_path, c.hook, job_dir)
+                    if intro_path:
+                        final_path = os.path.join(job_dir, f"short_{i:02d}_final.mp4")
+                        # Concat intro + content with filter_complex. The plain
+                        # concat demuxer + stream copy produces bloated durations
+                        # (edge-tts AAC metadata + source timestamps), so we
+                        # re-encode both segments onto a clean 42.9s timeline.
+                        sp.run([
+                            "ffmpeg", "-y", "-loglevel", "error",
+                            "-i", intro_path, "-i", out_path,
+                            "-filter_complex",
+                            "[0:v]setpts=PTS-STARTPTS,format=yuv420p[v0];"
+                            "[0:a]aresample=44100,asetpts=PTS-STARTPTS[a0];"
+                            "[1:v]setpts=PTS-STARTPTS,format=yuv420p[v1];"
+                            "[1:a]aresample=44100,asetpts=PTS-STARTPTS[a1];"
+                            "[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]",
+                            "-map", "[v]", "-map", "[a]",
+                            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                            "-profile:v", "high", "-level", "4.0",
+                            "-c:a", "aac", "-b:a", "128k",
+                            final_path,
+                        ], check=True)
+                        os.replace(final_path, out_path)
+                        item["hook"] = c.hook
+                        print(f"[render] clip {i}: hook intro prepended ({c.hook[:50]}...)", flush=True)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[render] clip {i}: hook intro failed ({e}), continuing without it", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[render] clip {i} failed: {e}", flush=True)
             item["error"] = str(e)
