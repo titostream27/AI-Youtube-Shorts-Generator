@@ -367,6 +367,14 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
             last_center = (src_w / 2.0, src_h / 2.0)
 
         cx, cy = last_center
+        # Phase 9: body framing. Instead of centering the crop on the FACE
+        # (which cuts the body at the bottom), shift the anchor DOWN so the
+        # face sits near the TOP third and the body fills the lower two thirds
+        # — the "head-and-shoulders / half body" framing used by viral Shorts.
+        # RENDER_BODY_ANCHOR = desired face position as a fraction of crop
+        # height from the top (0.25 = face at 25% of frame height).
+        body_anchor = float(os.getenv("RENDER_BODY_ANCHOR", "0.28"))
+        cx, cy = last_center
         # RENDER_FACE_ZOOM < 1.0 zooms out: crop a LARGER window around the
         # subject (more context) and scale it back down to the target size.
         # This keeps the whole face + surroundings visible instead of a tight
@@ -375,15 +383,19 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
             z = 1.0 / RENDER_FACE_ZOOM
             crop_w_z = min(src_w, int(crop_w * z))
             crop_h_z = min(src_h, int(crop_h * z))
+            # Center the window on the body anchor: face at body_anchor of the
+            # crop height, i.e. window center = cy + (0.5 - body_anchor) * h.
+            anchor_y = cy + (0.5 - body_anchor) * crop_h_z
             x0 = int(max(0, min(src_w - crop_w_z, cx - crop_w_z / 2)))
-            y0 = int(max(0, min(src_h - crop_h_z, cy - crop_h_z / 2)))
+            y0 = int(max(0, min(src_h - crop_h_z, anchor_y - crop_h_z / 2)))
             window = frame[y0:y0 + crop_h_z, x0:x0 + crop_w_z]
             if window.shape[1] != crop_w or window.shape[0] != crop_h:
                 window = cv2.resize(window, (crop_w, crop_h), interpolation=cv2.INTER_AREA)
             cropped = window
         else:
+            anchor_y = cy + (0.5 - body_anchor) * crop_h
             x0 = int(max(0, min(src_w - crop_w, cx - crop_w / 2)))
-            y0 = int(max(0, min(src_h - crop_h, cy - crop_h / 2)))
+            y0 = int(max(0, min(src_h - crop_h, anchor_y - crop_h / 2)))
             cropped = frame[y0:y0 + crop_h, x0:x0 + crop_w]
         writer.write(cropped)
 

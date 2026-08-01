@@ -108,7 +108,9 @@ def serve_file(job_id: str, filename: str):
     """Serve a rendered short so the miner UI can link / play it directly.
 
     Path traversal guard: both segments must be plain names, and the resolved
-    path must stay inside the render root.
+    path must stay inside the render root. Media type is derived from the
+    extension (mp4 -> video/mp4, jpg/png -> image/*) so browsers render
+    thumbnails correctly instead of treating them as video.
     """
     if not job_id or not filename or "/" in filename or "\\" in filename:
         raise HTTPException(status_code=400, detail="invalid file path")
@@ -116,7 +118,14 @@ def serve_file(job_id: str, filename: str):
     root = RENDER_ROOT.resolve()
     if not path.is_relative_to(root) or not path.is_file():
         raise HTTPException(status_code=404, detail="file not found")
-    return FileResponse(path, media_type="video/mp4")
+    ext = path.suffix.lower()
+    media_type = {
+        ".mp4": "video/mp4",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+    }.get(ext, "application/octet-stream")
+    return FileResponse(path, media_type=media_type)
 
 
 def _srt_timecode(seconds: float) -> str:
@@ -907,6 +916,199 @@ def _build_hook_intro(video_path: str, hook: str, work_dir: str) -> Optional[str
     return intro_path
 
 
+def _pick_best_frame(video_path: str, work_dir: str) -> str:
+    """Find the most engaging frame (largest detected face) and save it.
+
+    Scans the video in steps, runs YuNet face detection (same model as the
+    clipper), and returns the path of the frame with the biggest face area —
+    faces are the strongest thumbnail hook. Falls back to the first frame.
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return ""
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    model_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "shorts_generator", "local", "models", "face_detection_yunet_2023mar.onnx",
+    )
+    detector = None
+    try:
+        detector = cv2.FaceDetectorYN_create(model_path, "", (width, height))
+    except Exception:  # noqa: BLE001
+        detector = None
+
+    best_path, best_area = "", 0.0
+    step = max(1, int(fps * 0.5))  # sample every 0.5s
+    frame_idx = 0
+    saved = 0
+    out = os.path.join(work_dir, "thumb_frames")
+    os.makedirs(out, exist_ok=True)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_idx % step == 0 and detector is not None:
+            try:
+                _, faces = detector.detect(frame)
+                if faces is not None and len(faces) > 0:
+                    # Score by usable area: prefer a MEDIUM SHOT (face ~10-15%
+                    # of frame = head-and-shoulders / half body, like popular
+                    # Shorts thumbnails). Too close (face fills frame) or too
+                    # far (tiny face) both score lower.
+                    for f in faces:
+                        fx, fy, fw, fh = float(f[0]), float(f[1]), float(f[2]), float(f[3])
+                        area = fw * fh
+                        frame_area = float(width * height)
+                        ratio = area / frame_area if frame_area > 0 else 0
+                        fit = 1.0 - abs(ratio - 0.12) / 0.12  # peak at ~12%
+                        score = area * max(fit, 0.2)
+                        if score > best_area:
+                            best_area = score
+                            p = os.path.join(out, f"best_{saved}.jpg")
+                            cv2.imwrite(p, frame)
+                            best_path = p
+                            saved += 1
+            except Exception:  # noqa: BLE001
+                pass
+        frame_idx += 1
+    cap.release()
+
+    if not best_path:
+        # Fallback: first frame.
+        best_path = os.path.join(out, "first.jpg")
+        cap = cv2.VideoCapture(video_path)
+        ok, frame = cap.read()
+        cap.release()
+        if ok:
+            cv2.imwrite(best_path, frame)
+        else:
+            return ""
+    return best_path
+
+
+def _build_thumbnail(video_path: str, hook: str, work_dir: str) -> Optional[str]:
+    """Generate a Shorts-style thumbnail: best frame + big Impact hook text.
+
+    Returns the path to a 9:16 (portrait) JPG matching the video's native
+    resolution, or None on failure. The frame with the best-placed face is
+    used as-is (no cover-crop — cropping a portrait frame to landscape pushes
+    the subject out of frame). A dark gradient at the bottom keeps the hook
+    text readable; the hook is rendered in Impact with a thick outline.
+    """
+    hook = " ".join(hook.split()).strip()
+    from PIL import Image, ImageDraw, ImageFont
+
+    frame_path = _pick_best_frame(video_path, work_dir)
+    if not frame_path:
+        return None
+
+    img = Image.open(frame_path).convert("RGB")
+    TARGET_W, TARGET_H = img.size  # keep native portrait resolution
+    draw = ImageDraw.Draw(img)
+    # No dark gradient / strip: text sits directly on the photo, only the
+    # thick outline keeps it readable. Transparent background as requested.
+
+    if hook:
+        # Shorten the hook for thumbnail readability: keep the last ~6 words
+        # (the payoff) unless the whole line is already short. A wall of text
+        # on a thumbnail gets skipped; a punchy fragment gets clicked.
+        words = hook.split()
+        if len(words) > 7:
+            hook = " ".join(words[-6:])
+        # Font scales with frame width (portrait ~606px vs landscape 1280px).
+        base_size = max(int(TARGET_W * 0.16), 56)
+        font_candidates = [
+            "C:/Windows/Fonts/impact.ttf",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "Anton-Regular.ttf"),
+            "C:/Windows/Fonts/ariblk.ttf",
+        ]
+        font = None
+        for fp in font_candidates:
+            try:
+                font = ImageFont.truetype(fp, base_size)
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+
+        # Wrap to max ~92% width.
+        max_w = int(TARGET_W * 0.92)
+        lines: List[str] = []
+        for word in hook.split():
+            if not lines:
+                lines.append(word)
+                continue
+            trial = lines[-1] + " " + word
+            if draw.textlength(trial, font=font) <= max_w:
+                lines[-1] = trial
+            else:
+                lines.append(word)
+
+        # Auto-shrink font if the text is still too wide (>=3 lines).
+        while len(lines) >= 3 and base_size > 48:
+            base_size = int(base_size * 0.85)
+            font = ImageFont.truetype(font_candidates[0] if font_candidates else "", base_size)
+            lines = []
+            for word in hook.split():
+                if not lines:
+                    lines.append(word)
+                    continue
+                trial = lines[-1] + " " + word
+                if draw.textlength(trial, font=font) <= max_w:
+                    lines[-1] = trial
+                else:
+                    lines.append(word)
+
+        line_h = base_size * 1.18
+        total_h = line_h * len(lines)
+        # Text at the TOP as a headline (leaves the bottom clear — the same
+        # zone where subtitles will appear in the video).
+        y = int(TARGET_H * 0.06)
+        outline_w = max(4, base_size // 16)
+
+        # Keyword highlight: render each line with its LAST word in amber
+        # (the payoff word) and the rest in white — matches the punchy
+        # white/yellow contrast seen on high-CTR Shorts thumbnails. No strip
+        # behind the text (transparent background); the thick outline keeps it
+        # readable over any frame.
+        for line in lines:
+            parts = line.rsplit(" ", 1)
+            if len(parts) == 2:
+                main_text, accent_text = parts
+                main_w = draw.textlength(main_text, font=font)
+                space_w = draw.textlength(" ", font=font)
+                accent_w = draw.textlength(accent_text, font=font)
+                total_w = main_w + space_w + accent_w
+                x = (TARGET_W - total_w) // 2
+                for dx in range(-outline_w, outline_w + 1):
+                    for dy in range(-outline_w, outline_w + 1):
+                        if dx * dx + dy * dy <= outline_w * outline_w:
+                            draw.text((x + dx, y + dy), main_text, font=font, fill=(0, 0, 0))
+                            draw.text((x + main_w + space_w + dx, y + dy), accent_text, font=font, fill=(0, 0, 0))
+                draw.text((x, y), main_text, font=font, fill=(255, 255, 255))
+                draw.text((x + main_w + space_w, y), accent_text, font=font, fill=(255, 220, 80))
+            else:
+                lw = draw.textlength(line, font=font)
+                x = (TARGET_W - lw) // 2
+                for dx in range(-outline_w, outline_w + 1):
+                    for dy in range(-outline_w, outline_w + 1):
+                        if dx * dx + dy * dy <= outline_w * outline_w:
+                            draw.text((x + dx, y + dy), line, font=font, fill=(0, 0, 0))
+                draw.text((x, y), line, font=font, fill=(255, 255, 255))
+            y += line_h
+
+    thumb_path = os.path.join(work_dir, "thumbnail.jpg")
+    img.save(thumb_path, quality=92)
+    return thumb_path
+
+
 def _render(request: RenderRequest) -> RenderResponse:
     job_id = uuid.uuid4().hex[:10]
     job_dir = RENDER_ROOT / job_id
@@ -1031,6 +1233,19 @@ def _render(request: RenderRequest) -> RenderResponse:
                         print(f"[render] clip {i}: hook intro prepended ({c.hook[:50]}...)", flush=True)
                 except Exception as e:  # noqa: BLE001
                     print(f"[render] clip {i}: hook intro failed ({e}), continuing without it", flush=True)
+
+            # Phase 7: auto thumbnail (best face frame + hook text).
+            try:
+                thumb_path = _build_thumbnail(
+                    out_path,
+                    c.hook,
+                    job_dir,
+                )
+                if thumb_path:
+                    item["thumbnail_url"] = f"{job_id}/thumbnail.jpg"
+                    print(f"[render] clip {i}: thumbnail generated", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[render] clip {i}: thumbnail failed ({e})", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[render] clip {i} failed: {e}", flush=True)
             item["error"] = str(e)
