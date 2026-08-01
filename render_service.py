@@ -1265,12 +1265,63 @@ def _render(request: RenderRequest) -> RenderResponse:
 # saw. The lock serializes them; waiters simply block until their turn.
 _render_lock = threading.Lock()
 _render_busy = False
+# Async job registry: job_id -> {state, response, error}
+_async_jobs: Dict[str, Dict] = {}
+_async_jobs_lock = threading.Lock()
 
 
 @app.get("/api/render/status")
 def render_status():
     """Report whether a render job is currently running (queue status)."""
     return {"busy": _render_busy}
+
+
+@app.get("/api/render/status/{job_id}")
+def render_job_status(job_id: str):
+    """Return the state of an async render job: running | done | error."""
+    with _async_jobs_lock:
+        job = _async_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {
+        "job_id": job_id,
+        "state": job["state"],
+        "error": job.get("error"),
+        "rendered": job.get("response").rendered if job["state"] == "done" and job.get("response") else None,
+        "source_video": job.get("response").source_video if job["state"] == "done" and job.get("response") else None,
+    }
+
+
+@app.post("/api/render/async", response_model=RenderResponse)
+def render_async(request: RenderRequest):
+    """Queue a render job and return immediately.
+
+    The job runs in a background thread (still serialized by the process-wide
+    lock). Clients poll GET /api/render/status/{job_id} for completion. This
+    avoids the ~5min client timeout that killed long batch renders.
+    """
+    job_id = uuid.uuid4().hex[:10]
+    with _async_jobs_lock:
+        _async_jobs[job_id] = {"state": "running", "response": None, "error": None}
+
+    def worker():
+        global _render_busy
+        try:
+            _render_lock.acquire()
+            _render_busy = True
+            try:
+                resp = _render(request)
+            finally:
+                _render_busy = False
+                _render_lock.release()
+            with _async_jobs_lock:
+                _async_jobs[job_id] = {"state": "done", "response": resp, "error": None}
+        except Exception as e:  # noqa: BLE001
+            with _async_jobs_lock:
+                _async_jobs[job_id] = {"state": "error", "response": None, "error": str(e)}
+
+    threading.Thread(target=worker, daemon=True).start()
+    return RenderResponse(job_id=job_id, source_video="", rendered=[])
 
 
 @app.post("/api/render", response_model=RenderResponse)
