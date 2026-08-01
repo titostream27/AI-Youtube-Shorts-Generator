@@ -6,3 +6,7 @@ venv/
 output/
 *.mp4
 .DS_Store
+rendered/
+*.png
+*.jpg
+*.log

@@ -129,14 +129,37 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
     return out_path
 
 
+def _cache_key(source_path: str, start_time: float, end_time: float, aspect_ratio: str) -> str:
+    """Deterministic cache filename for a cut+reframe operation."""
+    src = os.path.splitext(os.path.basename(source_path))[0]
+    ratio = aspect_ratio.replace(":", "x")
+    return f"{src}_{start_time:.2f}_{end_time:.2f}_{ratio}.mp4"
+
+
 def crop_clip_local(
     source_path: str,
     start_time: float,
     end_time: float,
     aspect_ratio: str,
     out_path: str,
+    cache_dir: Optional[str] = None,
 ) -> str:
-    """Cut + reframe one highlight, returning the local mp4 path."""
+    """Cut + reframe one highlight, returning the local mp4 path.
+
+    When `cache_dir` is given, the reframed (vertical, caption-free) result is
+    cached per (source, start, end, aspect). Re-rendering a clip — e.g. to
+    change caption style — then skips the expensive cut-from-source and
+    OpenCV reframe entirely.
+    """
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, _cache_key(source_path, start_time, end_time, aspect_ratio))
+        if os.path.exists(cache_path):
+            print(f"[clip/local] cache hit: {os.path.basename(cache_path)}", flush=True)
+            import shutil
+            shutil.copyfile(cache_path, out_path)
+            return out_path
+
     cut_path = out_path + ".cut.mp4"
     try:
         _cut_subclip(source_path, start_time, end_time, cut_path)
@@ -150,6 +173,12 @@ def crop_clip_local(
                     break
                 except PermissionError:
                     time.sleep(0.5)
+
+    if cache_dir and os.path.exists(out_path):
+        import shutil
+        shutil.copyfile(out_path, cache_path)
+        print(f"[clip/local] cached: {os.path.basename(cache_path)}", flush=True)
+
     return out_path
 
 
