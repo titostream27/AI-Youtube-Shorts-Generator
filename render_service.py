@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from shorts_generator.local.clipper import crop_highlights_local
@@ -55,6 +56,22 @@ class RenderResponse(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "shorts-render", "version": "0.1.0"}
+
+
+@app.get("/files/{job_id}/{filename}")
+def serve_file(job_id: str, filename: str):
+    """Serve a rendered short so the miner UI can link / play it directly.
+
+    Path traversal guard: both segments must be plain names, and the resolved
+    path must stay inside the render root.
+    """
+    if not job_id or not filename or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="invalid file path")
+    path = (RENDER_ROOT / job_id / filename).resolve()
+    root = RENDER_ROOT.resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(path, media_type="video/mp4")
 
 
 def _render(request: RenderRequest) -> RenderResponse:
@@ -102,6 +119,8 @@ def _render(request: RenderRequest) -> RenderResponse:
         }
         if r.get("clip_url"):
             item["clip_path"] = os.path.abspath(r["clip_url"])
+            # Browser-reachable path relative to the render root: <job>/<file>.
+            item["clip_url"] = f"{job_id}/{os.path.basename(r['clip_url'])}"
         if r.get("error"):
             item["error"] = r["error"]
         rendered.append(item)
