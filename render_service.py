@@ -63,11 +63,15 @@ class CaptionRequest(BaseModel):
     faster-whisper so the karaoke reveal matches the actual speech rhythm.
     When absent, the render service falls back to evenly distributing the
     line's span across its words.
+
+    `speaker` is optional: when diarization is enabled each line is tagged
+    with SPEAKER_00 / SPEAKER_01 / ... and rendered in that speaker's color.
     """
     start_sec: float
     end_sec: float
     text: str
     words: List[CaptionWord] = Field(default_factory=list)
+    speaker: str = ""
 
 
 class ClipRequest(BaseModel):
@@ -299,7 +303,7 @@ def _normalize_cues(captions: List[CaptionRequest], clip_start: float) -> List[D
             if word_times is not None:
                 word_times = word_times[-keep:] if keep < len(word_times) else word_times
             s = clip_start
-        cues.append({"s": s, "e": e, "words": words, "word_times": word_times})
+        cues.append({"s": s, "e": e, "words": words, "word_times": word_times, "speaker": cap.speaker})
 
     if not cues:
         return []
@@ -310,10 +314,19 @@ def _normalize_cues(captions: List[CaptionRequest], clip_start: float) -> List[D
     for cue in cues:
         if merged and cue["s"] < merged[-1]["e"]:
             # Overlap — extend the previous line instead of starting a new one.
+            # Keep the dominant speaker = the cue with the most words so the
+            # color doesn't flicker on short interjections.
             merged[-1]["e"] = max(merged[-1]["e"], cue["e"])
             merged[-1]["cues"].append(cue)
+            if cue["speaker"]:
+                prev_spk = merged[-1].get("speaker", "")
+                if prev_spk != cue["speaker"]:
+                    prev_words = sum(len(c["words"]) for c in merged[-1]["cues"] if c.get("speaker") == prev_spk)
+                    new_words = sum(len(c["words"]) for c in merged[-1]["cues"] if c.get("speaker") == cue["speaker"])
+                    if new_words > prev_words:
+                        merged[-1]["speaker"] = cue["speaker"]
         else:
-            merged.append({"s": cue["s"], "e": cue["e"], "cues": [cue]})
+            merged.append({"s": cue["s"], "e": cue["e"], "cues": [cue], "speaker": cue.get("speaker", "")})
 
     lines: List[Dict] = []
     for m in merged:
@@ -360,6 +373,7 @@ def _normalize_cues(captions: List[CaptionRequest], clip_start: float) -> List[D
             "words": word_items,
             "start": local_start,
             "end": local_end,
+            "speaker": m.get("speaker", ""),
         })
     return lines
 
@@ -447,6 +461,163 @@ def _transcribe_with_whisper(
     return captions
 
 
+# Phase 6: speaker diarization (pyannote). Gives each caption line a speaker
+# label so each speaker is rendered in their own color. Lazy-loaded per
+# process; disabled if pyannote is not installed or RENDER_DIARIZE=0.
+DIARIZE_ENABLED = os.getenv("RENDER_DIARIZE", "1") != "0"
+DIARIZE_MODEL = os.getenv("RENDER_DIARIZE_MODEL", "pyannote/speaker-diarization-3.1")
+_diarize_pipeline = None
+
+
+def _get_diarize_pipeline():
+    """Lazily load the pyannote diarization pipeline once per process."""
+    global _diarize_pipeline
+    if _diarize_pipeline is None:
+        from pyannote.audio import Pipeline
+        _diarize_pipeline = Pipeline.from_pretrained(
+            DIARIZE_MODEL,
+            token=os.getenv("HF_TOKEN"),
+        )
+    return _diarize_pipeline
+
+
+def _diarize_clip(source_path: str, clip_start: float, clip_end: float, work_dir: str) -> List[Dict]:
+    """Run speaker diarization on the clip window.
+
+    Returns a list of {start, end, speaker} turns (start/end in ABSOLUTE video
+    coords). Falls back to [] on any error so caption rendering still works.
+    """
+    import subprocess as sp
+    import soundfile as sf
+
+    audio_path = os.path.join(work_dir, "diar_audio.wav")
+    sp.run([
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-ss", f"{clip_start:.3f}",
+        "-i", source_path,
+        "-to", f"{max(clip_end - clip_start, 0.05):.3f}",
+        "-vn", "-ac", "1", "-ar", "16000",
+        audio_path,
+    ], check=True)
+
+    try:
+        pipeline = _get_diarize_pipeline()
+        data, sr = sf.read(audio_path, dtype="float32")
+        if data.ndim == 1:
+            data = data[None, :]
+        import torch
+        out = pipeline({"waveform": torch.from_numpy(data), "sample_rate": sr})
+        ann = getattr(out, "speaker_diarization", out)
+        turns: List[Dict] = []
+        for turn, _, speaker in ann.itertracks(yield_label=True):
+            turns.append({
+                "start": clip_start + turn.start,
+                "end": clip_start + turn.end,
+                "speaker": speaker,
+            })
+        return turns
+    except Exception as e:  # noqa: BLE001
+        print(f"[diarize] failed: {e}", flush=True)
+        return []
+    finally:
+        try:
+            os.remove(audio_path)
+        except OSError:
+            pass
+
+
+def _assign_speakers(captions: List[CaptionRequest], turns: List[Dict]) -> List[CaptionRequest]:
+    """Tag each caption line with its speaker, splitting mixed-speaker lines.
+
+    Whisper segments are utterance boundaries, but two speakers often talk
+    over each other, so ONE segment can contain words from both speakers.
+    We use the per-word timestamps to decide each word's speaker from the
+    diarization turns, then split the caption at speaker changes — each
+    resulting line gets its own speaker and color, and overlaps render as
+    alternating lines instead of a blended monochrome blob.
+    """
+    if not turns:
+        return captions
+
+    def speaker_at(t: float) -> str:
+        """Speaker of the turn containing timestamp t (absolute coords).
+
+        For a point strictly inside a turn this returns that turn's speaker
+        directly; for points in overlap/gap we pick the nearest turn. The
+        naive min(t,end)-max(t,start) overlap is 0 for interior points, which
+        would leave every word unlabeled.
+        """
+        best, best_dist = "", float("inf")
+        for tr in turns:
+            if tr["start"] <= t <= tr["end"]:
+                return tr["speaker"]
+            dist = min(abs(t - tr["start"]), abs(t - tr["end"]))
+            if dist < best_dist:
+                best, best_dist = tr["speaker"], dist
+        return best
+
+    out: List[CaptionRequest] = []
+    for cap in captions:
+        if not cap.words:
+            # No word timestamps: assign by midpoint, keep one line.
+            cap.speaker = speaker_at((cap.start_sec + cap.end_sec) / 2)
+            out.append(cap)
+            continue
+
+        # Tag each word with its speaker.
+        tagged: List[Tuple[str, CaptionWord]] = []
+        for w in cap.words:
+            spk = speaker_at((w.start_sec + w.end_sec) / 2)
+            tagged.append((spk, w))
+
+        # Group consecutive words by speaker.
+        groups: List[Tuple[str, List[CaptionWord]]] = []
+        for spk, w in tagged:
+            if groups and groups[-1][0] == spk:
+                groups[-1][1].append(w)
+            else:
+                groups.append((spk, [w]))
+
+        if len(groups) == 1:
+            cap.speaker = groups[0][0]
+            out.append(cap)
+            continue
+
+        # Split into separate caption lines, one per speaker run.
+        for spk, words in groups:
+            text = " ".join(w.text for w in words).strip()
+            if not text:
+                continue
+            out.append(CaptionRequest(
+                start_sec=words[0].start_sec,
+                end_sec=words[-1].end_sec,
+                text=text,
+                words=words,
+                speaker=spk,
+            ))
+    return out
+
+
+# Speaker -> caption color palette. SPEAKER_00 keeps the classic white; the
+# rest cycle through high-contrast colors that read well over video.
+SPEAKER_COLORS = {
+    "SPEAKER_00": (255, 255, 255),
+    "SPEAKER_01": (255, 220, 80),    # amber
+    "SPEAKER_02": (120, 220, 255),   # sky
+    "SPEAKER_03": (180, 255, 160),   # mint
+    "SPEAKER_04": (255, 160, 220),   # pink
+}
+
+
+def _speaker_color(speaker: str) -> tuple:
+    if speaker in SPEAKER_COLORS:
+        return SPEAKER_COLORS[speaker]
+    # Unknown labels: derive a stable color from the label hash.
+    import hashlib
+    h = int(hashlib.md5(speaker.encode()).hexdigest()[:6], 16)
+    return ((h >> 16) & 255, (h >> 8) & 255, h & 255)
+
+
 def _burn_karaoke_captions(
     video_path: str,
     captions: List[CaptionRequest],
@@ -486,7 +657,7 @@ def _burn_karaoke_captions(
     # visual lines (max ~92% of frame width). Each visual line keeps the word
     # ordering so we can compute the active word from elapsed time.
     from PIL import ImageFont
-    font_scale = float(os.getenv("RENDER_CAPTION_FONT_SCALE", "0.065"))
+    font_scale = float(os.getenv("RENDER_CAPTION_FONT_SCALE", "0.05"))
     base_size = max(int(height * font_scale), 14)
     font_path = "C:/Windows/Fonts/arialbd.ttf"
     font = ImageFont.truetype(font_path, base_size)
@@ -497,6 +668,7 @@ def _burn_karaoke_captions(
     # start/end from its source cue — see _normalize_cues).
     flat: List[Dict] = []
     for line in lines:
+        color = _speaker_color(line.get("speaker", ""))
         for wi in line["words"]:
             flat.append({
                 "word": wi["word"],
@@ -504,11 +676,13 @@ def _burn_karaoke_captions(
                 "end": wi["end"],
                 "cap_start": line["start"],
                 "cap_end": line["end"],
+                "speaker": line.get("speaker", ""),
+                "color": color,
             })
 
-    # Render sprites (single white version per word — reveal style).
+    # Render sprites (one per word, colored by speaker — reveal style).
     for item in flat:
-        item["sprite"] = _make_word_sprite(item["word"], font, ACTIVE_COLOR)
+        item["sprite"] = _make_word_sprite(item["word"], font, item["color"])
 
     # Wrap into visual lines by cumulative width. Each caption cue is wrapped
     # independently so two cues never share a visual line.
@@ -791,6 +965,24 @@ def _render(request: RenderRequest) -> RenderResponse:
                 except Exception as e:  # noqa: BLE001
                     print(f"[render] clip {i}: whisper failed ({e}), using ASR cues", flush=True)
                     transcript_captions = c.captions
+
+                # Phase 6: speaker diarization — tag each caption line with a
+                # speaker so colors differ per speaker. Optional; on failure
+                # lines just stay uncolored (white).
+                if transcript_captions and DIARIZE_ENABLED:
+                    try:
+                        turns = _diarize_clip(
+                            source,
+                            float(c.start_sec),
+                            float(c.end_sec),
+                            job_dir,
+                        )
+                        if turns:
+                            transcript_captions = _assign_speakers(transcript_captions, turns)
+                            speakers = sorted({t["speaker"] for t in turns})
+                            print(f"[render] clip {i}: diarize -> {len(speakers)} speakers {speakers}", flush=True)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[render] clip {i}: diarize failed ({e}), captions uncolored", flush=True)
 
                 if transcript_captions:
                     burned = _burn_karaoke_captions(
