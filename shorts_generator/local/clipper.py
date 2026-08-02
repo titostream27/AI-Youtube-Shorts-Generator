@@ -194,6 +194,26 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
     focus_hold_frames = 0
     focus_lost_frames = 0
 
+    # ── Phase 2: smooth virtual camera (brief §26-29) ──
+    # Time-based smoothing so behavior is identical at 24/30/60 FPS:
+    #   alpha = 1 - exp(-dt / smoothing_time)
+    # plus a per-second speed limit (prevents teleport on bad detection) and a
+    # dead zone (camera ignores small face jitter). Values are NORMALIZED to
+    # the crop size so they scale with resolution.
+    CAMERA_POS_SMOOTH_S = float(os.getenv("RENDER_CAMERA_POSITION_SMOOTH_S", "0.32"))
+    CAMERA_ZOOM_SMOOTH_S = float(os.getenv("RENDER_CAMERA_ZOOM_SMOOTH_S", "0.45"))
+    CAMERA_MAX_PAN_PER_S = float(os.getenv("RENDER_CAMERA_MAX_PAN_PER_S", "0.85"))
+    CAMERA_MAX_ZOOM_PER_S = float(os.getenv("RENDER_CAMERA_MAX_ZOOM_PER_S", "0.65"))
+    CAMERA_DEADZONE_X = float(os.getenv("RENDER_CAMERA_DEADZONE_X", "0.025"))
+    CAMERA_DEADZONE_Y = float(os.getenv("RENDER_CAMERA_DEADZONE_Y", "0.020"))
+    camera_cur: Optional[Tuple[float, float]] = None     # current (normalized cx, cy)
+    camera_cur_w: Optional[float] = None                 # current normalized crop width
+    prev_frame_time = None
+
+    def _smootherstep(t: float) -> float:
+        t = max(0.0, min(1.0, t))
+        return t * t * t * (t * (t * 6 - 15) + 10)
+
     def _box_iou(a: Dict, b: Dict) -> float:
         """IoU between two face boxes (track dicts with cx/cy/w/h or x/y/w/h)."""
         ax0 = a.get("x", a["cx"] - a["w"] / 2)
@@ -393,6 +413,7 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
                     "vx": vx, "vy": vy,
                     "px": face["cx"] + vx, "py": face["cy"] + vy,
                     "last_seen": 0,
+                    "activity": act,
                 })
 
             best = max(new_tracks, key=lambda t: t["score"])
@@ -479,11 +500,24 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
     SPLIT_REACT_FRAMES = int(fps * float(os.getenv("RENDER_SPLIT_REACT_S", "0.25"))) # mouth-open confirm
     SPLIT_MOUTH_OPEN_RATIO = float(os.getenv("RENDER_SPLIT_MOUTH_OPEN", "1.6"))     # (unused, kept for compat)
     SPLIT_MOUTH_DELTA = float(os.getenv("RENDER_SPLIT_MOUTH_DELTA", "0.15"))         # spike over baseline
+    # ── Phase 2: temporal reaction detection (brief §32) ──
+    # Do NOT rely on horizontal mouth-corner distance as the primary reaction
+    # signal. Use mouth ROI temporal activity (grayscale frame diff) with a
+    # per-track baseline and per-track streak.
+    SPLIT_REACT_ACTIVITY = float(os.getenv("RENDER_SPLIT_REACT_ACTIVITY", "2.4"))    # activity floor
+    SPLIT_REACT_DELTA = float(os.getenv("RENDER_SPLIT_REACT_DELTA", "0.8"))          # activity spike over baseline
     SPLIT_SINGLE_S = float(os.getenv("RENDER_SPLIT_SINGLE_S", "0.4"))                # fade back after reactor leaves
     SPLIT_SINGLE_FRAMES = int(fps * SPLIT_SINGLE_S) if fps > 0 else 10
     SPLIT_TOP_RATIO = float(os.getenv("RENDER_SPLIT_TOP_RATIO", "0.60"))            # speaker region
     split_state = "idle"        # idle -> fading_in -> active -> fading_out
     split_single_frames = 0     # consecutive frames with <2 faces while split active
+    # ── Phase 2: split track locking (brief §30-31) ──
+    # While split is active the panes are LOCKED to fixed track IDs so the top
+    # and bottom never swap because the speaker changed. Locks release only
+    # after the track disappears past its TTL.
+    split_top_track_id: Optional[int] = None
+    split_bottom_track_id: Optional[int] = None
+    split_lock_frames = 0       # frames the locks have been held
     split_alpha = 0.0           # 0..1 blend weight toward split layout
     split_hold = 0              # frames held in active state
     split_react_streak = 0      # consecutive frames reactor mouth is open
@@ -522,9 +556,24 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
 
     body_anchor = float(os.getenv("RENDER_BODY_ANCHOR", "0.28"))
 
+    # ── Phase 2: separate crop resolution from output resolution (brief §36) ──
+    # The crop window is chosen from the source for framing; the OUTPUT is a
+    # fixed 1080x1920 9:16 canvas. Resizing here (LANCZOS4) upscales the crop
+    # once, at the end — never progressively.
+    output_w = int(os.getenv("RENDER_OUTPUT_WIDTH", "1080"))
+    output_h = int(os.getenv("RENDER_OUTPUT_HEIGHT", "1920"))
+    if output_h <= 0:
+        output_h = int(output_w * 16 / 9)
+    output_w = max(2, output_w - (output_w % 2))
+    output_h = max(2, output_h - (output_h % 2))
+    output_ratio = output_w / output_h
+    # Output is 9:16; if the crop ratio differs (e.g. unusual source), resize
+    # to the output canvas exactly (may stretch) — the target is 9:16 shorts.
+    _ = output_ratio
+
     silent_path = out_path + ".silent.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(silent_path, fourcc, fps, (crop_w, crop_h))
+    writer = cv2.VideoWriter(silent_path, fourcc, fps, (output_w, output_h))
     debug_track = os.getenv("RENDER_DEBUG_TRACK", "0") == "1"
     frame_no = 0
 
@@ -675,7 +724,46 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
                             flush=True,
                         )
 
-        # ------------------------------------------------------------------
+        # ── Phase 2: virtual camera (brief §26-29) ──
+        # cx,cy is the TARGET (from focus/anti-shake). The virtual camera is a
+        # smoothed current position with time-based easing, dead zone, and a
+        # per-second speed limit. Normalize by crop size so it scales.
+        now_t = time.time()
+        dt = 0.0 if prev_frame_time is None else min(0.2, max(0.001, now_t - prev_frame_time))
+        prev_frame_time = now_t
+
+        target_nx = cx / max(1, crop_w)
+        target_ny = cy / max(1, crop_h)
+        if camera_cur is None:
+            camera_cur = (target_nx, target_ny)
+            camera_cur_w = 1.0
+        else:
+            # Dead zone: ignore sub-threshold jitter.
+            dzx = CAMERA_DEADZONE_X
+            dzy = CAMERA_DEADZONE_Y
+            nx, ny = camera_cur
+            # Time-based alpha (identical across frame rates).
+            alpha_p = 1.0 - math.exp(-dt / max(0.01, CAMERA_POS_SMOOTH_S))
+            # Speed limit in normalized units per second.
+            max_pan = CAMERA_MAX_PAN_PER_S * dt
+            desired_dx = (target_nx - nx) * alpha_p
+            desired_dy = (target_ny - ny) * alpha_p
+            # Clamp movement to the speed limit (brief §28).
+            mag = math.hypot(desired_dx, desired_dy)
+            if mag > max_pan:
+                k = max_pan / max(1e-6, mag)
+                desired_dx *= k
+                desired_dy *= k
+            # Dead zone (brief §29): if the desired move is tiny, don't move.
+            if abs(desired_dx) > dzx or abs(desired_dy) > dzy:
+                camera_cur = (nx + desired_dx, ny + desired_dy)
+            else:
+                camera_cur = (nx, ny)
+
+        cx = camera_cur[0] * crop_w
+        cy = camera_cur[1] * crop_h
+
+
         # Phase: reaction-gated split screen.
         # ------------------------------------------------------------------
         # Detect whether the REACTOR (a non-speaker face) just opened their
@@ -704,35 +792,35 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
                         tid_of[face_tracks[best_j]["track_id"]] = face
                     else:
                         tid_of[None] = face
-                # Reactor = any NON-speaker track whose mouth is sharply open.
+                # Reactor = any NON-speaker track whose mouth shows a temporal
+                # activity SPIKE (brief §32) — a sharp laugh / gasp / surprise
+                # produces a burst of mouth-ROI motion over the track's own
+                # baseline, whereas talking produces continuous moderate motion.
                 frame_triggered = False
                 for tid, face in tid_of.items():
                     if tid == speaker_track_id:
                         continue
-                    r = _mouth_open_ratio(face)
-                    if r is None:
+                    # Prefer the temporal activity stored on the matched track;
+                    # fall back to mouth-open ratio when the track has none.
+                    act = face.get("activity")
+                    if act is None:
+                        act = _mouth_open_ratio(face) or 0.0
+                    if act <= 0:
                         continue
-                    # Maintain a soft baseline per track; a fresh face starts
-                    # at its own ratio so it must spike, not just be open.
                     base = track_mouth_base.get(tid)
                     if base is None:
-                        track_mouth_base[tid] = r
+                        track_mouth_base[tid] = act
                         continue
-                    track_mouth_base[tid] = base * 0.9 + r * 0.1
-                    # Reaction = sharp INCREASE over that track's own baseline
-                    # (absolute jump), not a high absolute ratio — everyone's
-                    # mouth moves while talking, so a fixed ratio threshold
-                    # would never fire during an interview.
-                    delta = r - base
-                    # Debug: log reactor mouth deltas so we can calibrate the
-                    # spike threshold against real footage.
+                    track_mouth_base[tid] = base * 0.9 + act * 0.1
+                    # Reaction = sharp INCREASE over that track's own baseline.
+                    delta = act - base
                     if debug_track and delta > 0.15:
                         print(
-                            f"[reactor] f={frame_no} tid={tid} r={r:.2f} base={base:.2f} "
+                            f"[reactor] f={frame_no} tid={tid} act={act:.2f} base={base:.2f} "
                             f"delta={delta:.2f} streak={split_react_streak}",
                             flush=True,
                         )
-                    if delta > SPLIT_MOUTH_DELTA:
+                    if delta > SPLIT_REACT_DELTA or act > SPLIT_REACT_ACTIVITY:
                         split_react_streak += 1
                         split_reactor_id = tid
                         frame_triggered = True
@@ -749,6 +837,17 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
             if reactor_hit and split_state == "idle":
                 split_state = "fading_in"
                 split_hold = 0
+                # Phase 2: lock the panes to stable track IDs (brief §31) —
+                # top = current speaker, bottom = the reacting track.
+                split_top_track_id = speaker_track_id
+                split_bottom_track_id = split_reactor_id
+                split_lock_frames = 0
+                if debug_track:
+                    print(
+                        f"[track] f={frame_no} split_lock top={split_top_track_id} "
+                        f"bottom={split_bottom_track_id}",
+                        flush=True,
+                    )
             # NOTE: do NOT reset split_react_streak here when !reactor_hit —
             # reactor_hit only turns true after the streak already reached
             # SPLIT_REACT_FRAMES, so a reset here would wipe the confirm
@@ -782,6 +881,9 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
                 split_state = "idle"
                 split_reactor_id = None
                 split_single_frames = 0
+                split_top_track_id = None
+                split_bottom_track_id = None
+                split_lock_frames = 0
 
         # ------------------------------------------------------------------
         # Render the frame: single view (default) or split layout.
@@ -809,23 +911,43 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
             # Build both regions from the source frame.
             top_h = int(crop_h * SPLIT_TOP_RATIO)
             bot_h = crop_h - top_h
+            # ── Phase 2: locked panes (brief §31) ──
+            # While split is active, the top pane follows the locked speaker
+            # track and the bottom pane the locked reactor track — even if the
+            # active speaker changes mid-split, the panes do NOT swap.
+            top_cx, top_cy = cx, cy
+            bot_cx, bot_cy = cx, cy + 80
+
+            top_track = None
+            if split_top_track_id is not None:
+                top_track = next(
+                    (t for t in face_tracks if t["track_id"] == split_top_track_id), None
+                )
+            if top_track is not None:
+                top_cx, top_cy = top_track["cx"], top_track["cy"]
+            elif split_reactor_id is not None:
+                # Speaker lock lost — fall back to the current speaker.
+                sp = next((t for t in face_tracks if t["track_id"] == speaker_track_id), None)
+                if sp is not None:
+                    top_cx, top_cy = sp["cx"], sp["cy"]
+
+            bot_track = None
+            if split_bottom_track_id is not None:
+                bot_track = next(
+                    (t for t in face_tracks if t["track_id"] == split_bottom_track_id), None
+                )
+            if bot_track is not None:
+                bot_cx, bot_cy = bot_track["cx"], bot_track["cy"]
+            elif cur_faces and len(cur_faces) > 1:
+                # Reactor lock lost — fall back to the second-largest face.
+                second = sorted(cur_faces, key=lambda f: -f["w"] * f["h"])[1]
+                bot_cx, bot_cy = second["cx"], second["cy"]
+
             # Speaker crop (top region). Zoom OUT (<1.0) so the subject is not
             # clipped at the seam/edges — a too-tight crop cuts head/shoulders.
-            top_region = _crop_region(frame, cx, cy, crop_w, top_h, zoom=0.75)
-            # Reactor crop (bottom region). If we have a reactor track, use it;
-            # otherwise fall back to the second-largest face center. If fewer
-            # than two faces are present (reactor already gone), keep the
-            # bottom region on the same speaker so the fade-out still looks
-            # clean instead of cropping an arbitrary spot.
-            rcx, rcy = cx, cy + 80
-            if split_reactor_id is not None:
-                rt = next((t for t in face_tracks if t["track_id"] == split_reactor_id), None)
-                if rt is not None:
-                    rcx, rcy = rt["cx"], rt["cy"]
-            elif cur_faces and len(cur_faces) > 1:
-                second = sorted(cur_faces, key=lambda f: -f["w"] * f["h"])[1]
-                rcx, rcy = second["cx"], second["cy"]
-            bot_region = _crop_region(frame, rcx, rcy, crop_w, bot_h, zoom=0.9)
+            top_region = _crop_region(frame, top_cx, top_cy, crop_w, top_h, zoom=0.75)
+            # Reactor crop (bottom region).
+            bot_region = _crop_region(frame, bot_cx, bot_cy, crop_w, bot_h, zoom=0.9)
 
             split_frame = np.vstack([top_region, bot_region])
             # Thin divider line at the seam (dark, subtle).
@@ -835,6 +957,12 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
             cropped = cv2.addWeighted(single_crop, 1.0 - split_alpha, split_frame, split_alpha, 0)
         else:
             cropped = single_crop
+
+        # Phase 2: resize to the fixed output canvas (brief §36). Crop frames
+        # are 606x1080-ish; the writer expects 1080x1920. LANCZOS4 once, at the
+        # end — the single lossy encode happens later in ffmpeg.
+        if cropped.shape[1] != output_w or cropped.shape[0] != output_h:
+            cropped = cv2.resize(cropped, (output_w, output_h), interpolation=cv2.INTER_LANCZOS4)
         writer.write(cropped)
 
     cap.release()

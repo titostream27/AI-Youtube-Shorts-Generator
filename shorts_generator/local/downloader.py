@@ -2,9 +2,16 @@
 
 Returns a local mp4 path so the rest of the local pipeline can read it
 directly off disk.
+
+Phase 2 (Stability) upgrades per the upgrade brief §37-38:
+  - format selector supports up to 2160p with VP9/AV1 fallbacks (not mp4-only)
+  - resolution-aware cache: source_<id>_720p.mp4 / _1080p.mp4 / _1440p.mp4 /
+    _2160p.mp4; a cached file below the requested height is rejected and
+    re-downloaded, with an explicit log line explaining the decision.
 """
 import os
 import re
+import subprocess
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 from typing import Optional
@@ -24,13 +31,12 @@ def _import_ytdlp():
 
 
 def _format_for(fmt: str) -> str:
-    """Map our '720' / '1080' shorthand to a yt-dlp format selector.
+    """Map our '720'/'1080'/'1440'/'2160' shorthand to a yt-dlp format selector.
 
-    Ordered fallbacks: prefer separate video+audio streams (best quality),
-    then progressive single-file formats (mp4 18/22), then anything.
-    YouTube's anti-bot layer intermittently refuses the separate-stream
-    URLs with HTTP 403 while the progressive formats still work, so the
-    fallback chain matters for reliability, not just quality.
+    The brief (§37) requires supporting VP9/AV1 for 1440p/2160p — restricting
+    to mp4 only would force a 1080p fallback on most high-res sources. We still
+    prefer mp4 when available, but allow vp9/av1 video with any audio container
+    and let yt-dlp merge.
     """
     try:
         height = int(fmt)
@@ -38,6 +44,7 @@ def _format_for(fmt: str) -> str:
         height = 720
     return (
         f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<={height}]+bestaudio/"
         f"best[height<={height}][ext=mp4]/"
         f"best[height<={height}]/"
         f"18/best"
@@ -92,33 +99,75 @@ def _resolve_local_path(source: str) -> Optional[str]:
     return None
 
 
-def _existing_download(out_dir: str, video_id: str) -> Optional[str]:
-    """Return a cached download path if we already have this YouTube id.
+def _probe_height(path: str) -> Optional[int]:
+    """Return the video stream height (px) of a file via ffprobe, or None."""
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=height", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=20,
+        )
+        if probe.returncode == 0 and probe.stdout.strip():
+            return int(probe.stdout.strip().splitlines()[0])
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
-    Only considers the MERGED file (source_<id>.mp4). A leftover stream file
-    like source_<id>.f399.mp4 is a partial bestvideo-only download that never
-    merged with audio — treating it as a cache hit yields silent videos.
+
+def _has_audio(path: str) -> bool:
+    """True if the file has at least one audio stream."""
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=20,
+        )
+        return probe.returncode == 0 and bool(probe.stdout.strip())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _existing_download(out_dir: str, video_id: str, fmt: str) -> Optional[str]:
+    """Return a resolution-appropriate cached download, or None.
+
+    Phase 2 (§38): the cache key now includes the requested height so a 720p
+    download is never reused for a 2160p request. Each candidate is validated:
+    it must exist, have audio, and its probed height must be >= the requested
+    height. Anything lower is logged as rejected and ignored.
     """
-    candidate = os.path.join(out_dir, f"source_{video_id}.mp4")
-    if os.path.exists(candidate):
-        # Extra safety: reject a merged file that somehow has no audio stream.
-        try:
-            import subprocess
-            probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "a:0",
-                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", candidate],
-                capture_output=True, text=True, timeout=20,
-            )
-            if probe.returncode == 0 and probe.stdout.strip():
-                return candidate
-            # No audio stream — remove the broken cache so we re-download.
+    try:
+        height = int(fmt)
+    except ValueError:
+        height = 0  # unknown fmt -> any cached file is acceptable
+
+    # Candidates: resolution-specific first, then the legacy generic name.
+    candidates = []
+    if height > 0:
+        for ext in (".mp4", ".mkv", ".webm"):
+            candidates.append(os.path.join(out_dir, f"source_{video_id}_{height}p{ext}"))
+    for ext in (".mp4", ".mkv", ".webm"):
+        candidates.append(os.path.join(out_dir, f"source_{video_id}{ext}"))
+
+    for candidate in candidates:
+        if not os.path.exists(candidate):
+            continue
+        if not _has_audio(candidate):
+            print(f"[download/local] cached file has no audio, removing: {candidate}", flush=True)
             try:
                 os.remove(candidate)
             except OSError:
                 pass
-            print(f"[download/local] cached file has no audio, removing: {candidate}", flush=True)
-        except Exception:  # noqa: BLE001
-            return candidate
+            continue
+        cached_h = _probe_height(candidate)
+        if height > 0 and cached_h is not None and cached_h < height:
+            print(
+                f"[download/local] Cached source: {cached_h}p | Requested source: up to {height}p | "
+                f"Cache rejected: resolution below request ({os.path.basename(candidate)})",
+                flush=True,
+            )
+            continue
+        print(f"[download/local] reusing cached download: {candidate}", flush=True)
+        return candidate
     return None
 
 
@@ -135,15 +184,21 @@ def download_youtube_local(video_url: str, fmt: str = "720", out_dir: Optional[s
 
     video_id = _extract_youtube_video_id(video_url)
     if video_id:
-        cached = _existing_download(out_dir, video_id)
+        cached = _existing_download(out_dir, video_id, fmt)
         if cached:
-            print(f"[download/local] reusing cached download: {cached}", flush=True)
             return cached
 
-    print(f"[download/local] {video_url} @ {fmt}p -> {out_dir}/", flush=True)
+    try:
+        height = int(fmt)
+    except ValueError:
+        height = 720
+    # Resolution-aware output template: source_<id>_<height>p.<ext>.
+    outtmpl = os.path.join(out_dir, f"source_%(id)s_{height}p.%(ext)s")
+
+    print(f"[download/local] {video_url} @ {height}p -> {out_dir}/", flush=True)
     ydl_opts = {
         "format": _format_for(fmt),
-        "outtmpl": os.path.join(out_dir, "source_%(id)s.%(ext)s"),
+        "outtmpl": outtmpl,
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,

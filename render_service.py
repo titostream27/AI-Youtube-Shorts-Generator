@@ -29,7 +29,7 @@ from shorts_generator.local.downloader import download_youtube_local
 RENDER_ROOT = Path(os.getenv("RENDER_OUTPUT_DIR", "rendered")).resolve()
 HOST = os.getenv("RENDER_HOST", "127.0.0.1")
 PORT = int(os.getenv("RENDER_PORT", "8084"))
-FORMAT = os.getenv("RENDER_FORMAT", "720")
+FORMAT = os.getenv("RENDER_FORMAT", "2160")
 # When exposed through a reverse proxy under a path prefix (e.g.
 # hub.aelflab.com/short), strip that prefix so routes like /files/... match.
 PATH_PREFIX = os.getenv("RENDER_PATH_PREFIX", "").strip().strip("/")
