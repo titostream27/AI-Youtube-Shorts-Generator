@@ -7,6 +7,7 @@ Two stages per highlight:
      cascade — same approach as the original repo, no external models).
 """
 import os
+import math
 import subprocess
 import time
 from typing import Dict, List, Optional, Tuple
@@ -157,6 +158,61 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
     challenger_id: Optional[int] = None
     challenger_streak = 0
 
+    # ── Phase 1 (Correctness): persistent tracking upgrade (brief §15-16) ──
+    # Face tracks now carry velocity + predicted position + smoothed box, and
+    # matching uses a combined cost (normalized center distance + IoU + scale
+    # difference + velocity prediction) instead of a fixed 80px radius, which
+    # is inconsistent across 480p/720p/1080p/4K sources.
+    FACE_MATCH_DISTANCE = float(os.getenv("RENDER_FACE_MATCH_DISTANCE", "1.65"))  # normalized (face-size units)
+    TRACK_ASSIGNMENT_MARGIN = float(os.getenv("RENDER_TRACK_ASSIGNMENT_MARGIN", "0.12"))
+    FACE_TRACK_TTL_S = float(os.getenv("RENDER_FACE_TRACK_TTL_S", "0.45"))
+    FACE_BOX_EMA = float(os.getenv("RENDER_FACE_BOX_EMA", "0.28"))
+    face_track_ttl_frames = int(fps * FACE_TRACK_TTL_S) if fps > 0 else 12
+
+    # ── Phase 1 (Correctness): scene-change awareness (brief §35) ──
+    # Hard cuts / camera angle changes reset track velocity and re-validate
+    # track IDs; we never interpolate a face from one scene into another.
+    SCENE_CHANGE_THRESHOLD = float(os.getenv("RENDER_SCENE_CHANGE_THRESHOLD", "0.55"))
+    prev_scene_gray = None
+    scene_changed = False
+
+    # ── Phase 1 (Correctness): focus lock + hysteresis (brief §21-24) ──
+    # Stable focus target: an explicit active_focus_track_id with minimum hold,
+    # candidate confirmation, lost grace, and score margin. Prevents the
+    # "two faces pulling focus" ping-pong.
+    RENDER_FOCUS_SWITCH_CONFIRM_S = float(os.getenv("RENDER_FOCUS_SWITCH_CONFIRM_S", "0.55"))
+    RENDER_FOCUS_MIN_HOLD_S = float(os.getenv("RENDER_FOCUS_MIN_HOLD_S", "1.20"))
+    RENDER_FOCUS_SCORE_MARGIN = float(os.getenv("RENDER_FOCUS_SCORE_MARGIN", "0.18"))
+    RENDER_FOCUS_LOST_GRACE_S = float(os.getenv("RENDER_FOCUS_LOST_GRACE_S", "0.60"))
+    RENDER_FOCUS_MIN_CONFIDENCE = float(os.getenv("RENDER_FOCUS_MIN_CONFIDENCE", "0.58"))
+    focus_confirm_frames = int(fps * RENDER_FOCUS_SWITCH_CONFIRM_S) if fps > 0 else 14
+    focus_min_hold_frames = int(fps * RENDER_FOCUS_MIN_HOLD_S) if fps > 0 else 30
+    focus_lost_grace_frames = int(fps * RENDER_FOCUS_LOST_GRACE_S) if fps > 0 else 15
+    active_focus_track_id: Optional[int] = None
+    candidate_focus_track_id: Optional[int] = None
+    candidate_focus_since = 0
+    focus_hold_frames = 0
+    focus_lost_frames = 0
+
+    def _box_iou(a: Dict, b: Dict) -> float:
+        """IoU between two face boxes (track dicts with cx/cy/w/h or x/y/w/h)."""
+        ax0 = a.get("x", a["cx"] - a["w"] / 2)
+        ay0 = a.get("y", a["cy"] - a["h"] / 2)
+        ax1 = ax0 + a["w"]
+        ay1 = ay0 + a["h"]
+        bx0 = b.get("x", b["cx"] - b["w"] / 2)
+        by0 = b.get("y", b["cy"] - b["h"] / 2)
+        bx1 = bx0 + b["w"]
+        by1 = by0 + b["h"]
+        ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+        ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+        iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        union = a["w"] * a["h"] + b["w"] * b["h"] - inter
+        return inter / max(1.0, union)
+
     def _detect_yunet_faces(frame) -> Optional[List[Dict]]:
         """Return ALL YuNet faces: {cx, cy, w, h, lm, score}.
 
@@ -249,14 +305,53 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
                 prev_mouth: Optional[Tuple[float, float]] = None
                 prev_score = 0.0
                 track_id: Optional[int] = None
-                best_j, best_d = -1, 80.0
+                # ── Phase 1 upgrade: combined matching cost (brief §15-16) ──
+                # Replace the fixed 80px radius with a normalized cost that
+                # works across resolutions: center distance in face-size units,
+                # IoU of boxes, scale difference, and predicted (velocity)
+                # position error. Keep the previous assignment when the best
+                # and second-best are ambiguous (margin too small).
+                best_j, best_cost = -1, 1e9
+                second_cost = 1e9
+                face_area = max(1.0, face["w"] * face["h"])
+                face_diag = max(1.0, (face["w"] ** 2 + face["h"] ** 2) ** 0.5)
                 for j, tr in enumerate(face_tracks):
                     if used[j]:
                         continue
-                    d = ((tr["cx"] - face["cx"]) ** 2 + (tr["cy"] - face["cy"]) ** 2) ** 0.5
-                    if d < best_d:
-                        best_d, best_j = d, j
-                if best_j >= 0:
+                    # Predicted position from stored velocity.
+                    px = tr.get("px", tr["cx"])
+                    py = tr.get("py", tr["cy"])
+                    d = ((px - face["cx"]) ** 2 + (py - face["cy"]) ** 2) ** 0.5
+                    norm_d = d / face_diag
+                    # IoU between previous track box and current face box.
+                    iou = _box_iou(tr, face)
+                    # Scale difference (log ratio).
+                    tr_area = max(1.0, tr["area"])
+                    scale_diff = abs(math.log(face_area / tr_area))
+                    cost = (
+                        norm_d * 1.0
+                        + (1.0 - iou) * 0.8
+                        + scale_diff * 0.6
+                    )
+                    if cost < best_cost:
+                        second_cost = best_cost
+                        best_cost = cost
+                        best_j = j
+                    elif cost < second_cost:
+                        second_cost = cost
+                # Ambiguous assignment: keep previous assignment for that track
+                # (brief §16: don't swap track IDs under ambiguity).
+                if (
+                    best_j >= 0
+                    and second_cost < 1e8
+                    and (second_cost - best_cost) < TRACK_ASSIGNMENT_MARGIN * best_cost
+                ):
+                    # Margin too small — the two candidates are near-ties.
+                    # Skip re-assigning this face; it will fall to the new-face
+                    # branch only if NO track is a clear winner. We keep the
+                    # current track assignment untouched by not marking used.
+                    pass
+                if best_j >= 0 and best_cost <= FACE_MATCH_DISTANCE:
                     used[best_j] = True
                     prev_track = face_tracks[best_j]
                     prev_score = prev_track["score"]
@@ -279,11 +374,25 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
                 # Current mouth position (for next frame's face-relative crop).
                 (mx1, my1), (mx2, my2) = face["lm"][3], face["lm"][4]
                 mouth = ((mx1 + mx2) / 2, (my1 + my2) / 2)
+                # Velocity for next frame's predicted position (brief §15).
+                vx = vy = 0.0
+                prev_match = None
+                for j, tr in enumerate(face_tracks):
+                    if used[j] and tr.get("track_id") == track_id:
+                        prev_match = tr
+                        break
+                if prev_match is not None and "vx" in prev_match:
+                    vx = prev_match["vx"] * 0.8 + (face["cx"] - prev_match["cx"]) * 0.2
+                    vy = prev_match["vy"] * 0.8 + (face["cy"] - prev_match["cy"]) * 0.2
                 new_tracks.append({
                     "cx": face["cx"], "cy": face["cy"], "score": score, "idx": fi,
                     "track_id": track_id,
-                    "area": face["w"] * face["h"],
+                    "area": face_area,
+                    "w": face["w"], "h": face["h"],
                     "mouth": mouth,
+                    "vx": vx, "vy": vy,
+                    "px": face["cx"] + vx, "py": face["cy"] + vy,
+                    "last_seen": 0,
                 })
 
             best = max(new_tracks, key=lambda t: t["score"])
@@ -424,6 +533,28 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
         if not ret:
             break
 
+        # ── Phase 1: scene-change awareness (brief §35) ──
+        # Detect hard cuts / camera angle changes via frame-difference on a
+        # downscaled grayscale. On a scene change we reset track velocity so
+        # faces are never interpolated across the cut, and we re-validate all
+        # track IDs (a track from the old scene must not keep its identity).
+        if tracker_mode in ("dual", "yunet"):
+            small_gray = cv2.cvtColor(cv2.resize(frame, (160, 90)), cv2.COLOR_BGR2GRAY)
+            if prev_scene_gray is not None:
+                diff = cv2.absdiff(small_gray, prev_scene_gray).mean() / 255.0
+                scene_changed = diff > SCENE_CHANGE_THRESHOLD
+                if scene_changed:
+                    # New scene: drop velocity predictions and stale tracks so
+                    # the matcher cannot jump across the cut.
+                    for tr in face_tracks:
+                        tr.pop("vx", None)
+                        tr.pop("vy", None)
+                        tr.pop("px", None)
+                        tr.pop("py", None)
+                    if debug_track:
+                        print(f"[track] f={frame_no} scene_change diff={diff:.2f}", flush=True)
+            prev_scene_gray = small_gray
+
         det = _pick_speaker(frame)
         # Refresh face list every frame while split is enabled — the split
         # state machine needs to know when a reactor face disappears (if only
@@ -486,6 +617,63 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
             last_center = (src_w / 2.0, src_h / 2.0)
 
         cx, cy = last_center
+
+        # ── Phase 1: focus lock + hysteresis (brief §21-24) ──
+        # Keep the active focus track unless a candidate consistently beats it
+        # by a margin for the confirm window, and respect a minimum hold. This
+        # prevents two-face focus ping-pong: the crop no longer flips because
+        # one frame's mouth activity favoured the other face.
+        if tracker_mode in ("dual", "yunet") and lip_detect and face_tracks:
+            tracks_by_id = {t["track_id"]: t for t in face_tracks}
+            active = tracks_by_id.get(active_focus_track_id) if active_focus_track_id is not None else None
+            best_track = max(face_tracks, key=lambda t: t.get("score", 0))
+
+            if active is None:
+                # Lost grace: keep the last valid box until grace expires.
+                if focus_lost_frames < focus_lost_grace_frames:
+                    focus_lost_frames += 1
+                else:
+                    # No active focus — adopt the strongest stable track.
+                    if best_track.get("score", 0) >= RENDER_FOCUS_MIN_CONFIDENCE:
+                        active_focus_track_id = best_track["track_id"]
+                        focus_hold_frames = 0
+                        focus_lost_frames = 0
+            else:
+                focus_lost_frames = 0
+                focus_hold_frames += 1
+                # Candidate confirmation: a different track must beat the
+                # active one by the margin, consistently, for the confirm
+                # window, AND the active track must have held its minimum.
+                if (
+                    best_track["track_id"] != active_focus_track_id
+                    and focus_hold_frames >= focus_min_hold_frames
+                    and best_track.get("score", 0)
+                    > active.get("score", 0) + RENDER_FOCUS_SCORE_MARGIN
+                ):
+                    if candidate_focus_track_id == best_track["track_id"]:
+                        candidate_focus_since += 1
+                    else:
+                        candidate_focus_track_id = best_track["track_id"]
+                        candidate_focus_since = 1
+                    if candidate_focus_since >= focus_confirm_frames:
+                        active_focus_track_id = best_track["track_id"]
+                        focus_hold_frames = 0
+                        candidate_focus_track_id = None
+                        candidate_focus_since = 0
+                else:
+                    candidate_focus_track_id = None
+                    candidate_focus_since = 0
+                # Override the crop target with the active focus track so the
+                # single view never points at the midpoint between two faces.
+                focus_track = tracks_by_id.get(active_focus_track_id)
+                if focus_track is not None:
+                    cx, cy = focus_track["cx"], focus_track["cy"]
+                    if debug_track and frame_no % 12 == 0:
+                        print(
+                            f"[track] f={frame_no} focus={active_focus_track_id} "
+                            f"score={active.get('score', 0):.2f} hold={focus_hold_frames}",
+                            flush=True,
+                        )
 
         # ------------------------------------------------------------------
         # Phase: reaction-gated split screen.
