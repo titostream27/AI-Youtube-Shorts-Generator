@@ -150,6 +150,25 @@ def _upload_to_youtube(
     }
 
 
+def _set_thumbnail(video_id: str, thumbnail_path: str) -> bool:
+    """Upload a custom thumbnail for a video via the thumbnails.set API.
+
+    The video must be owned by the authenticated account; the thumbnail file
+    is a JPG from the render service's /files endpoint or a local path.
+    Returns True on success, False on failure (non-fatal for publish).
+    """
+    try:
+        creds = _credentials()
+        youtube = build("youtube", "v3", credentials=creds)
+        media = MediaFileUpload(thumbnail_path, mimetype="image/jpeg")
+        youtube.thumbnails().set(videoId=video_id, media_body=media).execute()
+        print(f"[poster] thumbnail set for {video_id}", flush=True)
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[poster] thumbnail failed ({e}), continuing", flush=True)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
@@ -165,6 +184,7 @@ try:
         description: str = ""
         tags: List[str] = []
         file_url: str
+        thumbnail_url: str = ""
         privacy: str = "private"
 
     class PublishResponse(BaseModel):
@@ -191,6 +211,14 @@ try:
                 tags=req.tags,
                 privacy=req.privacy,
             )
+            # Custom thumbnail (non-fatal if it fails).
+            thumbnail_set = False
+            if req.thumbnail_url and result.get("videoId"):
+                try:
+                    thumb_path = _resolve_file(req.thumbnail_url)
+                    thumbnail_set = _set_thumbnail(result["videoId"], thumb_path)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[poster] thumbnail resolve failed ({e})", flush=True)
             return PublishResponse(
                 clip_id=req.clip_id,
                 status="published",
@@ -198,6 +226,7 @@ try:
                 url=result["url"],
                 title=result["title"],
                 privacy=result["privacy"],
+                error=None if thumbnail_set else "thumbnail not set",
             )
         except PosterConfigError as e:
             raise HTTPException(status_code=500, detail=str(e)) from e

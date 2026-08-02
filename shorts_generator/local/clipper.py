@@ -11,6 +11,8 @@ import subprocess
 import time
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 from ..config import LOCAL_OUTPUT_DIR
 
 
@@ -128,8 +130,9 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
     # Lip-movement speaker selection state (only used when lip_detect is on
     # and YuNet landmarks are available).
     prev_gray = None
-    face_tracks: List[Dict] = []   # [{cx, cy, score, idx}] from previous frame
-    speaker_id: Optional[int] = None
+    face_tracks: List[Dict] = []   # [{cx, cy, score, idx, track_id}] from previous frame
+    next_track_id = 0
+    speaker_track_id: Optional[int] = None
     speaker_pos: Optional[Tuple[float, float]] = None
     speaker_conf = 0.0
     SWITCH_FACTOR = 1.35      # new face must beat current speaker by this much
@@ -188,14 +191,21 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
         except Exception:
             return None
 
-    def _mouth_activity(gray, face: Dict) -> float:
+    def _mouth_activity(gray, face: Dict, prev_mouth: Optional[Tuple[float, float]] = None) -> float:
         """Mean abs diff in the mouth ROI between this frame and the previous.
 
         Uses YuNet mouth-corner landmarks to define a box around the mouth;
         lips moving (speaking) produce a high diff, a still face ~0.
+
+        KEY FIX — face-relative measurement: the previous frame's ROI is
+        cropped at the face's PREVIOUS mouth position (passed in as
+        prev_mouth), not at the current absolute coordinates. Without this, a
+        head nod (whole face shifting) moves the ROI across the frame and
+        produces a high diff even though the lips never moved — the nodding
+        listener was being mistaken for the speaker. Cropping both frames at
+        their own mouth position makes the ROI follow the face, so only real
+        lip motion registers.
         """
-        if prev_gray is None:
-            return 0.0
         (mx1, my1), (mx2, my2) = face["lm"][3], face["lm"][4]
         cx = (mx1 + mx2) / 2
         cy = (my1 + my2) / 2
@@ -207,7 +217,16 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
         x0 = max(0, min(src_w - roi_w, int(cx - roi_w / 2)))
         y0 = max(0, min(src_h - roi_h, int(cy - roi_h / 2)))
         cur = gray[y0:y0 + roi_h, x0:x0 + roi_w]
-        prev = prev_gray[y0:y0 + roi_h, x0:x0 + roi_w]
+        if prev_gray is None:
+            return 0.0
+        if prev_mouth is not None:
+            # Crop the PREVIOUS frame at where the mouth was then, so head
+            # translation (nod, sway) cancels out.
+            px0 = max(0, min(src_w - roi_w, int(prev_mouth[0] - roi_w / 2)))
+            py0 = max(0, min(src_h - roi_h, int(prev_mouth[1] - roi_h / 2)))
+            prev = prev_gray[py0:py0 + roi_h, px0:px0 + roi_w]
+        else:
+            prev = prev_gray[y0:y0 + roi_h, x0:x0 + roi_w]
         if cur.shape != prev.shape:
             return 0.0
         return float(cv2.absdiff(cur, prev).mean())
@@ -216,7 +235,7 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
         """Choose the face to track. Lip detection picks the active speaker;
         without it (or when YuNet is unavailable) we fall back to the largest
         face. Returns the detection center or None."""
-        nonlocal prev_gray, face_tracks, speaker_id, speaker_pos, speaker_conf, speaker_size
+        nonlocal prev_gray, face_tracks, next_track_id, speaker_track_id, speaker_pos, speaker_conf, speaker_size
         nonlocal challenger_id, challenger_streak
         faces = _detect_yunet_faces(frame) if tracker_mode in ("dual", "yunet") else None
 
@@ -225,8 +244,11 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
             new_tracks: List[Dict] = []
             used = [False] * len(face_tracks)
             for fi, face in enumerate(faces):
-                act = _mouth_activity(gray, face)
-                # Match to nearest previous track so activity carries over.
+                # Find the matching previous track first so we can measure
+                # mouth activity at the face-relative position (nod-proof).
+                prev_mouth: Optional[Tuple[float, float]] = None
+                prev_score = 0.0
+                track_id: Optional[int] = None
                 best_j, best_d = -1, 80.0
                 for j, tr in enumerate(face_tracks):
                     if used[j]:
@@ -236,24 +258,44 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
                         best_d, best_j = d, j
                 if best_j >= 0:
                     used[best_j] = True
-                    score = face_tracks[best_j]["score"] * SCORE_EMA + act * (1 - SCORE_EMA)
+                    prev_track = face_tracks[best_j]
+                    prev_score = prev_track["score"]
+                    prev_mouth = prev_track.get("mouth")
+                    # KEY FIX: carry the persistent track_id from the matched
+                    # previous track. YuNet returns faces in an UNSTABLE ORDER
+                    # frame-to-frame, so a positional idx would let speaker_id
+                    # silently point at a different person. track_id survives
+                    # reordering, so the speaker identity stays stable.
+                    track_id = prev_track["track_id"]
+                else:
+                    # New face: assign a fresh persistent id.
+                    track_id = next_track_id
+                    next_track_id += 1
+                act = _mouth_activity(gray, face, prev_mouth)
+                if prev_mouth is not None:
+                    score = prev_score * SCORE_EMA + act * (1 - SCORE_EMA)
                 else:
                     score = act
+                # Current mouth position (for next frame's face-relative crop).
+                (mx1, my1), (mx2, my2) = face["lm"][3], face["lm"][4]
+                mouth = ((mx1 + mx2) / 2, (my1 + my2) / 2)
                 new_tracks.append({
                     "cx": face["cx"], "cy": face["cy"], "score": score, "idx": fi,
+                    "track_id": track_id,
                     "area": face["w"] * face["h"],
+                    "mouth": mouth,
                 })
 
             best = max(new_tracks, key=lambda t: t["score"])
             # Size-consistency guard: if the current best is NOT the speaker
             # and its area deviates wildly from the speaker's face area, it is
             # almost certainly a hand/object false positive — keep the speaker.
-            if speaker_id is not None and speaker_size:
-                cand = next((t for t in new_tracks if t["idx"] == best["idx"]), best)
-                if cand["idx"] != speaker_id and cand["area"] > 0:
+            if speaker_track_id is not None and speaker_size:
+                cand = next((t for t in new_tracks if t["track_id"] == best["track_id"]), best)
+                if cand["track_id"] != speaker_track_id and cand["area"] > 0:
                     ratio = cand["area"] / speaker_size
                     if ratio > SIZE_MAX_RATIO or ratio < SIZE_MIN_RATIO:
-                        sp = next((t for t in new_tracks if t["idx"] == speaker_id), None)
+                        sp = next((t for t in new_tracks if t["track_id"] == speaker_track_id), None)
                         if sp is not None:
                             best = sp
             # Hysteresis: only switch speakers when the newcomer clearly beats
@@ -262,8 +304,8 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
             # pauses — their EMA decays toward 0, and without the floor any
             # background motion would win the switch.
             can_switch = best["score"] >= max(speaker_conf * SWITCH_FACTOR, MIN_SWITCH_SCORE)
-            if speaker_id is not None and not can_switch:
-                sp = next((t for t in new_tracks if t["idx"] == speaker_id), None)
+            if speaker_track_id is not None and not can_switch:
+                sp = next((t for t in new_tracks if t["track_id"] == speaker_track_id), None)
                 if sp is None and speaker_pos is not None:
                     sp = min(new_tracks, key=lambda t: (t["cx"] - speaker_pos[0]) ** 2 + (t["cy"] - speaker_pos[1]) ** 2)
                 if sp is not None:
@@ -274,14 +316,14 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
             # sweeping past the camera rarely persists that long; a real speaker
             # change does. While the streak is incomplete, stick with the
             # current speaker so the crop does not dart to a transient object.
-            if speaker_id is not None and best["idx"] != speaker_id:
-                if challenger_id == best["idx"]:
+            if speaker_track_id is not None and best["track_id"] != speaker_track_id:
+                if challenger_id == best["track_id"]:
                     challenger_streak += 1
                 else:
-                    challenger_id = best["idx"]
+                    challenger_id = best["track_id"]
                     challenger_streak = 1
                 if challenger_streak < SWITCH_CONFIRM_FRAMES:
-                    sp = next((t for t in new_tracks if t["idx"] == speaker_id), None)
+                    sp = next((t for t in new_tracks if t["track_id"] == speaker_track_id), None)
                     if sp is not None:
                         best = sp
             else:
@@ -289,7 +331,7 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
                 challenger_streak = 0
 
             speaker_track = best
-            speaker_id = speaker_track["idx"]
+            speaker_track_id = speaker_track["track_id"]
             speaker_pos = (speaker_track["cx"], speaker_track["cy"])
             speaker_conf = speaker_track["score"]
             # EMA the speaker's face area so the size guard adapts as the
@@ -319,9 +361,63 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
                 pass
         return None
 
+    # Split-screen (reaction-gated) state — Phase: reaction split.
+    # When a non-speaker's mouth opens sharply (surprise/laugh), we split the
+    # frame: speaker on top, reactor on bottom, with a smooth fade in/out.
+    split_enabled = os.getenv("RENDER_SPLIT", "1") != "0"
+    SPLIT_FADE_FRAMES = int(fps * float(os.getenv("RENDER_SPLIT_FADE_S", "0.3")))   # fade frames
+    SPLIT_HOLD_FRAMES = int(fps * float(os.getenv("RENDER_SPLIT_HOLD_S", "2.5")))   # min hold
+    SPLIT_REACT_FRAMES = int(fps * float(os.getenv("RENDER_SPLIT_REACT_S", "0.25"))) # mouth-open confirm
+    SPLIT_MOUTH_OPEN_RATIO = float(os.getenv("RENDER_SPLIT_MOUTH_OPEN", "1.6"))     # (unused, kept for compat)
+    SPLIT_MOUTH_DELTA = float(os.getenv("RENDER_SPLIT_MOUTH_DELTA", "0.15"))         # spike over baseline
+    SPLIT_SINGLE_S = float(os.getenv("RENDER_SPLIT_SINGLE_S", "0.4"))                # fade back after reactor leaves
+    SPLIT_SINGLE_FRAMES = int(fps * SPLIT_SINGLE_S) if fps > 0 else 10
+    SPLIT_TOP_RATIO = float(os.getenv("RENDER_SPLIT_TOP_RATIO", "0.60"))            # speaker region
+    split_state = "idle"        # idle -> fading_in -> active -> fading_out
+    split_single_frames = 0     # consecutive frames with <2 faces while split active
+    split_alpha = 0.0           # 0..1 blend weight toward split layout
+    split_hold = 0              # frames held in active state
+    split_react_streak = 0      # consecutive frames reactor mouth is open
+    split_reactor_id: Optional[int] = None
+    # Per-track mouth-open baseline (EMA) so a sharp OPEN counts as reaction.
+    track_mouth_base: Dict[int, float] = {}
+
+    def _crop_region(frame, cx, cy, region_w, region_h, zoom=1.0) -> "cv2.ndarray":
+        """Crop a region around (cx,cy) with body anchor + zoom, resize to region."""
+        z = 1.0 / zoom
+        cw = min(src_w, int(region_w * z))
+        ch = min(src_h, int(region_h * z))
+        anchor_y = cy + (0.5 - body_anchor) * ch
+        x0 = int(max(0, min(src_w - cw, cx - cw / 2)))
+        y0 = int(max(0, min(src_h - ch, anchor_y - ch / 2)))
+        win = frame[y0:y0 + ch, x0:x0 + cw]
+        if win.shape[1] != region_w or win.shape[0] != region_h:
+            win = cv2.resize(win, (region_w, region_h), interpolation=cv2.INTER_AREA)
+        return win
+
+    def _mouth_open_ratio(face: Dict) -> Optional[float]:
+        """Ratio of mouth-corner distance vs the face's running baseline.
+
+        A value well above 1 means the mouth is WIDE OPEN (surprise / laugh).
+        Returns None when landmarks are unavailable or the face is tiny.
+        """
+        try:
+            (mx1, my1), (mx2, my2) = face["lm"][3], face["lm"][4]
+            d = ((mx2 - mx1) ** 2 + (my2 - my1) ** 2) ** 0.5
+            face_w = face["w"]
+            if d < 2 or face_w < 20:
+                return None
+            return d / max(face_w * 0.18, 1.0)
+        except Exception:
+            return None
+
+    body_anchor = float(os.getenv("RENDER_BODY_ANCHOR", "0.28"))
+
     silent_path = out_path + ".silent.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(silent_path, fourcc, fps, (crop_w, crop_h))
+    debug_track = os.getenv("RENDER_DEBUG_TRACK", "0") == "1"
+    frame_no = 0
 
     while True:
         ret, frame = cap.read()
@@ -329,6 +425,29 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
             break
 
         det = _pick_speaker(frame)
+        # Refresh face list every frame while split is enabled — the split
+        # state machine needs to know when a reactor face disappears (if only
+        # one face remains we must fade back to the single view).
+        cur_faces: Optional[List[Dict]] = (
+            _detect_yunet_faces(frame) if (split_enabled and tracker_mode in ("dual", "yunet")) else None
+        )
+
+        # Optional tracking debug: dump face positions + chosen center every
+        # 12 frames so we can diagnose crop drift (e.g. nodding listener).
+        if debug_track and frame_no % 12 == 0:
+            f_cur = _detect_yunet_faces(frame) if tracker_mode in ("dual", "yunet") else None
+            n_faces = len(f_cur) if f_cur else 0
+            fc = ""
+            if f_cur:
+                fc = ", ".join(f"({t['cx']:.0f},{t['cy']:.0f})" for t in sorted(f_cur, key=lambda t: -t["w"] * t["h"]))
+            print(
+                f"[track] f={frame_no} src_t={frame_no / fps:.1f}s faces={n_faces} [{fc}] "
+                f"speaker_track_id={speaker_track_id} det={'None' if det is None else f'({det[0]:.0f},{det[1]:.0f})'} "
+                f"center={'None' if last_center is None else f'({last_center[0]:.0f},{last_center[1]:.0f})'} "
+                f"split={split_state} a={split_alpha:.2f}",
+                flush=True,
+            )
+        frame_no += 1
 
         if det is not None:
             # Anti-shake stage 1: median of recent detections (kills outliers).
@@ -367,36 +486,167 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
             last_center = (src_w / 2.0, src_h / 2.0)
 
         cx, cy = last_center
-        # Phase 9: body framing. Instead of centering the crop on the FACE
-        # (which cuts the body at the bottom), shift the anchor DOWN so the
-        # face sits near the TOP third and the body fills the lower two thirds
-        # — the "head-and-shoulders / half body" framing used by viral Shorts.
-        # RENDER_BODY_ANCHOR = desired face position as a fraction of crop
-        # height from the top (0.25 = face at 25% of frame height).
-        body_anchor = float(os.getenv("RENDER_BODY_ANCHOR", "0.28"))
-        cx, cy = last_center
-        # RENDER_FACE_ZOOM < 1.0 zooms out: crop a LARGER window around the
-        # subject (more context) and scale it back down to the target size.
-        # This keeps the whole face + surroundings visible instead of a tight
-        # face-only crop that feels cramped.
+
+        # ------------------------------------------------------------------
+        # Phase: reaction-gated split screen.
+        # ------------------------------------------------------------------
+        # Detect whether the REACTOR (a non-speaker face) just opened their
+        # mouth sharply. If so, transition to split layout with a smooth fade.
+        if split_enabled and split_state != "active":
+            # Find current faces (from the last _pick_speaker run) plus their
+            # mouth-open ratios, keyed by persistent track_id.
+            reactor_hit = False
+            # Split REQUIRES two distinct faces — a reactor. If only one face
+            # (or none) is present there is nothing to split into, so skip.
+            if cur_faces and len(cur_faces) >= 2 and speaker_track_id is not None and lip_detect:
+                # Map each detected face to its track_id using position match
+                # against face_tracks (same 80px radius as the tracker).
+                tid_of: Dict[int, Dict] = {}
+                used_t = [False] * len(face_tracks)
+                for face in cur_faces:
+                    best_j, best_d = -1, 80.0
+                    for j, tr in enumerate(face_tracks):
+                        if used_t[j]:
+                            continue
+                        d = ((tr["cx"] - face["cx"]) ** 2 + (tr["cy"] - face["cy"]) ** 2) ** 0.5
+                        if d < best_d:
+                            best_d, best_j = d, j
+                    if best_j >= 0:
+                        used_t[best_j] = True
+                        tid_of[face_tracks[best_j]["track_id"]] = face
+                    else:
+                        tid_of[None] = face
+                # Reactor = any NON-speaker track whose mouth is sharply open.
+                frame_triggered = False
+                for tid, face in tid_of.items():
+                    if tid == speaker_track_id:
+                        continue
+                    r = _mouth_open_ratio(face)
+                    if r is None:
+                        continue
+                    # Maintain a soft baseline per track; a fresh face starts
+                    # at its own ratio so it must spike, not just be open.
+                    base = track_mouth_base.get(tid)
+                    if base is None:
+                        track_mouth_base[tid] = r
+                        continue
+                    track_mouth_base[tid] = base * 0.9 + r * 0.1
+                    # Reaction = sharp INCREASE over that track's own baseline
+                    # (absolute jump), not a high absolute ratio — everyone's
+                    # mouth moves while talking, so a fixed ratio threshold
+                    # would never fire during an interview.
+                    delta = r - base
+                    # Debug: log reactor mouth deltas so we can calibrate the
+                    # spike threshold against real footage.
+                    if debug_track and delta > 0.15:
+                        print(
+                            f"[reactor] f={frame_no} tid={tid} r={r:.2f} base={base:.2f} "
+                            f"delta={delta:.2f} streak={split_react_streak}",
+                            flush=True,
+                        )
+                    if delta > SPLIT_MOUTH_DELTA:
+                        split_react_streak += 1
+                        split_reactor_id = tid
+                        frame_triggered = True
+                        if split_react_streak >= SPLIT_REACT_FRAMES:
+                            reactor_hit = True
+                            split_react_streak = SPLIT_REACT_FRAMES
+                # KEY FIX: reset the streak only when NO track triggered this
+                # frame. Previously a non-triggering track (e.g. a face that
+                # failed to match and got tid=None) would reset the streak
+                # that another track had just built up, so the confirm window
+                # could never complete.
+                if not frame_triggered:
+                    split_react_streak = 0
+            if reactor_hit and split_state == "idle":
+                split_state = "fading_in"
+                split_hold = 0
+            # NOTE: do NOT reset split_react_streak here when !reactor_hit —
+            # reactor_hit only turns true after the streak already reached
+            # SPLIT_REACT_FRAMES, so a reset here would wipe the confirm
+            # window every frame. The streak is reset inside the detection
+            # loop only when no track triggered this frame.
+
+        # Advance the split state machine with smooth fade alpha.
+        if split_state == "fading_in":
+            split_alpha = min(1.0, split_alpha + 1.0 / max(SPLIT_FADE_FRAMES, 1))
+            if split_alpha >= 1.0:
+                split_state = "active"
+                split_hold = 0
+        elif split_state == "active":
+            split_hold += 1
+            # If the reactor face disappeared (only one face remains), fade
+            # back to the single view. Use a short anti-flicker window so a
+            # single missed frame doesn't pop the layout.
+            if cur_faces is None or len(cur_faces) < 2:
+                split_single_frames += 1
+                if split_single_frames >= SPLIT_SINGLE_FRAMES:
+                    split_state = "fading_out"
+            else:
+                split_single_frames = 0
+            # Stay in split while the reactor keeps reacting; after the hold
+            # window the layout fades back to the single speaker.
+            if split_state == "active" and split_hold >= SPLIT_HOLD_FRAMES and split_react_streak == 0:
+                split_state = "fading_out"
+        elif split_state == "fading_out":
+            split_alpha = max(0.0, split_alpha - 1.0 / max(SPLIT_FADE_FRAMES, 1))
+            if split_alpha <= 0.0:
+                split_state = "idle"
+                split_reactor_id = None
+                split_single_frames = 0
+
+        # ------------------------------------------------------------------
+        # Render the frame: single view (default) or split layout.
+        # ------------------------------------------------------------------
+        # Always build the single (body-anchored) crop first — it is the base
+        # layer for the fade and the full-frame output when not splitting.
         if RENDER_FACE_ZOOM < 0.999:
             z = 1.0 / RENDER_FACE_ZOOM
             crop_w_z = min(src_w, int(crop_w * z))
             crop_h_z = min(src_h, int(crop_h * z))
-            # Center the window on the body anchor: face at body_anchor of the
-            # crop height, i.e. window center = cy + (0.5 - body_anchor) * h.
             anchor_y = cy + (0.5 - body_anchor) * crop_h_z
-            x0 = int(max(0, min(src_w - crop_w_z, cx - crop_w_z / 2)))
-            y0 = int(max(0, min(src_h - crop_h_z, anchor_y - crop_h_z / 2)))
-            window = frame[y0:y0 + crop_h_z, x0:x0 + crop_w_z]
+            x0_single = int(max(0, min(src_w - crop_w_z, cx - crop_w_z / 2)))
+            y0_single = int(max(0, min(src_h - crop_h_z, anchor_y - crop_h_z / 2)))
+            window = frame[y0_single:y0_single + crop_h_z, x0_single:x0_single + crop_w_z]
             if window.shape[1] != crop_w or window.shape[0] != crop_h:
                 window = cv2.resize(window, (crop_w, crop_h), interpolation=cv2.INTER_AREA)
-            cropped = window
+            single_crop = window
         else:
             anchor_y = cy + (0.5 - body_anchor) * crop_h
-            x0 = int(max(0, min(src_w - crop_w, cx - crop_w / 2)))
-            y0 = int(max(0, min(src_h - crop_h, anchor_y - crop_h / 2)))
-            cropped = frame[y0:y0 + crop_h, x0:x0 + crop_w]
+            x0_single = int(max(0, min(src_w - crop_w, cx - crop_w / 2)))
+            y0_single = int(max(0, min(src_h - crop_h, anchor_y - crop_h / 2)))
+            single_crop = frame[y0_single:y0_single + crop_h, x0_single:x0_single + crop_w]
+
+        if split_enabled and split_alpha > 0.0:
+            # Build both regions from the source frame.
+            top_h = int(crop_h * SPLIT_TOP_RATIO)
+            bot_h = crop_h - top_h
+            # Speaker crop (top region). Zoom OUT (<1.0) so the subject is not
+            # clipped at the seam/edges — a too-tight crop cuts head/shoulders.
+            top_region = _crop_region(frame, cx, cy, crop_w, top_h, zoom=0.75)
+            # Reactor crop (bottom region). If we have a reactor track, use it;
+            # otherwise fall back to the second-largest face center. If fewer
+            # than two faces are present (reactor already gone), keep the
+            # bottom region on the same speaker so the fade-out still looks
+            # clean instead of cropping an arbitrary spot.
+            rcx, rcy = cx, cy + 80
+            if split_reactor_id is not None:
+                rt = next((t for t in face_tracks if t["track_id"] == split_reactor_id), None)
+                if rt is not None:
+                    rcx, rcy = rt["cx"], rt["cy"]
+            elif cur_faces and len(cur_faces) > 1:
+                second = sorted(cur_faces, key=lambda f: -f["w"] * f["h"])[1]
+                rcx, rcy = second["cx"], second["cy"]
+            bot_region = _crop_region(frame, rcx, rcy, crop_w, bot_h, zoom=0.9)
+
+            split_frame = np.vstack([top_region, bot_region])
+            # Thin divider line at the seam (dark, subtle).
+            cv2.line(split_frame, (0, top_h - 1), (crop_w, top_h - 1), (20, 20, 20), 3)
+
+            # Fade between single view and split layout (alpha 0→1).
+            cropped = cv2.addWeighted(single_crop, 1.0 - split_alpha, split_frame, split_alpha, 0)
+        else:
+            cropped = single_crop
         writer.write(cropped)
 
     cap.release()
