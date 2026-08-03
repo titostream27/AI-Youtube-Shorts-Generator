@@ -196,3 +196,9 @@ class RenderResponse(BaseModel):
     job_id: str
     source_video: str
     rendered: List[Dict]
+    # Phase 2/4 (brief §23): structured QC artifacts + job metadata exposed on
+    # the response so GET /api/render/status/:id can return them without
+    # re-parsing the persisted payload.
+    artifacts: Optional[List[Dict]] = None
+    mode: str = "final"
+    source: Optional[Dict] = None

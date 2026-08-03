@@ -28,6 +28,7 @@ from shorts_generator.local.downloader import download_youtube_local
 
 from render_contract import (
     CaptionRequest,
+    CaptionWord,
     ClipRequest,
     RenderArtifact,
     RenderJobStatus,
@@ -1649,8 +1650,8 @@ def _render(request) -> RenderResponse:
                             final_path,
                         ], check=True)
                         os.replace(final_path, out_path)
-                        item["hook"] = c.hook
-                        print(f"[render] clip {i}: hook intro prepended ({c.hook[:50]}...)", flush=True)
+                        item["hook"] = c["hook"]
+                        print(f"[render] clip {i}: hook intro prepended ({c['hook'][:50]}...)", flush=True)
                 except Exception as e:  # noqa: BLE001
                     print(f"[render] clip {i}: hook intro failed ({e}), continuing without it", flush=True)
 
@@ -1748,6 +1749,7 @@ def _render(request) -> RenderResponse:
             if item["status"] == "ok":
                 item["clip_path"] = os.path.abspath(out_path)
                 item["clip_url"] = f"{job_id}/{os.path.basename(out_path)}"
+                item["video_url"] = f"{job_id}/{os.path.basename(out_path)}"
                 artifact.status = "ok"
                 artifact.video_url = f"{job_id}/{os.path.basename(out_path)}"
                 artifact.actual_layout = clip_layout
@@ -1807,6 +1809,9 @@ def _render(request) -> RenderResponse:
         job_id=job_id,
         source_video=source,
         rendered=rendered,
+        artifacts=[a.model_dump() for a in artifacts],
+        mode=mode,
+        source=src_info or {},
     )
 
 
