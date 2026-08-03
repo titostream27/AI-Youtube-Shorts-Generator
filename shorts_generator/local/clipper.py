@@ -1060,20 +1060,69 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         # foreground (the face crop) — no extreme upscale of the subject.
         if layout_mode == "blur_background":
             try:
-                bg = cv2.resize(frame, (output_w, output_h), interpolation=cv2.INTER_AREA)
+                # Center-crop the source to the target 9:16 ratio BEFORE resize
+                # so the background never stretches (16:9->9:16 directly would
+                # distort the subject and duplicate elements near the edges).
+                src_w = frame.shape[1]
+                src_h = frame.shape[0]
+                target_ratio = output_w / output_h  # 0.5625 for 1080x1920
+                if src_w / src_h > target_ratio:
+                    new_w = int(src_h * target_ratio)
+                    x0 = (src_w - new_w) // 2
+                    bg_src = frame[:, x0:x0 + new_w]
+                else:
+                    new_h = int(src_w / target_ratio)
+                    y0 = (src_h - new_h) // 2
+                    bg_src = frame[y0:y0 + new_h, :]
+                bg = cv2.resize(bg_src, (output_w, output_h), interpolation=cv2.INTER_AREA)
                 # Blur amount: 1.0 = strong (original), 0.2 = subtle ~20%.
+                # The kernel must be LARGE at 1080p: a small Gaussian leaves
+                # readable content and "sepotong" artifacts near the edges.
+                # Use a strong floor (>= 0.35) so faces/objects in the blurred
+                # background are unidentifiable, even at subtle preference.
                 blur_amount = float(os.getenv("RENDER_LAYOUT_BLUR_AMOUNT", "0.2"))
-                k = max(1, int(output_h * 0.02 * blur_amount) | 1)
+                k = max(1, int(output_h * 0.10 * max(blur_amount, 0.35)) | 1)
                 if k > 1:
                     bg = cv2.GaussianBlur(bg, (k, k), 0)
-                # Darken the background slightly so the foreground pops.
-                bg = cv2.addWeighted(bg, 0.75, np.zeros_like(bg), 0, 0)
-                # Foreground: the crop resized to ~88% width, centered — big
-                # enough that the blurred border stays thin (user: blur frame
-                # was too large before at 70%).
-                fg_h = int(output_h * 0.78)
+                # Darken the background so the foreground pops and leftover
+                # background texture reads as depth, not content.
+                bg = cv2.addWeighted(bg, 0.55, np.zeros_like(bg), 0, 0)
+                # Foreground: tight crop of the ACTIVE SPEAKER ONLY (head +
+                # shoulders). A full-width crop of a two-person shot would show
+                # both people and clip the guest at the bottom edge
+                # ("sepotong" look). The speaker face box is tracked per-frame,
+                # so the foreground follows the person actually talking.
+                fg_src = cropped
+                try:
+                    spk = next((t for t in face_tracks if t["track_id"] == speaker_track_id), None)
+                    if spk is None and face_tracks:
+                        spk = sorted(face_tracks, key=lambda t: -t["w"] * t["h"])[0]
+                    if spk is not None:
+                        # Box around the speaker face (head + upper shoulders).
+                        # If a second person is visible, clamp the width to
+                        # half the face-to-face gap so the OTHER person never
+                        # leaks into the foreground ("sepotong" look).
+                        fw = max(int(spk["w"] * 2.6), 240)
+                        if cur_faces and len(cur_faces) > 1:
+                            others = [
+                                f for f in cur_faces
+                                if abs(f["cx"] - spk["cx"]) > 10 or abs(f["cy"] - spk["cy"]) > 10
+                            ]
+                            if others:
+                                nearest = min(others, key=lambda f: ((f["cx"] - spk["cx"]) ** 2 + (f["cy"] - spk["cy"]) ** 2) ** 0.5)
+                                gap = abs(nearest["cx"] - spk["cx"])
+                                fw = min(fw, max(int(gap * 1.1), 200))
+                        fh = int(fw / (9 / 16))
+                        fh = min(fh, src_h)
+                        fg_src = _crop_region(frame, spk["cx"], spk["cy"], fw, fh, zoom=1.0)
+                except Exception:  # noqa: BLE001
+                    fg_src = cropped
+
                 fg_w = int(output_w * 0.88)
-                fg = cv2.resize(cropped, (fg_w, fg_h), interpolation=cv2.INTER_LANCZOS4)
+                crop_ar = fg_src.shape[1] / max(fg_src.shape[0], 1)
+                fg_h = int(fg_w / crop_ar) if crop_ar > 0 else output_h
+                fg_h = min(fg_h, output_h)
+                fg = cv2.resize(fg_src, (fg_w, fg_h), interpolation=cv2.INTER_LANCZOS4)
                 x0 = (output_w - fg_w) // 2
                 y0 = (output_h - fg_h) // 2
                 bg[y0:y0 + fg_h, x0:x0 + fg_w] = fg
