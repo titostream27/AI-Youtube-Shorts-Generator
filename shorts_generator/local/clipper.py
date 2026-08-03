@@ -216,6 +216,15 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
     focus_lost_grace_frames = int(fps * RENDER_FOCUS_LOST_GRACE_S) if fps > 0 else 15
     active_focus_track_id: Optional[int] = None
     focus_track: Optional[Dict] = None  # set each frame in the focus-lock phase
+    # Anti-shake / anti-zoom state for the blur_background tight speaker crop.
+    blur_fg_cx: Optional[float] = None
+    blur_fg_cy: Optional[float] = None
+    blur_fg_fw: Optional[float] = None
+    # Locked second panel for the 2-person split: picked once, kept until it
+    # disappears (prevents flickering between a real person and a random
+    # background object every frame).
+    blur_second_id: Optional[int] = None
+    blur_second_miss: int = 0
     # Phase 4 (brief §23): per-reframe QC stats.
     global _RENDER_STATS
     _RENDER_STATS = {
@@ -1087,34 +1096,89 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                 # Darken the background so the foreground pops and leftover
                 # background texture reads as depth, not content.
                 bg = cv2.addWeighted(bg, 0.55, np.zeros_like(bg), 0, 0)
-                # Foreground: tight crop of the ACTIVE SPEAKER ONLY (head +
-                # shoulders). A full-width crop of a two-person shot would show
-                # both people and clip the guest at the bottom edge
-                # ("sepotong" look). The speaker face box is tracked per-frame,
-                # so the foreground follows the person actually talking.
+                # Foreground — dynamic per speaker count:
+                #  - 1 tracked face -> tight crop around the active speaker
+                #  - 2+ TRACKED faces (persistent, comparable size) -> two-panel
+                #    split (speaker TOP, other BOTTOM)
+                #
+                # Tracking, NOT raw detection, decides: a static bust/doll in
+                # the background may get detected as a face for a few frames,
+                # but it never becomes a persistent track, so it won't hijack
+                # the layout.
+                #
+                # Anti-zoom: crop width EMA'd very slowly -> constant upscale.
+                # Anti-shake: position from last_center + slow EMA.
+                # Zoom-out keeps the head inside ("muka kepotong" fix).
                 fg_src = cropped
                 try:
                     spk = next((t for t in face_tracks if t["track_id"] == speaker_track_id), None)
                     if spk is None and face_tracks:
                         spk = sorted(face_tracks, key=lambda t: -t["w"] * t["h"])[0]
                     if spk is not None:
-                        # Box around the speaker face (head + upper shoulders).
-                        # If a second person is visible, clamp the width to
-                        # half the face-to-face gap so the OTHER person never
-                        # leaks into the foreground ("sepotong" look).
-                        fw = max(int(spk["w"] * 2.6), 240)
-                        if cur_faces and len(cur_faces) > 1:
+                        # Split only when another REAL person is persistently
+                        # tracked with comparable size (busts/statues are much
+                        # smaller or never become persistent tracks). The
+                        # second panel is LOCKED to one track so it does not
+                        # flicker between people/objects every frame.
+                        second = None
+                        if split_enabled and len(face_tracks) >= 2:
                             others = [
-                                f for f in cur_faces
-                                if abs(f["cx"] - spk["cx"]) > 10 or abs(f["cy"] - spk["cy"]) > 10
+                                t for t in face_tracks
+                                if t["track_id"] != spk["track_id"]
+                                and t["w"] >= spk["w"] * 0.45  # comparable size
                             ]
-                            if others:
-                                nearest = min(others, key=lambda f: ((f["cx"] - spk["cx"]) ** 2 + (f["cy"] - spk["cy"]) ** 2) ** 0.5)
-                                gap = abs(nearest["cx"] - spk["cx"])
-                                fw = min(fw, max(int(gap * 1.1), 200))
-                        fh = int(fw / (9 / 16))
-                        fh = min(fh, src_h)
-                        fg_src = _crop_region(frame, spk["cx"], spk["cy"], fw, fh, zoom=1.0)
+                            if blur_second_id is not None:
+                                locked = next(
+                                    (t for t in others if t["track_id"] == blur_second_id), None
+                                )
+                                if locked is not None:
+                                    second = locked
+                                    blur_second_miss = 0
+                                else:
+                                    blur_second_miss += 1
+                                    # Grace ~0.5s before releasing the lock.
+                                    if blur_second_miss > max(1, int(fps * 0.5)):
+                                        blur_second_id = None
+                            if second is None and others:
+                                second = sorted(others, key=lambda t: -t["w"] * t["h"])[0]
+                                blur_second_id = second["track_id"]
+                                blur_second_miss = 0
+                        if second is not None:
+                            top_h = int(crop_h * 0.55)
+                            bot_h = crop_h - top_h
+                            # Panel width: tight around the FACE (2.6x face
+                            # width). The source is a 3-panel podcast where
+                            # crop_w spans nearly a full panel, so a wide crop
+                            # would include the neighbouring person
+                            # ("setengah objek 1 dan 2"). A face-sized crop
+                            # keeps exactly one person per panel.
+                            p_w = max(int(spk["w"] * 2.6), 280)
+                            p_w = min(p_w, crop_w)
+                            top_region = _crop_region(frame, spk["cx"], spk["cy"], p_w, top_h, zoom=0.9)
+                            bot_region = _crop_region(frame, second["cx"], second["cy"], p_w, bot_h, zoom=0.9)
+                            fg_src = np.vstack([top_region, bot_region])
+                        else:
+                            fw = max(int(spk["w"] * 3.2), 340)
+                            if blur_fg_fw is None:
+                                blur_fg_fw = fw
+                            else:
+                                # Very slow EMA -> constant size -> no zoom.
+                                blur_fg_fw = blur_fg_fw + (fw - blur_fg_fw) * 0.05
+                            fw = int(blur_fg_fw)
+                            fh = int(fw / (9 / 16))
+                            fh = min(fh, src_h)
+                            if last_center is not None:
+                                raw_cx, raw_cy = last_center
+                            else:
+                                raw_cx, raw_cy = spk["cx"], spk["cy"]
+                            alpha = 0.18
+                            if blur_fg_cx is None:
+                                blur_fg_cx = raw_cx
+                                blur_fg_cy = raw_cy
+                            else:
+                                blur_fg_cx = blur_fg_cx + (raw_cx - blur_fg_cx) * alpha
+                                blur_fg_cy = blur_fg_cy + (raw_cy - blur_fg_cy) * alpha
+                            fg_src = _crop_region(frame, blur_fg_cx, blur_fg_cy, fw, fh, zoom=0.85)
                 except Exception:  # noqa: BLE001
                     fg_src = cropped
 
