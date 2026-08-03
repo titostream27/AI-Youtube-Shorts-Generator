@@ -650,17 +650,36 @@ def _burn_karaoke_captions(
     # Merge overlapping ASR cues into non-overlapping continuous lines, so only
     # one caption line is on screen at any moment (fixes duplicate captions).
     lines = _normalize_cues(captions, clip_start)
+    print(f"[caption] normalize: {len(captions)} caps -> {len(lines)} lines (clip_start={clip_start:.2f})", flush=True)
     if not lines:
         return 0
 
-    # Video properties.
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"could not open {video_path}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
+    # Video properties. Use ffprobe (not cv2.VideoCapture) so FFV1/mkv
+    # lossless intermediates work — OpenCV's VideoCapture cannot decode FFV1
+    # and silently returns 0 frames, which erased every caption.
+    try:
+        import json as _json
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate",
+             "-of", "json", video_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        probe_data = _json.loads(probe.stdout)["streams"][0]
+        width = int(probe_data["width"])
+        height = int(probe_data["height"])
+        rfr = probe_data.get("r_frame_rate", "25/1").split("/")
+        fps = float(rfr[0]) / float(rfr[1]) if len(rfr) == 2 and float(rfr[1]) else 25.0
+    except Exception:  # noqa: BLE001
+        # Fallback: cv2 (works for plain mp4/h264 sources).
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"could not open {video_path}")
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+    print(f"[caption] video {os.path.basename(video_path)}: {width}x{height} fps={fps:.3f}", flush=True)
 
     # ── Phase 3 (brief §44): face collision avoidance needs face boxes ──
     # The clipper tracks faces per frame; the reframe stage exports the last
@@ -742,11 +761,10 @@ def _burn_karaoke_captions(
             visual_lines.append({"items": cur, "width": cur_w})
 
     # ── Phase 3 (brief §44): max 2 visible lines ──
-    # If more than caption_max_lines are active at once (shouldn't happen with
-    # per-cue wrapping, but guard against ASR cue overlap), keep only the most
-    # recent lines so the caption never fills the screen.
-    if caption_max_lines >= 1:
-        visual_lines = visual_lines[-caption_max_lines:]
+    # NOTE: we do NOT slice the global list here (that would keep only the
+    # last two lines of the WHOLE clip — every earlier caption would vanish).
+    # The limit is applied per-frame inside compose() instead: at any moment
+    # only the most recent caption_max_lines are drawn.
 
     overlay_dir = os.path.join(work_dir, "overlay")
     os.makedirs(overlay_dir, exist_ok=True)
@@ -767,6 +785,10 @@ def _burn_karaoke_captions(
             line for line in visual_lines
             if (min(it["start"] for it in line["items"]) - lead_sec) <= ts <= (max(it["end"] for it in line["items"]) + hold_sec)
         ]
+        # Phase 3 (brief §44): max 2 visible lines at any moment — keep the
+        # most recent ones (end time latest first), not the whole history.
+        if caption_max_lines >= 1 and len(active_lines) > caption_max_lines:
+            active_lines = sorted(active_lines, key=lambda l: max(it["end"] for it in l["items"]))[-caption_max_lines:]
         if not active_lines:
             canvas.save(path)
             return
@@ -806,17 +828,45 @@ def _burn_karaoke_captions(
             y += line["items"][0]["sprite"].height + line_gap
         canvas.save(path)
 
-    # Re-open to count frames properly.
-    cap = cv2.VideoCapture(video_path)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
+    # Re-open to count frames properly (ffprobe duration * fps; cv2 can't
+    # count FFV1 frames).
+    frame_count = 0
+    try:
+        import json as _json2
+        probe2 = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "json", video_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        dur2 = float(_json2.loads(probe2.stdout)["format"]["duration"])
+        frame_count = int(round(dur2 * fps))
+    except Exception:  # noqa: BLE001
+        try:
+            cap = cv2.VideoCapture(video_path)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+        except Exception:  # noqa: BLE001
+            frame_count = 0
+    if frame_count <= 0:
+        frame_count = 1
+    print(f"[caption] frame_count={frame_count} (dur*fps)", flush=True)
 
     overlay_paths: List[str] = []
+    non_empty_overlays = 0
     for i in range(frame_count):
         ts = i / fps
         p = os.path.join(overlay_dir, f"ov_{i:05d}.png")
         compose(ts, p)
+        # Quick check: count overlays with actual content (non-transparent).
+        try:
+            from PIL import Image as _Img
+            _ov = _Img.open(p).convert("RGBA")
+            if _ov.getextrema()[3][1] > 0:
+                non_empty_overlays += 1
+        except Exception:  # noqa: BLE001
+            pass
         overlay_paths.append(p)
+    print(f"[caption] overlay: {non_empty_overlays}/{frame_count} frames with content", flush=True)
 
     # Composite overlays over the video with ffmpeg.
     # ── Phase 3 (brief §39): keep this intermediate LOSSLESS (FFV1). The

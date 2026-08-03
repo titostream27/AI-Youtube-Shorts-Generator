@@ -1009,13 +1009,18 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         if layout_mode == "blur_background":
             try:
                 bg = cv2.resize(frame, (output_w, output_h), interpolation=cv2.INTER_AREA)
-                k = max(1, int(output_h * 0.02) | 1)
-                bg = cv2.GaussianBlur(bg, (k, k), 0)
+                # Blur amount: 1.0 = strong (original), 0.2 = subtle ~20%.
+                blur_amount = float(os.getenv("RENDER_LAYOUT_BLUR_AMOUNT", "0.2"))
+                k = max(1, int(output_h * 0.02 * blur_amount) | 1)
+                if k > 1:
+                    bg = cv2.GaussianBlur(bg, (k, k), 0)
                 # Darken the background slightly so the foreground pops.
                 bg = cv2.addWeighted(bg, 0.75, np.zeros_like(bg), 0, 0)
-                # Foreground: the crop resized to ~70% width, centered.
-                fg_h = int(output_h * 0.62)
-                fg_w = int(output_w * 0.70)
+                # Foreground: the crop resized to ~88% width, centered — big
+                # enough that the blurred border stays thin (user: blur frame
+                # was too large before at 70%).
+                fg_h = int(output_h * 0.78)
+                fg_w = int(output_w * 0.88)
                 fg = cv2.resize(cropped, (fg_w, fg_h), interpolation=cv2.INTER_LANCZOS4)
                 x0 = (output_w - fg_w) // 2
                 y0 = (output_h - fg_h) // 2
