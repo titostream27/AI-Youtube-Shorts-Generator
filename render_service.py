@@ -662,6 +662,17 @@ def _burn_karaoke_captions(
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
 
+    # ── Phase 3 (brief §44): face collision avoidance needs face boxes ──
+    # The clipper tracks faces per frame; the reframe stage exports the last
+    # frame's tracks via get_last_face_tracks() so the caption composer can
+    # avoid covering the speaker's mouth.
+    try:
+        from shorts_generator.local.clipper import get_last_face_tracks
+        face_tracks_ref, speaker_track_id_ref = get_last_face_tracks()
+    except Exception:  # noqa: BLE001
+        face_tracks_ref = []
+        speaker_track_id_ref = None
+
     # Pre-render sprites per word (active + idle) and lay words into wrapped
     # visual lines (max ~92% of frame width). Each visual line keeps the word
     # ordering so we can compute the active word from elapsed time.
@@ -737,10 +748,31 @@ def _burn_karaoke_captions(
             canvas.save(path)
             return
 
+        # ── Phase 3 (brief §44): face collision avoidance ──
+        # When enabled, drop the bottom-margin anchor down/up around a detected
+        # face (mouth zone) so captions never cover the speaker's mouth.
+        face_avoid = os.getenv("RENDER_CAPTION_FACE_AVOIDANCE", "1") != "0"
+        mouth_zone: Optional[Tuple[int, int, int, int]] = None  # (x0,y0,x1,y1)
+        if face_avoid and face_tracks_ref:
+            # Find the current speaker's face box; anchor captions above or
+            # below it depending on which half of the frame it occupies.
+            sp = next((t for t in face_tracks_ref if t.get("track_id") == speaker_track_id_ref), None)
+            f = sp or (max(face_tracks_ref, key=lambda t: t.get("area", 0)) if face_tracks_ref else None)
+            if f is not None and f.get("w"):
+                bx0 = int(max(0, f["cx"] - f["w"] / 2))
+                by0 = int(max(0, f["cy"] - f["h"] / 2))
+                bx1 = int(min(width, f["cx"] + f["w"] / 2))
+                by1 = int(min(height, f["cy"] + f["h"] / 2))
+                mouth_zone = (bx0, by0, bx1, by1)
+
         # Stack active lines upward from the bottom margin (higher on screen to
         # clear the source video's own lower-third text/watermarks).
         total_h = sum(l["items"][0]["sprite"].height for l in active_lines) + line_gap * (len(active_lines) - 1)
         y = height - total_h - int(height * CAPTION_BOTTOM_MARGIN)
+        # If the speaker's face/mouth sits in the lower area where the caption
+        # block would go, move the block ABOVE the face instead.
+        if mouth_zone is not None and y < mouth_zone[3] and mouth_zone[3] > height * 0.35:
+            y = max(int(height * 0.12), mouth_zone[1] - total_h - line_gap)
         for line in active_lines:
             x = (width - line["width"]) // 2
             for item in line["items"]:
@@ -764,7 +796,10 @@ def _burn_karaoke_captions(
         overlay_paths.append(p)
 
     # Composite overlays over the video with ffmpeg.
-    tmp_out = out_path + ".captioned.mp4"
+    # ── Phase 3 (brief §39): keep this intermediate LOSSLESS (FFV1). The
+    # single lossy H.264 encode happens once at the very end of the pipeline,
+    # after captions AND hook are composited — never per-stage.
+    tmp_out = out_path + ".captioned.mkv"
     seq = os.path.join(overlay_dir, "ov_%05d.png")
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
@@ -772,7 +807,7 @@ def _burn_karaoke_captions(
         "-framerate", f"{fps:.3f}", "-i", seq,
         "-filter_complex", "[0:v][1:v]overlay=0:0[out]",
         "-map", "[out]", "-map", "0:a?",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+        "-c:v", "ffv1",
         "-c:a", "copy",
         "-shortest",
         tmp_out,
@@ -1149,6 +1184,7 @@ def _render(request: RenderRequest) -> RenderResponse:
                 request.aspect_ratio,
                 out_path,
                 cache_dir=str(RENDER_ROOT / "cache"),
+                final_encode=False,  # Phase 3: keep lossless until final H.264 pass
             )
 
             if c.captions:
@@ -1199,20 +1235,18 @@ def _render(request: RenderRequest) -> RenderResponse:
                     else:
                         print(f"[render] clip {i}: no captions inside window, skipping burn", flush=True)
 
-            item["status"] = "ok"
-            item["clip_path"] = os.path.abspath(out_path)
-            item["clip_url"] = f"{job_id}/{os.path.basename(out_path)}"
-
             # Phase 5: prepend the hook intro (frame + dim + hook text + TTS).
             if c.hook:
                 try:
                     intro_path = _build_hook_intro(out_path, c.hook, job_dir)
                     if intro_path:
-                        final_path = os.path.join(job_dir, f"short_{i:02d}_final.mp4")
+                        final_path = os.path.join(job_dir, f"short_{i:02d}_final.mkv")
                         # Concat intro + content with filter_complex. The plain
                         # concat demuxer + stream copy produces bloated durations
                         # (edge-tts AAC metadata + source timestamps), so we
-                        # re-encode both segments onto a clean 42.9s timeline.
+                        # re-encode both segments onto a clean timeline. Phase 3:
+                        # intermediate stays LOSSLESS (ffv1); the single H.264
+                        # encode happens in the final pass below.
                         sp.run([
                             "ffmpeg", "-y", "-loglevel", "error",
                             "-i", intro_path, "-i", out_path,
@@ -1223,9 +1257,8 @@ def _render(request: RenderRequest) -> RenderResponse:
                             "[1:a]aresample=44100,asetpts=PTS-STARTPTS[a1];"
                             "[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]",
                             "-map", "[v]", "-map", "[a]",
-                            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-                            "-profile:v", "high", "-level", "4.0",
-                            "-c:a", "aac", "-b:a", "128k",
+                            "-c:v", "ffv1",
+                            "-c:a", "aac", "-b:a", "192k",
                             final_path,
                         ], check=True)
                         os.replace(final_path, out_path)
@@ -1233,6 +1266,74 @@ def _render(request: RenderRequest) -> RenderResponse:
                         print(f"[render] clip {i}: hook intro prepended ({c.hook[:50]}...)", flush=True)
                 except Exception as e:  # noqa: BLE001
                     print(f"[render] clip {i}: hook intro failed ({e}), continuing without it", flush=True)
+
+            # ── Phase 3: single final H.264 encode (brief §39-40) ──
+            # All stages above (crop, captions, hook) are lossless intermediates.
+            # THIS is the one and only lossy encode: CRF 17, preset slow,
+            # High profile, yuv420p, faststart, AAC 192k. Phase 4 color
+            # correction (brief §49) rides on this same pass.
+            try:
+                final_h264 = os.path.join(job_dir, f"short_{i:02d}_h264.mp4")
+                crf = os.getenv("RENDER_VIDEO_CRF", "17")
+                preset = os.getenv("RENDER_VIDEO_PRESET", "slow")
+                color_filter = None
+                try:
+                    from visual_effects import build_color_filter
+                    color_filter = build_color_filter()
+                except Exception:  # noqa: BLE001
+                    color_filter = None
+                vf_parts = ["format=yuv420p"]
+                if color_filter:
+                    vf_parts.insert(0, color_filter)
+                cmd = [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-i", out_path,
+                    "-vf", ",".join(vf_parts),
+                    "-c:v", "libx264", "-preset", preset, "-crf", crf,
+                    "-profile:v", "high", "-level", "4.0",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    "-c:a", "copy",
+                    final_h264,
+                ]
+                sp.run(cmd, check=True)
+                os.replace(final_h264, out_path)
+            except Exception as e:  # noqa: BLE001
+                print(f"[render] clip {i}: final encode failed ({e}), keeping lossless intermediate", flush=True)
+
+            # ── Phase 3 (brief §45): audio mastering chain ──
+            # Applied AFTER the final video encode: re-encodes audio only
+            # (video stream copied), so no extra video generation.
+            try:
+                from audio_master import master_audio
+                mastered = os.path.join(job_dir, f"short_{i:02d}_mastered.mp4")
+                result = master_audio(out_path, mastered)
+                if result and result != out_path:
+                    os.replace(mastered, out_path)
+            except Exception as e:  # noqa: BLE001
+                print(f"[render] clip {i}: audio mastering failed ({e}), keeping original", flush=True)
+
+            # ── Phase 4 (brief §50): automated quality gate ──
+            # Run QC on the FINAL file (after hook + final encode + mastering).
+            # When QC_BLOCK_UPLOAD=1 and the video fails, mark the clip failed
+            # so the publisher refuses to upload.
+            try:
+                from quality_gate import quality_gate
+                qc = quality_gate(out_path)
+                item["quality"] = {
+                    "status": qc["status"],
+                    "score": qc["quality_score"],
+                    "warnings": qc["warnings"][:6],
+                }
+                if qc["status"] != "pass":
+                    item["status"] = "error"
+                    item["error"] = f"quality gate failed: {qc['warnings'][:3]}"
+                    print(f"[render] clip {i}: QC FAILED ({qc['warnings'][:3]})", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[render] clip {i}: quality gate error ({e}), continuing", flush=True)
+
+            if item["status"] == "ok":
+                item["clip_path"] = os.path.abspath(out_path)
+                item["clip_url"] = f"{job_id}/{os.path.basename(out_path)}"
 
             # Phase 7: auto thumbnail (best face frame + hook text).
             try:

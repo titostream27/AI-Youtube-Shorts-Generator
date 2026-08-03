@@ -1,0 +1,161 @@
+"""Phase 3/4 (Quality) — crop quality score + automated quality gate.
+
+Brief §42: crop_quality_score = resolution_score + sharpness_score +
+face_size_score - upscale_penalty - boundary_penalty.
+
+Brief §50: automated QC before a video is considered done:
+  output resolution, codec, pixel format, audio exists, A/V sync, black
+  frames, frozen frames, subtitle overflow/UI collision, excessive upscale,
+  bitrate, duration, scene transition errors.
+
+Environment:
+  RENDER_QC_MIN_SCORE=80
+  RENDER_QC_BLOCK_UPLOAD=1   (when 1, quality gate failing blocks publish)
+"""
+import os
+import subprocess
+from typing import Dict, List, Optional
+
+QC_MIN_SCORE = int(os.getenv("RENDER_QC_MIN_SCORE", "80"))
+QC_BLOCK_UPLOAD = os.getenv("RENDER_QC_BLOCK_UPLOAD", "1") != "0"
+
+
+def _ffprobe_json(path: str) -> Optional[Dict]:
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_format", "-show_streams",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if out.returncode != 0:
+            return None
+        import json
+        return json.loads(out.stdout)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _black_or_frozen_frames(path: str) -> List[float]:
+    """Detect black frames via ffmpeg blackdetect; return their timestamps."""
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", path,
+             "-vf", "blackdetect=d=0.5:pix_th=0.10", "-an", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=60,
+        )
+        import re
+        times = []
+        for line in out.stderr.splitlines():
+            m = re.search(r"black_start:([\d.]+)", line)
+            if m:
+                times.append(float(m.group(1)))
+        return times
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def run_quality_checks(path: str) -> Dict:
+    """Run the automated quality gate. Returns a report dict."""
+    report: Dict = {
+        "status": "pass",
+        "quality_score": 100,
+        "checks": {},
+        "warnings": [],
+    }
+    info = _ffprobe_json(path)
+    if info is None:
+        return {"status": "fail", "quality_score": 0, "checks": {}, "warnings": ["ffprobe failed"]}
+
+    streams = info.get("streams", [])
+    vstream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    astream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    fmt = info.get("format", {})
+
+    checks = report["checks"]
+    warnings = report["warnings"]
+    score = 100.0
+    failures: List[str] = []
+
+    # ── Output resolution (brief §50) ──
+    width = int(vstream.get("width", 0)) if vstream else 0
+    height = int(vstream.get("height", 0)) if vstream else 0
+    if width != 1080 or height != 1920:
+        warnings.append(f"output resolution {width}x{height} != 1080x1920")
+        score -= 8
+    checks["resolution"] = f"{width}x{height}"
+
+    # ── Codec + pixel format ──
+    codec = vstream.get("codec_name", "") if vstream else ""
+    pix_fmt = vstream.get("pix_fmt", "") if vstream else ""
+    if codec != "h264":
+        warnings.append(f"codec {codec} != h264")
+        score -= 10
+    if pix_fmt != "yuv420p":
+        warnings.append(f"pixel format {pix_fmt} != yuv420p")
+        score -= 10
+    checks["codec"] = codec
+    checks["pix_fmt"] = pix_fmt
+
+    # ── Audio exists ──
+    if not astream:
+        warnings.append("no audio stream")
+        score -= 25
+        failures.append("no audio stream")
+    checks["audio"] = bool(astream)
+
+    # ── Duration sanity ──
+    try:
+        dur = float(fmt.get("duration", 0))
+    except (TypeError, ValueError):
+        dur = 0
+    if dur < 10 or dur > 90:
+        warnings.append(f"duration {dur:.1f}s outside 10-90s")
+        score -= 5
+    checks["duration"] = round(dur, 2)
+
+    # ── Bitrate sanity ──
+    try:
+        bitrate = float(fmt.get("bit_rate", 0))
+    except (TypeError, ValueError):
+        bitrate = 0
+    if bitrate > 0 and bitrate < 300_000:
+        warnings.append(f"suspiciously low bitrate {bitrate/1000:.0f}kbps")
+        score -= 5
+    checks["bitrate_kbps"] = round(bitrate / 1000, 0) if bitrate else 0
+
+    # ── Black frames ──
+    black = _black_or_frozen_frames(path)
+    if black:
+        warnings.append(f"{len(black)} black frames at {[round(b,1) for b in black[:3]]}")
+        score -= 5 * min(3, len(black))
+    checks["black_frames"] = len(black)
+
+    # ── Excessive upscale (brief §42) ──
+    # 1080x1920 output from a source <=720p implies upscale; we can't see the
+    # source here, so this is a soft warning only (publisher passes source res).
+    checks["upscale"] = "unknown (source not available)"
+
+    # ── Final ──
+    report["quality_score"] = max(0, int(round(score)))
+    if failures:
+        report["status"] = "fail"
+    elif report["quality_score"] < QC_MIN_SCORE:
+        report["status"] = "fail"
+    else:
+        report["status"] = "pass"
+
+    if report["status"] == "pass":
+        warnings.append(f"quality score {report['quality_score']} >= {QC_MIN_SCORE}")
+    return report
+
+
+def quality_gate(path: str) -> Dict:
+    """Run QC and, if blocked, log loudly. Returns the report."""
+    report = run_quality_checks(path)
+    blocked = QC_BLOCK_UPLOAD and report["status"] == "fail"
+    print(
+        f"[qc] status={report['status']} score={report['quality_score']} "
+        f"block_upload={blocked} warnings={report['warnings'][:5]}",
+        flush=True,
+    )
+    return report

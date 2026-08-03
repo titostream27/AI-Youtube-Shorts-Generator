@@ -12,6 +12,17 @@ import subprocess
 import time
 from typing import Dict, List, Optional, Tuple
 
+# ── Phase 3 (brief §44): last-frame face tracking snapshot ──
+# The reframe loop publishes its per-frame tracks here so downstream stages
+# (caption compositor) can avoid covering the speaker's mouth.
+_LAST_FACE_TRACKS: List[Dict] = []
+_LAST_SPEAKER_TRACK_ID: Optional[int] = None
+
+
+def get_last_face_tracks() -> Tuple[List[Dict], Optional[int]]:
+    """Return (face_tracks, speaker_track_id) from the most recent frame."""
+    return _LAST_FACE_TRACKS, _LAST_SPEAKER_TRACK_ID
+
 import numpy as np
 
 from ..config import LOCAL_OUTPUT_DIR
@@ -460,6 +471,11 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
                 challenger_id = None
                 challenger_streak = 0
 
+            # Publish per-frame tracking snapshot for caption face avoidance.
+            global _LAST_FACE_TRACKS, _LAST_SPEAKER_TRACK_ID
+            _LAST_FACE_TRACKS = new_tracks
+            _LAST_SPEAKER_TRACK_ID = speaker_track_id
+
             speaker_track = best
             speaker_track_id = speaker_track["track_id"]
             speaker_pos = (speaker_track["cx"], speaker_track["cy"])
@@ -571,8 +587,12 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
     # to the output canvas exactly (may stretch) — the target is 9:16 shorts.
     _ = output_ratio
 
-    silent_path = out_path + ".silent.mp4"
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    silent_path = out_path + ".silent.mkv"
+    # ── Phase 3: lossless intermediate (brief §39) ──
+    # mp4v is a LOSSY intermediate: source -> lossy cut -> mp4v -> lossy caption
+    # encode -> lossy hook -> platform = 4+ lossy generations. FFV1 is lossless
+    # (matroska container), so the ONLY lossy encode is the final H.264 pass.
+    fourcc = cv2.VideoWriter_fourcc(*"FFV1")
     writer = cv2.VideoWriter(silent_path, fourcc, fps, (output_w, output_h))
     debug_track = os.getenv("RENDER_DEBUG_TRACK", "0") == "1"
     frame_no = 0
@@ -974,27 +994,38 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
     import gc
     gc.collect()
 
-    # Mux audio from the cut clip back onto the silent reframed video.
+    # ── Phase 3: lossless audio mux (brief §39) ──
+    # Mux the source audio onto the silent FFV1 video, preserving audio
+    # losslessly (pcm/aac copy). NO video re-encode here — the caller decides
+    # the final encode. Returns the .mkv (lossless) path.
+    muxed_path = silent_path + ".muxed.mkv"
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", silent_path,
         "-i", in_path,
-        "-c:v", "copy",
-        "-c:a", "aac", "-b:a", "128k",
         "-map", "0:v:0", "-map", "1:a:0?",
+        "-c:v", "copy",
+        "-c:a", "copy",
         "-shortest",
-        out_path,
+        muxed_path,
     ]
     subprocess.run(cmd, check=True)
-    os.remove(silent_path)
-    return out_path
+    os.replace(muxed_path, silent_path)
+    return silent_path
 
 
 def _cache_key(source_path: str, start_time: float, end_time: float, aspect_ratio: str) -> str:
-    """Deterministic cache filename for a cut+reframe operation."""
+    """Deterministic cache filename for a cut+reframe operation.
+
+    Phase 2/3: the key includes the OUTPUT resolution and the pipeline version
+    so a 606x1080 mp4v cache from before the upgrade is never reused by the
+    1080x1920 FFV1 pipeline.
+    """
     src = os.path.splitext(os.path.basename(source_path))[0]
     ratio = aspect_ratio.replace(":", "x")
-    return f"{src}_{start_time:.2f}_{end_time:.2f}_{ratio}.mp4"
+    out_w = os.getenv("RENDER_OUTPUT_WIDTH", "1080")
+    out_h = os.getenv("RENDER_OUTPUT_HEIGHT", "1920")
+    return f"{src}_{start_time:.2f}_{end_time:.2f}_{ratio}_{out_w}x{out_h}.mp4"
 
 
 def crop_clip_local(
@@ -1004,6 +1035,7 @@ def crop_clip_local(
     aspect_ratio: str,
     out_path: str,
     cache_dir: Optional[str] = None,
+    final_encode: bool = True,
 ) -> str:
     """Cut + reframe one highlight, returning the local mp4 path.
 
@@ -1011,6 +1043,11 @@ def crop_clip_local(
     cached per (source, start, end, aspect). Re-rendering a clip — e.g. to
     change caption style — then skips the expensive cut-from-source and
     OpenCV reframe entirely.
+
+    Phase 3 (brief §39): `final_encode=False` leaves the output as the LOSSLESS
+    FFV1 intermediate so the caller (render_service) can composite captions /
+    hook losslessly and do ONE final H.264 pass. With the default True the
+    function finishes with H.264 (used by the CLI path).
     """
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
@@ -1024,7 +1061,41 @@ def crop_clip_local(
     cut_path = out_path + ".cut.mp4"
     try:
         _cut_subclip(source_path, start_time, end_time, cut_path)
-        _reframe_vertical(cut_path, out_path, aspect_ratio)
+        # FFV1 lossless reframe; _reframe_vertical returns the silent mkv.
+        silent_path = _reframe_vertical(cut_path, out_path, aspect_ratio)
+        if final_encode:
+            # Final H.264 (used by CLI/local mode).
+            crf = os.getenv("RENDER_VIDEO_CRF", "17")
+            preset = os.getenv("RENDER_VIDEO_PRESET", "slow")
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", silent_path,
+                "-i", cut_path,
+                "-c:v", "libx264", "-preset", preset, "-crf", crf,
+                "-profile:v", "high", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-c:a", "aac", "-b:a", "192k",
+                "-map", "0:v:0", "-map", "1:a:0?",
+                "-shortest",
+                out_path,
+            ]
+            subprocess.run(cmd, check=True)
+            for _attempt in range(5):
+                try:
+                    os.remove(silent_path)
+                    break
+                except OSError:
+                    time.sleep(0.3)
+        else:
+            # Lossless intermediate: copy the mkv to out_path (mkv container).
+            import shutil
+            shutil.copyfile(silent_path, out_path)
+            for _attempt in range(5):
+                try:
+                    os.remove(silent_path)
+                    break
+                except OSError:
+                    time.sleep(0.3)
     finally:
         if os.path.exists(cut_path):
             # Retry — Windows can briefly hold the handle (AV/scan/indexers).
