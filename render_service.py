@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -1528,6 +1528,23 @@ def _render(request) -> RenderResponse:
             item["status"] = "ok"
             artifact.status = "ok"
 
+            # Phase 4 (brief §23): structured tracking QC from the clipper.
+            try:
+                from shorts_generator.local.clipper import get_render_stats
+                stats = get_render_stats()
+                artifact.qc.focus_switch_count = int(stats.get("focus_switch_count", 0) or 0)
+                artifact.qc.focus_ping_pong_detected = bool(stats.get("focus_ping_pong_detected", False))
+                artifact.qc.random_crop_detected = bool(stats.get("random_crop_detected", False))
+                artifact.qc.face_cutoff_ratio = float(stats.get("face_cutoff_ratio", 0) or 0)
+                item["tracking_stats"] = {
+                    "focus_switch_count": artifact.qc.focus_switch_count,
+                    "focus_ping_pong_detected": artifact.qc.focus_ping_pong_detected,
+                    "face_cutoff_ratio": artifact.qc.face_cutoff_ratio,
+                    "frames": int(stats.get("frames", 0) or 0),
+                }
+            except Exception as e:  # noqa: BLE001
+                print(f"[render] clip {i}: tracking stats failed ({e}), continuing", flush=True)
+
             # ── Phase 3 (brief §46): long-pause trim ──
             # Optional: cut long silences inside the clip window. Disabled by
             # default (RENDER_TRIM_REMOVE_LONG_PAUSES=1 to enable) because it
@@ -1821,6 +1838,7 @@ def render_job_status(job_id: str):
             "job_id": job_id,
             "state": job["state"],
             "error": job.get("error"),
+            "mode": job.get("mode", "final"),
         }
         resp = job.get("response")
         if job["state"] == "done" and resp:
@@ -1849,8 +1867,13 @@ def render_job_status(job_id: str):
 
 
 @app.post("/api/render/async", response_model=RenderResponse)
-def render_async(request: Union[RenderRequest, RenderRequestV2]):
+def render_async(request: Dict[str, Any]):
     """Queue a render job (v1 or v2 contract) and return immediately.
+
+    The request is parsed MANUALLY (not via Union) so that a v2 body with
+    contract_version="2.0" is never mis-parsed as v1. FastAPI's Union tries
+    v1 first, and v1 ignores unknown fields — which silently dropped
+    mode=preview (brief §21) and made previews render as finals.
 
     The job runs in a background thread (still serialized by the process-wide
     lock). Clients poll GET /api/render/status/{job_id} for completion. This
@@ -1860,6 +1883,12 @@ def render_async(request: Union[RenderRequest, RenderRequestV2]):
     exists in a non-failed job, the EXISTING job id is returned instead of
     starting a duplicate render.
     """
+    # Parse manually: v2 body -> RenderRequestV2, otherwise v1 (legacy).
+    if isinstance(request, dict):
+        if request.get("contract_version") == "2.0":
+            request = RenderRequestV2(**request)
+        else:
+            request = RenderRequest(**request)
     request_id = getattr(request, "request_id", "") or ""
     if request_id:
         with _async_jobs_lock:
@@ -1877,7 +1906,7 @@ def render_async(request: Union[RenderRequest, RenderRequestV2]):
     mode = getattr(request, "mode", "final") or "final"
     episode_id = getattr(request, "episode_id", "") or ""
     with _async_jobs_lock:
-        _async_jobs[job_id] = {"state": "running", "response": None, "error": None, "request_id": request_id}
+        _async_jobs[job_id] = {"state": "running", "response": None, "error": None, "request_id": request_id, "mode": mode}
     _persist_job(job_id, "queued", mode=mode, episode_id=episode_id,
                  request=request.model_dump_json() if hasattr(request, "model_dump_json") else "")
 

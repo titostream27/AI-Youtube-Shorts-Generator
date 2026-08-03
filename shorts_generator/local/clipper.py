@@ -18,9 +18,24 @@ from typing import Dict, List, Optional, Tuple
 _LAST_FACE_TRACKS: List[Dict] = []
 _LAST_SPEAKER_TRACK_ID: Optional[int] = None
 
+# Phase 4 (Master Task Brief §23): structured QC tracking stats collected
+# during reframing, exposed via get_render_stats() for the renderer's QC.
+_RENDER_STATS: Dict[str, object] = {
+    "focus_switch_count": 0,
+    "focus_ping_pong_detected": False,
+    "random_crop_detected": False,
+    "face_cutoff_ratio": 0.0,
+    "frames": 0,
+    "switch_history": [],  # list of (track_id, frame_no)
+}
+
+
+def get_render_stats() -> Dict[str, object]:
+    """Return the last reframe's tracking stats (structured QC, brief §23)."""
+    return dict(_RENDER_STATS)
+
 
 def get_last_face_tracks() -> Tuple[List[Dict], Optional[int]]:
-    """Return (face_tracks, speaker_track_id) from the most recent frame."""
     return _LAST_FACE_TRACKS, _LAST_SPEAKER_TRACK_ID
 
 import numpy as np
@@ -200,6 +215,18 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
     focus_min_hold_frames = int(fps * RENDER_FOCUS_MIN_HOLD_S) if fps > 0 else 30
     focus_lost_grace_frames = int(fps * RENDER_FOCUS_LOST_GRACE_S) if fps > 0 else 15
     active_focus_track_id: Optional[int] = None
+    focus_track: Optional[Dict] = None  # set each frame in the focus-lock phase
+    # Phase 4 (brief §23): per-reframe QC stats.
+    global _RENDER_STATS
+    _RENDER_STATS = {
+        "focus_switch_count": 0,
+        "focus_ping_pong_detected": False,
+        "random_crop_detected": False,
+        "face_cutoff_ratio": 0.0,
+        "frames": 0,
+        "switch_history": [],
+    }
+    switch_history: List[Tuple[Optional[int], int]] = []
     candidate_focus_track_id: Optional[int] = None
     candidate_focus_since = 0
     focus_hold_frames = 0
@@ -652,6 +679,20 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                 flush=True,
             )
         frame_no += 1
+        # Phase 4 (brief §23): per-frame QC stats.
+        _RENDER_STATS["frames"] = int(_RENDER_STATS["frames"]) + 1
+        if focus_track is not None and src_h > 0:
+            # Face cutoff: fraction of the face box outside the vertical crop.
+            cut = max(0.0, (0 - focus_track["cy"] - focus_track["h"] / 2) / max(1, focus_track["h"]))
+            if focus_track["cy"] - focus_track["h"] / 2 < 0:
+                cut = max(cut, (-(focus_track["cy"] - focus_track["h"] / 2)) / max(1, focus_track["h"]))
+            _RENDER_STATS["face_cutoff_ratio"] = max(float(_RENDER_STATS["face_cutoff_ratio"]), min(1.0, cut))
+        # Ping-pong: 3+ switches between the same two tracks within 1s.
+        if len(switch_history) >= 3:
+            recent = switch_history[-3:]
+            ids = [s[0] for s in recent]
+            if ids[0] is not None and ids[0] == ids[2] and ids[1] is not None and ids[1] != ids[0]:
+                _RENDER_STATS["focus_ping_pong_detected"] = True
 
         if det is not None:
             # Anti-shake stage 1: median of recent detections (kills outliers).
@@ -729,6 +770,11 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                 else:
                     # No active focus — adopt the strongest stable track.
                     if best_track.get("score", 0) >= RENDER_FOCUS_MIN_CONFIDENCE:
+                        if active_focus_track_id is None:
+                            pass  # first adoption, not a switch
+                        else:
+                            _RENDER_STATS["focus_switch_count"] = int(_RENDER_STATS["focus_switch_count"]) + 1
+                            switch_history.append((best_track["track_id"], frame_no))
                         active_focus_track_id = best_track["track_id"]
                         focus_hold_frames = 0
                         focus_lost_frames = 0
@@ -750,6 +796,8 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                         candidate_focus_track_id = best_track["track_id"]
                         candidate_focus_since = 1
                     if candidate_focus_since >= focus_confirm_frames:
+                        _RENDER_STATS["focus_switch_count"] = int(_RENDER_STATS["focus_switch_count"]) + 1
+                        switch_history.append((best_track["track_id"], frame_no))
                         active_focus_track_id = best_track["track_id"]
                         focus_hold_frames = 0
                         candidate_focus_track_id = None

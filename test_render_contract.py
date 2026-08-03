@@ -119,5 +119,29 @@ class TestV1BackwardCompat(unittest.TestCase):
         self.assertEqual(v1.clips[0].hook, "This is the hook")
 
 
+class V2ModeRegression(unittest.TestCase):
+    """Regression (brief §21): v2 preview mode must not be lost (Union bug)."""
+
+    def test_v2_preview_mode_preserved(self):
+        v2_body = {
+            "contract_version": "2.0",
+            "request_id": "regression-preview",
+            "episode_id": "ep",
+            "video_url": "https://youtu.be/x",
+            "mode": "preview",
+            "clips": [
+                {"clip_id": 1, "start_sec": 1.0, "end_sec": 5.0, "speaker_id": None, "narrative": {}, "caption_plan": {"cues": []}}
+            ],
+        }
+        parsed = RenderRequestV2(**v2_body)
+        self.assertEqual(parsed.mode, "preview")
+        self.assertEqual(parsed.contract_version, "2.0")
+
+    def test_v1_backward_compat(self):
+        v1_body = {"video_url": "https://youtu.be/x", "clips": [{"clip_id": 1, "title": "t", "start_sec": 1.0, "end_sec": 5.0}]}
+        parsed = RenderRequest(**v1_body)
+        self.assertEqual(parsed.aspect_ratio, "9:16")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
