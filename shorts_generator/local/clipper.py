@@ -58,7 +58,7 @@ def _cut_subclip(source_path: str, start: float, end: float, out_path: str) -> s
     return out_path
 
 
-def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
+def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_events: Optional[List[Dict]] = None, layout_mode: str = "face_crop") -> str:
     """Crop the cut clip to the target aspect ratio, tracking faces if possible.
 
     Face tracking is DUAL-MODE: YuNet (ONNX DNN, stable) is tried first per
@@ -687,6 +687,27 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
 
         cx, cy = last_center
 
+        # ── Phase 4 (brief §47): semantic punch-in zoom ──
+        # Emphasis events (punchline / strong statement / important number)
+        # trigger a short extra zoom that eases in/out. RENDER_EMPHASIS_DURATION_S
+        # around each event; min interval keeps it from firing every second.
+        current_zoom = 1.0
+        if emphasis_events:
+            EMPH_DUR = float(os.getenv("RENDER_EMPHASIS_DURATION_S", "0.65"))
+            ts = frame_no / max(fps, 1)
+            best_ev = None
+            best_dist = 1e9
+            for ev in emphasis_events:
+                d = abs(ts - ev["time"])
+                if d <= EMPH_DUR and d < best_dist:
+                    best_dist = d
+                    best_ev = ev
+            if best_ev is not None:
+                # Cosine-ish ease in/out over the event window.
+                t = best_dist / max(EMPH_DUR, 0.01)
+                ease = 0.5 - 0.5 * math.cos(min(1.0, t) * math.pi)
+                current_zoom = 1.0 + (best_ev.get("intensity", 1.05) - 1.0) * ease
+
         # ── Phase 1: focus lock + hysteresis (brief §21-24) ──
         # Keep the active focus track unless a candidate consistently beats it
         # by a margin for the confirm window, and respect a minimum hold. This
@@ -910,8 +931,11 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
         # ------------------------------------------------------------------
         # Always build the single (body-anchored) crop first — it is the base
         # layer for the fade and the full-frame output when not splitting.
-        if RENDER_FACE_ZOOM < 0.999:
-            z = 1.0 / RENDER_FACE_ZOOM
+        # Phase 4 punch-in: emphasis zoom multiplies the base zoom (brief §47).
+        base_zoom = RENDER_FACE_ZOOM
+        eff_zoom = base_zoom * (1.0 / max(1.0, current_zoom)) if current_zoom > 1.0 else base_zoom
+        if eff_zoom < 0.999:
+            z = 1.0 / eff_zoom
             crop_w_z = min(src_w, int(crop_w * z))
             crop_h_z = min(src_h, int(crop_h * z))
             anchor_y = cy + (0.5 - body_anchor) * crop_h_z
@@ -978,6 +1002,28 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
         else:
             cropped = single_crop
 
+        # ── Phase 4 (brief §43): blur_background layout ──
+        # For wide/soft sources, a fullscreen crop is a heavy upscale. Instead:
+        # blurred full-frame background (fills 1080x1920) + sharp centered
+        # foreground (the face crop) — no extreme upscale of the subject.
+        if layout_mode == "blur_background":
+            try:
+                bg = cv2.resize(frame, (output_w, output_h), interpolation=cv2.INTER_AREA)
+                k = max(1, int(output_h * 0.02) | 1)
+                bg = cv2.GaussianBlur(bg, (k, k), 0)
+                # Darken the background slightly so the foreground pops.
+                bg = cv2.addWeighted(bg, 0.75, np.zeros_like(bg), 0, 0)
+                # Foreground: the crop resized to ~70% width, centered.
+                fg_h = int(output_h * 0.62)
+                fg_w = int(output_w * 0.70)
+                fg = cv2.resize(cropped, (fg_w, fg_h), interpolation=cv2.INTER_LANCZOS4)
+                x0 = (output_w - fg_w) // 2
+                y0 = (output_h - fg_h) // 2
+                bg[y0:y0 + fg_h, x0:x0 + fg_w] = fg
+                cropped = bg
+            except Exception:  # noqa: BLE001
+                pass  # fall through to normal crop on any failure
+
         # Phase 2: resize to the fixed output canvas (brief §36). Crop frames
         # are 606x1080-ish; the writer expects 1080x1920. LANCZOS4 once, at the
         # end — the single lossy encode happens later in ffmpeg.
@@ -1036,6 +1082,8 @@ def crop_clip_local(
     out_path: str,
     cache_dir: Optional[str] = None,
     final_encode: bool = True,
+    emphasis_events: Optional[List[Dict]] = None,
+    layout_mode: str = "face_crop",
 ) -> str:
     """Cut + reframe one highlight, returning the local mp4 path.
 
@@ -1048,6 +1096,8 @@ def crop_clip_local(
     FFV1 intermediate so the caller (render_service) can composite captions /
     hook losslessly and do ONE final H.264 pass. With the default True the
     function finishes with H.264 (used by the CLI path).
+
+    Phase 4 (brief §47): `emphasis_events` drives semantic punch-in zoom.
     """
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
@@ -1062,7 +1112,7 @@ def crop_clip_local(
     try:
         _cut_subclip(source_path, start_time, end_time, cut_path)
         # FFV1 lossless reframe; _reframe_vertical returns the silent mkv.
-        silent_path = _reframe_vertical(cut_path, out_path, aspect_ratio)
+        silent_path = _reframe_vertical(cut_path, out_path, aspect_ratio, emphasis_events=emphasis_events, layout_mode=layout_mode)
         if final_encode:
             # Final H.264 (used by CLI/local mode).
             crf = os.getenv("RENDER_VIDEO_CRF", "17")

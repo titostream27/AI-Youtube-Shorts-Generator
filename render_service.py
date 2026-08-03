@@ -704,8 +704,16 @@ def _burn_karaoke_captions(
     for item in flat:
         item["sprite"] = _make_word_sprite(item["word"], font, item["color"])
 
-    # Wrap into visual lines by cumulative width. Each caption cue is wrapped
-    # independently so two cues never share a visual line.
+    # ── Phase 3 (brief §44): word/line budget ──
+    # Max 3-6 words per visual line and max 2 lines per caption display. The
+    # wrap breaks on BOTH width and word count so short bursts don't stretch
+    # into one long line, and a 3-word sentence never fills 6 slots.
+    caption_max_words = int(os.getenv("RENDER_CAPTION_MAX_WORDS", "6"))
+    caption_min_words = int(os.getenv("RENDER_CAPTION_MIN_WORDS", "2"))
+    caption_max_lines = int(os.getenv("RENDER_CAPTION_MAX_LINES", "2"))
+
+    # Wrap into visual lines by cumulative width AND word budget. Each caption
+    # cue is wrapped independently so two cues never share a visual line.
     visual_lines: List[Dict] = []
     for line in lines:
         cur: List[Dict] = []
@@ -715,15 +723,30 @@ def _burn_karaoke_captions(
         for item in caption_items:
             w = item["sprite"].width
             needed = w + (space if cur else 0)
-            if cur and cur_w + needed > max_line_w:
-                visual_lines.append({"items": cur, "width": cur_w})
-                cur = [item]
-                cur_w = item["sprite"].width
+            # Break if width would overflow, or if adding this word exceeds the
+            # max words per line.
+            if cur and (cur_w + needed > max_line_w or len(cur) >= caption_max_words):
+                # Drop trailing tiny words (e.g. a single "the") onto the next
+                # line only if that leaves the current line >= min words.
+                if len(cur) >= caption_min_words:
+                    visual_lines.append({"items": cur, "width": cur_w})
+                    cur = [item]
+                    cur_w = item["sprite"].width
+                else:
+                    cur.append(item)
+                    cur_w += needed
             else:
                 cur.append(item)
                 cur_w += needed
         if cur:
             visual_lines.append({"items": cur, "width": cur_w})
+
+    # ── Phase 3 (brief §44): max 2 visible lines ──
+    # If more than caption_max_lines are active at once (shouldn't happen with
+    # per-cue wrapping, but guard against ASR cue overlap), keep only the most
+    # recent lines so the caption never fills the screen.
+    if caption_max_lines >= 1:
+        visual_lines = visual_lines[-caption_max_lines:]
 
     overlay_dir = os.path.join(work_dir, "overlay")
     os.makedirs(overlay_dir, exist_ok=True)
@@ -1163,6 +1186,30 @@ def _render(request: RenderRequest) -> RenderResponse:
     from shorts_generator.local.clipper import crop_clip_local
     import subprocess as sp
 
+    # ── Phase 3/4 (brief §42-43): crop quality score + layout selection ──
+    # Decide once per job from the source; per-clip face count refines it.
+    layout_mode = "face_crop"
+    crop_score = None
+    try:
+        from visual_effects import probe_source_resolution, crop_quality_score, choose_layout
+        src_probe = probe_source_resolution(source)
+        if src_probe:
+            sw, sh, sratio = src_probe
+            # Crop window at 9:16 from this source.
+            if sratio < 9.0 / 16.0:
+                cw, ch = int(sh * 9 / 16), sh
+            else:
+                cw, ch = sw, int(sw * 16 / 9)
+            crop_score = crop_quality_score(sw, sh, cw, ch, face_count=0)
+            layout_mode = choose_layout(crop_score, 0, sratio)
+            print(
+                f"[render] source {sw}x{sh} ratio={sratio:.2f} crop_score={crop_score} "
+                f"layout={layout_mode}",
+                flush=True,
+            )
+    except Exception as e:  # noqa: BLE001
+        print(f"[render] layout selection failed ({e}), using face_crop", flush=True)
+
     start = time.time()
     rendered = []
     for i, c in enumerate(request.clips, 1):
@@ -1177,6 +1224,28 @@ def _render(request: RenderRequest) -> RenderResponse:
         }
         try:
             print(f"[render] clip {i}/{len(request.clips)}: {c.title or c.clip_id}", flush=True)
+
+            # ── Phase 4 (brief §47): derive emphasis events from captions ──
+            # Convert caption timestamps (absolute in the episode) to clip-
+            # relative times for the punch-in zoom inside crop_clip_local.
+            emphasis_events = None
+            if c.captions:
+                try:
+                    from visual_effects import build_emphasis_events
+                    raw_events = build_emphasis_events(c.captions, float(c.end_sec) - float(c.start_sec))
+                    emphasis_events = [
+                        {
+                            "time": round(float(ev["time"]) - float(c.start_sec), 2),
+                            "type": ev["type"],
+                            "intensity": ev["intensity"],
+                        }
+                        for ev in raw_events
+                    ]
+                    if emphasis_events:
+                        print(f"[render] clip {i}: emphasis events -> {len(emphasis_events)}", flush=True)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[render] clip {i}: emphasis events failed ({e}), continuing", flush=True)
+
             crop_clip_local(
                 source,
                 float(c.start_sec),
@@ -1185,7 +1254,27 @@ def _render(request: RenderRequest) -> RenderResponse:
                 out_path,
                 cache_dir=str(RENDER_ROOT / "cache"),
                 final_encode=False,  # Phase 3: keep lossless until final H.264 pass
+                emphasis_events=emphasis_events,
+                layout_mode=layout_mode,
             )
+
+            # ── Phase 3 (brief §46): long-pause trim ──
+            # Optional: cut long silences inside the clip window. Disabled by
+            # default (RENDER_TRIM_REMOVE_LONG_PAUSES=1 to enable) because it
+            # changes the timeline — captions are re-aligned below by re-running
+            # whisper against the TRIMMED file, not the source window.
+            trimmed_path = None
+            if os.getenv("RENDER_TRIM_REMOVE_LONG_PAUSES", "0") == "1":
+                try:
+                    from audio_master import trim_pauses
+                    trimmed_path = trim_pauses(out_path, 0.0, float(c.end_sec) - float(c.start_sec))
+                    if trimmed_path and os.path.exists(trimmed_path):
+                        os.replace(trimmed_path, out_path)
+                        print(f"[render] clip {i}: long pauses trimmed", flush=True)
+                        # Invalidate caption cache so whisper re-transcribes.
+                        _transcribe_with_whisper.cache_clear() if hasattr(_transcribe_with_whisper, "cache_clear") else None
+                except Exception as e:  # noqa: BLE001
+                    print(f"[render] clip {i}: pause trim failed ({e}), continuing", flush=True)
 
             if c.captions:
                 # Phase 4: transcribe the clip with faster-whisper for precise
@@ -1193,12 +1282,20 @@ def _render(request: RenderRequest) -> RenderResponse:
                 # natural segment boundaries (each speaker = own line). Fall
                 # back to the miner's ASR cues if transcription fails.
                 try:
-                    transcript_captions = _transcribe_with_whisper(
-                        source,
-                        float(c.start_sec),
-                        float(c.end_sec),
-                        job_dir,
-                    )
+                    # If long pauses were trimmed, the out_path timeline is
+                    # shorter than [start_sec, end_sec] of the source — transcribe
+                    # from the trimmed file itself so caption timing matches.
+                    if os.getenv("RENDER_TRIM_REMOVE_LONG_PAUSES", "0") == "1" and os.path.exists(out_path):
+                        transcript_captions = _transcribe_with_whisper(
+                            out_path, 0.0, float(c.end_sec) - float(c.start_sec), job_dir,
+                        )
+                    else:
+                        transcript_captions = _transcribe_with_whisper(
+                            source,
+                            float(c.start_sec),
+                            float(c.end_sec),
+                            job_dir,
+                        )
                     print(f"[render] clip {i}: whisper -> {len(transcript_captions)} segments", flush=True)
                 except Exception as e:  # noqa: BLE001
                     print(f"[render] clip {i}: whisper failed ({e}), using ASR cues", flush=True)
