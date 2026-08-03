@@ -225,6 +225,16 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
     # background object every frame).
     blur_second_id: Optional[int] = None
     blur_second_miss: int = 0
+    # Split-panel virtual camera state. Raw face-track coordinates are noisy,
+    # especially for the upper speaker's profile; never feed them directly to
+    # _crop_region. Each locked panel gets its own slow EMA + dead-zone.
+    blur_split_top_cx: Optional[float] = None
+    blur_split_top_cy: Optional[float] = None
+    blur_split_bot_cx: Optional[float] = None
+    blur_split_bot_cy: Optional[float] = None
+    blur_split_top_id: Optional[int] = None
+    blur_split_bot_id: Optional[int] = None
+    blur_split_pw: Optional[float] = None
     # Phase 4 (brief §23): per-reframe QC stats.
     global _RENDER_STATS
     _RENDER_STATS = {
@@ -1152,10 +1162,65 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                             # would include the neighbouring person
                             # ("setengah objek 1 dan 2"). A face-sized crop
                             # keeps exactly one person per panel.
-                            p_w = max(int(spk["w"] * 2.6), 280)
-                            p_w = min(p_w, crop_w)
-                            top_region = _crop_region(frame, spk["cx"], spk["cy"], p_w, top_h, zoom=0.9)
-                            bot_region = _crop_region(frame, second["cx"], second["cy"], p_w, bot_h, zoom=0.9)
+                            # Smooth each panel's virtual camera independently.
+                            # Dead-zone rejects detector noise; EMA remains slow
+                            # enough to suppress visible tremor while following
+                            # real head movement.
+                            split_pos_alpha = float(os.getenv("RENDER_SPLIT_POSITION_ALPHA", "0.10"))
+                            split_deadzone = float(os.getenv("RENDER_SPLIT_DEADZONE_PX", "6.0"))
+                            split_size_alpha = float(os.getenv("RENDER_SPLIT_SIZE_ALPHA", "0.05"))
+
+                            # A new locked track must not inherit the previous
+                            # person's virtual-camera position.
+                            if blur_split_top_id != spk["track_id"]:
+                                blur_split_top_id = spk["track_id"]
+                                blur_split_top_cx = None
+                                blur_split_top_cy = None
+                            if blur_split_bot_id != second["track_id"]:
+                                blur_split_bot_id = second["track_id"]
+                                blur_split_bot_cx = None
+                                blur_split_bot_cy = None
+
+                            def _smooth_split_pos(
+                                raw_cx: float,
+                                raw_cy: float,
+                                cur_cx: Optional[float],
+                                cur_cy: Optional[float],
+                            ) -> Tuple[float, float]:
+                                if cur_cx is None or cur_cy is None:
+                                    return raw_cx, raw_cy
+                                dx = raw_cx - cur_cx
+                                dy = raw_cy - cur_cy
+                                if abs(dx) <= split_deadzone:
+                                    raw_cx = cur_cx
+                                if abs(dy) <= split_deadzone:
+                                    raw_cy = cur_cy
+                                return (
+                                    cur_cx + (raw_cx - cur_cx) * split_pos_alpha,
+                                    cur_cy + (raw_cy - cur_cy) * split_pos_alpha,
+                                )
+
+                            blur_split_top_cx, blur_split_top_cy = _smooth_split_pos(
+                                spk["cx"], spk["cy"], blur_split_top_cx, blur_split_top_cy,
+                            )
+                            blur_split_bot_cx, blur_split_bot_cy = _smooth_split_pos(
+                                second["cx"], second["cy"], blur_split_bot_cx, blur_split_bot_cy,
+                            )
+                            raw_pw = max(int(spk["w"] * 2.6), 280)
+                            raw_pw = min(raw_pw, crop_w)
+                            if blur_split_pw is None:
+                                blur_split_pw = raw_pw
+                            else:
+                                blur_split_pw += (raw_pw - blur_split_pw) * split_size_alpha
+                            p_w = max(1, min(int(blur_split_pw), crop_w))
+                            top_region = _crop_region(
+                                frame, blur_split_top_cx, blur_split_top_cy,
+                                p_w, top_h, zoom=0.9,
+                            )
+                            bot_region = _crop_region(
+                                frame, blur_split_bot_cx, blur_split_bot_cy,
+                                p_w, bot_h, zoom=0.9,
+                            )
                             fg_src = np.vstack([top_region, bot_region])
                         else:
                             fw = max(int(spk["w"] * 3.2), 340)
