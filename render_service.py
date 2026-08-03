@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -25,6 +25,17 @@ from pydantic import BaseModel, Field
 
 from shorts_generator.local.clipper import crop_highlights_local
 from shorts_generator.local.downloader import download_youtube_local
+
+from render_contract import (
+    CaptionRequest,
+    ClipRequest,
+    RenderArtifact,
+    RenderJobStatus,
+    RenderRequest,
+    RenderRequestV2,
+    RenderResponse,
+    SourceInfo,
+)
 
 RENDER_ROOT = Path(os.getenv("RENDER_OUTPUT_DIR", "rendered")).resolve()
 HOST = os.getenv("RENDER_HOST", "127.0.0.1")
@@ -49,53 +60,136 @@ async def strip_path_prefix(request: Request, call_next):
     return await call_next(request)
 
 
-class CaptionWord(BaseModel):
-    """A single word with precise timing (faster-whisper word timestamps)."""
-    start_sec: float
-    end_sec: float
-    text: str
+# NOTE: Request/response models live in render_contract.py (versioned
+# contract, Master Task Brief §16). v1 models are imported from there.
 
 
-class CaptionRequest(BaseModel):
-    """A caption line in ABSOLUTE video coordinates (seconds from video start).
-
-    `words` is optional: when present it carries per-word timestamps from
-    faster-whisper so the karaoke reveal matches the actual speech rhythm.
-    When absent, the render service falls back to evenly distributing the
-    line's span across its words.
-
-    `speaker` is optional: when diarization is enabled each line is tagged
-    with SPEAKER_00 / SPEAKER_01 / ... and rendered in that speaker's color.
-    """
-    start_sec: float
-    end_sec: float
-    text: str
-    words: List[CaptionWord] = Field(default_factory=list)
-    speaker: str = ""
+def _aspect_ratio_from(request) -> str:
+    """Return '9:16' or the aspect_ratio when the request is legacy v1."""
+    ratio = getattr(request, "aspect_ratio", "9:16")
+    return ratio or "9:16"
 
 
-class ClipRequest(BaseModel):
-    clip_id: int | str
-    title: str = ""
-    start_sec: float
-    end_sec: float
-    captions: List[CaptionRequest] = Field(default_factory=list)
-    # Phase 5: attention-grabbing hook line for the intro scene. When present
-    # the render service prepends a ~2-3s intro (first frame + hook text +
-    # Edge-TTS voiceover) before the actual content.
-    hook: str = ""
+# ── Job persistence (Master Task Brief §19) ────────────────────────────────
+# Render jobs are stored in a small SQLite DB (RENDER_JOB_DB, default
+# rendered/render_jobs.db) so a service restart does not lose job status.
+JOB_DB_PATH = Path(os.getenv("RENDER_JOB_DB", str(RENDER_ROOT / "render_jobs.db"))).resolve()
+_job_db_conn = None
 
 
-class RenderRequest(BaseModel):
-    video_url: str
-    clips: List[ClipRequest] = Field(min_length=1)
-    aspect_ratio: str = "9:16"
+def _job_db():
+    global _job_db_conn
+    if _job_db_conn is None:
+        import sqlite3
+        _job_db_conn = sqlite3.connect(str(JOB_DB_PATH), check_same_thread=False)
+        _job_db_conn.execute(
+            """CREATE TABLE IF NOT EXISTS render_jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'final',
+                episode_id TEXT,
+                request TEXT,
+                response TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        _job_db_conn.commit()
+    return _job_db_conn
 
 
-class RenderResponse(BaseModel):
-    job_id: str
-    source_video: str
-    rendered: List[Dict]
+def _persist_job(job_id: str, status: str, *, mode: str = "final",
+                 episode_id: str = "", request: str = "", response: str = "",
+                 error: str = "") -> None:
+    import sqlite3
+    import datetime
+    try:
+        conn = _job_db()
+        now = datetime.datetime.utcnow().isoformat()
+        conn.execute(
+            """INSERT INTO render_jobs
+               (job_id, status, mode, episode_id, request, response, error, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(job_id) DO UPDATE SET
+                 status=excluded.status, mode=excluded.mode,
+                 response=excluded.response, error=excluded.error,
+                 updated_at=excluded.updated_at""",
+            (job_id, status, mode, episode_id, request, response, error, now, now),
+        )
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        pass  # persistence must never break rendering
+
+
+def _load_job(job_id: str) -> Optional[Dict]:
+    try:
+        conn = _job_db()
+        row = conn.execute(
+            "SELECT status, mode, episode_id, response, error FROM render_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if not row:
+            return None
+        import json
+        return {
+            "status": row[0],
+            "mode": row[1],
+            "episode_id": row[2],
+            "response": json.loads(row[3]) if row[3] else None,
+            "error": row[4],
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _normalize_clips(request) -> List:
+    """Return a normalized list of clip dicts from either a v1 RenderRequest
+    or a v2 RenderRequestV2 (brief §16 backward compatibility)."""
+    clips = []
+    for c in request.clips:
+        if hasattr(c, "caption_plan") and c.caption_plan is not None:
+            # v2: use caption_plan.cues as captions; layout from layout_plan.
+            cues = [
+                CaptionRequest(
+                    start_sec=cc.start_sec,
+                    end_sec=cc.end_sec,
+                    text=cc.text,
+                    speaker=cc.speaker_id or "",
+                )
+                for cc in c.caption_plan.cues
+            ]
+            clips.append({
+                "clip_id": c.clip_id,
+                "title": c.title,
+                "start_sec": float(c.start_sec),
+                "end_sec": float(c.end_sec),
+                "captions": cues,
+                "hook": c.hook or "",
+                "preferred_layout": c.layout_plan.preferred_layout if c.layout_plan else "auto",
+                "expected_speakers": c.layout_plan.expected_speakers if c.layout_plan else None,
+                "allow_split": c.layout_plan.allow_split if c.layout_plan else True,
+                "allow_blur_background": c.layout_plan.allow_blur_background if c.layout_plan else True,
+                "editing_events": [e.model_dump() for e in (c.editing_events or [])],
+                "highlight_terms": list(c.caption_plan.highlight_terms) if c.caption_plan else [],
+            })
+        else:
+            # v1 legacy
+            clips.append({
+                "clip_id": c.clip_id,
+                "title": c.title,
+                "start_sec": float(c.start_sec),
+                "end_sec": float(c.end_sec),
+                "captions": list(c.captions),
+                "hook": c.hook or "",
+                "preferred_layout": "auto",
+                "expected_speakers": None,
+                "allow_split": True,
+                "allow_blur_background": True,
+                "editing_events": [],
+                "highlight_terms": [],
+            })
+    return clips
 
 
 @app.get("/health")
@@ -1217,10 +1311,26 @@ def _build_thumbnail(video_path: str, hook: str, work_dir: str) -> Optional[str]
     return thumb_path
 
 
-def _render(request: RenderRequest) -> RenderResponse:
+def _render(request) -> RenderResponse:
     job_id = uuid.uuid4().hex[:10]
     job_dir = RENDER_ROOT / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
+
+    # Normalize v1/v2 request (brief §16-17). v2 carries mode, narrative,
+    # layout plan, caption plan, editing events; v1 is upgraded internally.
+    clips = _normalize_clips(request)
+    mode = getattr(request, "mode", "final") or "final"
+    episode_id = getattr(request, "episode_id", "") or ""
+    output_w = int(getattr(getattr(request, "output", None), "width", 1080) or 1080)
+    output_h = int(getattr(getattr(request, "output", None), "height", 1920) or 1920)
+    preview = mode == "preview"
+    if preview:
+        # Preview rendering (brief §21): cheaper, faster, smaller.
+        output_w = min(output_w, int(os.getenv("RENDER_PREVIEW_WIDTH", "540")))
+        output_h = min(output_h, int(os.getenv("RENDER_PREVIEW_HEIGHT", "960")))
+
+    _persist_job(job_id, "downloading", mode=mode, episode_id=episode_id,
+                 request=request.model_dump_json() if hasattr(request, "model_dump_json") else "")
 
     # 1. Download once (cached by video id).
     try:
@@ -1262,30 +1372,35 @@ def _render(request: RenderRequest) -> RenderResponse:
 
     start = time.time()
     rendered = []
-    for i, c in enumerate(request.clips, 1):
+    artifacts = []
+    for i, c in enumerate(clips, 1):
         out_path = os.path.join(job_dir, f"short_{i:02d}.mp4")
         item = {
-            "clip_id": c.clip_id,
-            "title": c.title,
-            "start_sec": c.start_sec,
-            "end_sec": c.end_sec,
+            "clip_id": c["clip_id"],
+            "title": c["title"],
+            "start_sec": c["start_sec"],
+            "end_sec": c["end_sec"],
             "status": "error",
-            "duration_sec": round(float(c.end_sec) - float(c.start_sec), 2),
+            "duration_sec": round(float(c["end_sec"]) - float(c["start_sec"]), 2),
         }
+        artifact = RenderArtifact(
+            clip_id=c["clip_id"],
+            status="error",
+            requested_layout=c["preferred_layout"],
+            duration_sec=round(float(c["end_sec"]) - float(c["start_sec"]), 2),
+        )
         try:
-            print(f"[render] clip {i}/{len(request.clips)}: {c.title or c.clip_id}", flush=True)
+            print(f"[render] clip {i}/{len(clips)}: {c['title'] or c['clip_id']} mode={mode}", flush=True)
 
             # ── Phase 4 (brief §47): derive emphasis events from captions ──
-            # Convert caption timestamps (absolute in the episode) to clip-
-            # relative times for the punch-in zoom inside crop_clip_local.
             emphasis_events = None
-            if c.captions:
+            if c["captions"]:
                 try:
                     from visual_effects import build_emphasis_events
-                    raw_events = build_emphasis_events(c.captions, float(c.end_sec) - float(c.start_sec))
+                    raw_events = build_emphasis_events(c["captions"], float(c["end_sec"]) - float(c["start_sec"]))
                     emphasis_events = [
                         {
-                            "time": round(float(ev["time"]) - float(c.start_sec), 2),
+                            "time": round(float(ev["time"]) - float(c["start_sec"]), 2),
                             "type": ev["type"],
                             "intensity": ev["intensity"],
                         }
@@ -1296,17 +1411,51 @@ def _render(request: RenderRequest) -> RenderResponse:
                 except Exception as e:  # noqa: BLE001
                     print(f"[render] clip {i}: emphasis events failed ({e}), continuing", flush=True)
 
+            # Per-clip layout decision honoring the miner's preferred layout
+            # when technical quality allows (brief §17); report fallback.
+            clip_layout = layout_mode
+            fallback_reason = None
+            preferred = c["preferred_layout"]
+            try:
+                if preferred and preferred != "auto":
+                    # Miner asked for a specific layout; only fall back when the
+                    # source cannot technically support it.
+                    from visual_effects import probe_source_resolution, crop_quality_score
+                    src_probe = probe_source_resolution(source)
+                    if src_probe:
+                        sw, sh, sratio = src_probe
+                        if sratio < 9.0 / 16.0:
+                            cw, ch = int(sh * 9 / 16), sh
+                        else:
+                            cw, ch = sw, int(sw * 16 / 9)
+                        score = crop_quality_score(sw, sh, cw, ch, face_count=c["expected_speakers"] or 0)
+                        min_score = int(os.getenv("RENDER_CROP_QUALITY_MIN_SCORE", "60"))
+                        if preferred == "face_crop" and score < min_score:
+                            clip_layout = "blur_background" if c["allow_blur_background"] else "face_crop"
+                            fallback_reason = "effective vertical crop below minimum quality"
+                        else:
+                            clip_layout = preferred
+                        print(f"[render] clip {i}: requested={preferred} score={score} actual={clip_layout}"
+                              f"{' (' + fallback_reason + ')' if fallback_reason else ''}", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[render] clip {i}: layout fallback check failed ({e}), using {clip_layout}", flush=True)
+
             crop_clip_local(
                 source,
-                float(c.start_sec),
-                float(c.end_sec),
-                request.aspect_ratio,
+                float(c["start_sec"]),
+                float(c["end_sec"]),
+                "9:16",
                 out_path,
                 cache_dir=str(RENDER_ROOT / "cache"),
                 final_encode=False,  # Phase 3: keep lossless until final H.264 pass
                 emphasis_events=emphasis_events,
-                layout_mode=layout_mode,
+                layout_mode=clip_layout,
+                output_size=(output_w, output_h) if preview else None,
             )
+            # The crop succeeded; final status may still flip to error later if
+            # the quality gate fails.
+            item["status"] = "ok"
+            artifact.status = "ok"
 
             # ── Phase 3 (brief §46): long-pause trim ──
             # Optional: cut long silences inside the clip window. Disabled by
@@ -1317,7 +1466,7 @@ def _render(request: RenderRequest) -> RenderResponse:
             if os.getenv("RENDER_TRIM_REMOVE_LONG_PAUSES", "0") == "1":
                 try:
                     from audio_master import trim_pauses
-                    trimmed_path = trim_pauses(out_path, 0.0, float(c.end_sec) - float(c.start_sec))
+                    trimmed_path = trim_pauses(out_path, 0.0, float(c["end_sec"]) - float(c["start_sec"]))
                     if trimmed_path and os.path.exists(trimmed_path):
                         os.replace(trimmed_path, out_path)
                         print(f"[render] clip {i}: long pauses trimmed", flush=True)
@@ -1326,7 +1475,7 @@ def _render(request: RenderRequest) -> RenderResponse:
                 except Exception as e:  # noqa: BLE001
                     print(f"[render] clip {i}: pause trim failed ({e}), continuing", flush=True)
 
-            if c.captions:
+            if c["captions"]:
                 # Phase 4: transcribe the clip with faster-whisper for precise
                 # word-level timing (karaoke reveal syncs to real speech) and
                 # natural segment boundaries (each speaker = own line). Fall
@@ -1337,19 +1486,19 @@ def _render(request: RenderRequest) -> RenderResponse:
                     # from the trimmed file itself so caption timing matches.
                     if os.getenv("RENDER_TRIM_REMOVE_LONG_PAUSES", "0") == "1" and os.path.exists(out_path):
                         transcript_captions = _transcribe_with_whisper(
-                            out_path, 0.0, float(c.end_sec) - float(c.start_sec), job_dir,
+                            out_path, 0.0, float(c["end_sec"]) - float(c["start_sec"]), job_dir,
                         )
                     else:
                         transcript_captions = _transcribe_with_whisper(
                             source,
-                            float(c.start_sec),
-                            float(c.end_sec),
+                            float(c["start_sec"]),
+                            float(c["end_sec"]),
                             job_dir,
                         )
                     print(f"[render] clip {i}: whisper -> {len(transcript_captions)} segments", flush=True)
                 except Exception as e:  # noqa: BLE001
                     print(f"[render] clip {i}: whisper failed ({e}), using ASR cues", flush=True)
-                    transcript_captions = c.captions
+                    transcript_captions = c["captions"]
 
                 # Phase 6: speaker diarization — tag each caption line with a
                 # speaker so colors differ per speaker. Optional; on failure
@@ -1358,8 +1507,8 @@ def _render(request: RenderRequest) -> RenderResponse:
                     try:
                         turns = _diarize_clip(
                             source,
-                            float(c.start_sec),
-                            float(c.end_sec),
+                            float(c["start_sec"]),
+                            float(c["end_sec"]),
                             job_dir,
                         )
                         if turns:
@@ -1373,7 +1522,7 @@ def _render(request: RenderRequest) -> RenderResponse:
                     burned = _burn_karaoke_captions(
                         out_path,
                         transcript_captions,
-                        float(c.start_sec),
+                        float(c["start_sec"]),
                         out_path,
                         job_dir,
                     )
@@ -1383,9 +1532,9 @@ def _render(request: RenderRequest) -> RenderResponse:
                         print(f"[render] clip {i}: no captions inside window, skipping burn", flush=True)
 
             # Phase 5: prepend the hook intro (frame + dim + hook text + TTS).
-            if c.hook:
+            if c["hook"]:
                 try:
-                    intro_path = _build_hook_intro(out_path, c.hook, job_dir)
+                    intro_path = _build_hook_intro(out_path, c["hook"], job_dir)
                     if intro_path:
                         final_path = os.path.join(job_dir, f"short_{i:02d}_final.mkv")
                         # Concat intro + content with filter_complex. The plain
@@ -1421,8 +1570,14 @@ def _render(request: RenderRequest) -> RenderResponse:
             # correction (brief §49) rides on this same pass.
             try:
                 final_h264 = os.path.join(job_dir, f"short_{i:02d}_h264.mp4")
-                crf = os.getenv("RENDER_VIDEO_CRF", "17")
-                preset = os.getenv("RENDER_VIDEO_PRESET", "slow")
+                if preview:
+                    # Preview (brief §21): faster preset + higher CRF, still
+                    # 540x960 (or the smaller requested output).
+                    crf = os.getenv("RENDER_PREVIEW_CRF", "26")
+                    preset = os.getenv("RENDER_PREVIEW_PRESET", "veryfast")
+                else:
+                    crf = os.getenv("RENDER_VIDEO_CRF", "17")
+                    preset = os.getenv("RENDER_VIDEO_PRESET", "slow")
                 color_filter = None
                 try:
                     from visual_effects import build_color_filter
@@ -1430,7 +1585,7 @@ def _render(request: RenderRequest) -> RenderResponse:
                 except Exception:  # noqa: BLE001
                     color_filter = None
                 vf_parts = ["format=yuv420p"]
-                if color_filter:
+                if color_filter and not preview:
                     vf_parts.insert(0, color_filter)
                 cmd = [
                     "ffmpeg", "-y", "-loglevel", "error",
@@ -1449,15 +1604,17 @@ def _render(request: RenderRequest) -> RenderResponse:
 
             # ── Phase 3 (brief §45): audio mastering chain ──
             # Applied AFTER the final video encode: re-encodes audio only
-            # (video stream copied), so no extra video generation.
-            try:
-                from audio_master import master_audio
-                mastered = os.path.join(job_dir, f"short_{i:02d}_mastered.mp4")
-                result = master_audio(out_path, mastered)
-                if result and result != out_path:
-                    os.replace(mastered, out_path)
-            except Exception as e:  # noqa: BLE001
-                print(f"[render] clip {i}: audio mastering failed ({e}), keeping original", flush=True)
+            # (video stream copied), so no extra video generation. Preview
+            # mode skips full mastering (brief §21).
+            if not preview:
+                try:
+                    from audio_master import master_audio
+                    mastered = os.path.join(job_dir, f"short_{i:02d}_mastered.mp4")
+                    result = master_audio(out_path, mastered)
+                    if result and result != out_path:
+                        os.replace(mastered, out_path)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[render] clip {i}: audio mastering failed ({e}), keeping original", flush=True)
 
             # ── Phase 4 (brief §50): automated quality gate ──
             # Run QC on the FINAL file (after hook + final encode + mastering).
@@ -1471,9 +1628,25 @@ def _render(request: RenderRequest) -> RenderResponse:
                     "score": qc["quality_score"],
                     "warnings": qc["warnings"][:6],
                 }
+                # Structured QC detail (brief §23).
+                artifact.qc.score = float(qc["quality_score"])
+                artifact.qc.output_width = int(qc.get("checks", {}).get("resolution", "1080x1920").split("x")[0] or 1080)
+                try:
+                    artifact.qc.output_height = int(qc["checks"]["resolution"].split("x")[1])
+                except Exception:  # noqa: BLE001
+                    pass
+                artifact.qc.codec = qc.get("checks", {}).get("codec", "h264")
+                artifact.qc.pixel_format = qc.get("checks", {}).get("pix_fmt", "yuv420p")
+                artifact.qc.audio_lufs = qc.get("checks", {}).get("audio_lufs")
+                artifact.qc.audio_true_peak = qc.get("checks", {}).get("audio_true_peak")
+                artifact.qc.audio_sync_ms = qc.get("checks", {}).get("audio_sync_ms")
+                artifact.qc.black_frame_ratio = min(1.0, (qc.get("checks", {}).get("black_frames", 0) or 0) / 5.0)
+                artifact.qc.warnings = qc["warnings"][:6]
                 if qc["status"] != "pass":
                     item["status"] = "error"
                     item["error"] = f"quality gate failed: {qc['warnings'][:3]}"
+                    artifact.status = "error"
+                    artifact.error = item["error"]
                     print(f"[render] clip {i}: QC FAILED ({qc['warnings'][:3]})", flush=True)
             except Exception as e:  # noqa: BLE001
                 print(f"[render] clip {i}: quality gate error ({e}), continuing", flush=True)
@@ -1481,25 +1654,58 @@ def _render(request: RenderRequest) -> RenderResponse:
             if item["status"] == "ok":
                 item["clip_path"] = os.path.abspath(out_path)
                 item["clip_url"] = f"{job_id}/{os.path.basename(out_path)}"
+                artifact.status = "ok"
+                artifact.video_url = f"{job_id}/{os.path.basename(out_path)}"
+                artifact.actual_layout = clip_layout
+                artifact.fallback_reason = fallback_reason
 
             # Phase 7: auto thumbnail (best face frame + hook text).
             try:
                 thumb_path = _build_thumbnail(
                     out_path,
-                    c.hook,
+                    c["hook"],
                     job_dir,
                 )
                 if thumb_path:
                     item["thumbnail_url"] = f"{job_id}/thumbnail.jpg"
+                    artifact.thumbnail_url = f"{job_id}/thumbnail.jpg"
                     print(f"[render] clip {i}: thumbnail generated", flush=True)
             except Exception as e:  # noqa: BLE001
                 print(f"[render] clip {i}: thumbnail failed ({e})", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[render] clip {i} failed: {e}", flush=True)
             item["error"] = str(e)
+            artifact.status = "error"
+            artifact.error = str(e)
         rendered.append(item)
+        artifacts.append(artifact)
 
     print(f"[render] job {job_id} finished in {time.time() - start:.1f}s", flush=True)
+    # Persist final job status (brief §19) so a restart keeps the result.
+    try:
+        import json
+        src_info = None
+        try:
+            from visual_effects import probe_source_resolution
+            src_probe = probe_source_resolution(source)
+            if src_probe:
+                src_info = {"width": src_probe[0], "height": src_probe[1]}
+        except Exception:  # noqa: BLE001
+            pass
+        resp_payload = {
+            "job_id": job_id,
+            "source_video": source,
+            "rendered": rendered,
+            "mode": mode,
+            "artifacts": [a.model_dump() for a in artifacts],
+            "source": src_info or {},
+        }
+        _persist_job(
+            job_id, "completed", mode=mode, episode_id=episode_id,
+            response=json.dumps(resp_payload, default=str),
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[render] job persist failed: {e}", flush=True)
     return RenderResponse(
         job_id=job_id,
         source_video=source,
@@ -1526,31 +1732,57 @@ def render_status():
 
 @app.get("/api/render/status/{job_id}")
 def render_job_status(job_id: str):
-    """Return the state of an async render job: running | done | error."""
+    """Return the state of a render job: running | done | error (from memory
+    when active, from the persisted job DB after a restart — brief §19)."""
     with _async_jobs_lock:
         job = _async_jobs.get(job_id)
-    if not job:
+    if job:
+        payload = {
+            "job_id": job_id,
+            "state": job["state"],
+            "error": job.get("error"),
+        }
+        resp = job.get("response")
+        if job["state"] == "done" and resp:
+            payload["rendered"] = resp.rendered
+            payload["source_video"] = resp.source_video
+            payload["mode"] = getattr(resp, "mode", "final")
+            payload["artifacts"] = getattr(resp, "artifacts", None)
+        return payload
+    # Not in memory: fall back to the persisted job store.
+    stored = _load_job(job_id)
+    if not stored:
         raise HTTPException(status_code=404, detail="job not found")
-    return {
+    payload = {
         "job_id": job_id,
-        "state": job["state"],
-        "error": job.get("error"),
-        "rendered": job.get("response").rendered if job["state"] == "done" and job.get("response") else None,
-        "source_video": job.get("response").source_video if job["state"] == "done" and job.get("response") else None,
+        "state": stored["status"],
+        "error": stored.get("error"),
+        "mode": stored.get("mode", "final"),
     }
+    resp = stored.get("response") or {}
+    if resp:
+        payload["rendered"] = resp.get("rendered")
+        payload["source_video"] = resp.get("source_video")
+        payload["artifacts"] = resp.get("artifacts")
+        payload["source"] = resp.get("source")
+    return payload
 
 
 @app.post("/api/render/async", response_model=RenderResponse)
-def render_async(request: RenderRequest):
-    """Queue a render job and return immediately.
+def render_async(request: Union[RenderRequest, RenderRequestV2]):
+    """Queue a render job (v1 or v2 contract) and return immediately.
 
     The job runs in a background thread (still serialized by the process-wide
     lock). Clients poll GET /api/render/status/{job_id} for completion. This
     avoids the ~5min client timeout that killed long batch renders.
     """
     job_id = uuid.uuid4().hex[:10]
+    mode = getattr(request, "mode", "final") or "final"
+    episode_id = getattr(request, "episode_id", "") or ""
     with _async_jobs_lock:
         _async_jobs[job_id] = {"state": "running", "response": None, "error": None}
+    _persist_job(job_id, "queued", mode=mode, episode_id=episode_id,
+                 request=request.model_dump_json() if hasattr(request, "model_dump_json") else "")
 
     def worker():
         global _render_busy
@@ -1567,14 +1799,34 @@ def render_async(request: RenderRequest):
         except Exception as e:  # noqa: BLE001
             with _async_jobs_lock:
                 _async_jobs[job_id] = {"state": "error", "response": None, "error": str(e)}
+            _persist_job(job_id, "failed", mode=mode, episode_id=episode_id, error=str(e))
 
     threading.Thread(target=worker, daemon=True).start()
     return RenderResponse(job_id=job_id, source_video="", rendered=[])
 
 
+@app.post("/api/render/jobs/{job_id}/cancel")
+def render_job_cancel(job_id: str):
+    """Mark a queued job as cancelled. A job already rendering cannot be
+    cancelled mid-flight (the lock serializes; it will finish)."""
+    with _async_jobs_lock:
+        job = _async_jobs.get(job_id)
+        if job and job["state"] == "running":
+            job["state"] = "cancelled"
+            _persist_job(job_id, "cancelled", error="cancelled by user")
+            return {"job_id": job_id, "state": "cancelled"}
+        if job and job["state"] != "running":
+            return {"job_id": job_id, "state": job["state"]}
+    stored = _load_job(job_id)
+    if not stored:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {"job_id": job_id, "state": stored["status"]}
+
+
 @app.post("/api/render", response_model=RenderResponse)
-def render(request: RenderRequest):
-    """Render clips synchronously. Long videos download first — poll client-side.
+def render(request: Union[RenderRequest, RenderRequestV2]):
+    """Render clips synchronously (v1 or v2 contract). Long videos download
+    first — poll client-side.
 
     Serialized by a process-wide lock so concurrent render requests never run
     in parallel (downloads of multi-hundred-MB sources and OpenCV encodes are

@@ -35,6 +35,61 @@ def _ffprobe_json(path: str) -> Optional[Dict]:
         return None
 
 
+def _audio_loudness(path: str) -> Optional[Dict]:
+    """Measure integrated loudness (LUFS) + true peak with ffmpeg loudnorm
+    (print_format=json, no audio change)."""
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", path,
+             "-af", "loudnorm=print_format=json", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=60,
+        )
+        import json
+        # loudnorm JSON appears on stderr after "[Parsed_loudnorm" line.
+        txt = out.stderr
+        idx = txt.find("{")
+        if idx < 0:
+            return None
+        payload = txt[idx:]
+        # Truncate at the final closing brace of the JSON block.
+        end = payload.rfind("}")
+        if end < 0:
+            return None
+        data = json.loads(payload[:end + 1])
+        return {
+            "input_i": data.get("input_i"),   # integrated LUFS
+            "input_tp": data.get("input_tp"), # true peak dBTP
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _av_sync_ms(path: str) -> Optional[int]:
+    """Estimate A/V sync offset by comparing the first audio and video frame
+    presentation timestamps (ffprobe packet info). Positive = audio ahead."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "frame=pts_time", "-frames:v", "1",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        import json
+        vdata = json.loads(out.stdout)
+        vpts = float(vdata["frames"][0]["pts_time"]) if vdata.get("frames") else 0
+        out2 = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "frame=pts_time", "-frames:a", "1",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        adata = json.loads(out2.stdout)
+        apts = float(adata["frames"][0]["pts_time"]) if adata.get("frames") else 0
+        return int(round((apts - vpts) * 1000))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _black_or_frozen_frames(path: str) -> List[float]:
     """Detect black frames via ffmpeg blackdetect; return their timestamps."""
     try:
@@ -102,6 +157,29 @@ def run_quality_checks(path: str) -> Dict:
         score -= 25
         failures.append("no audio stream")
     checks["audio"] = bool(astream)
+
+    # ── Audio loudness + true peak (brief §23 structured QC) ──
+    try:
+        loudness = _audio_loudness(path)
+        if loudness:
+            checks["audio_lufs"] = round(loudness["input_i"], 1) if loudness["input_i"] is not None else None
+            checks["audio_true_peak"] = round(loudness["input_tp"], 2) if loudness["input_tp"] is not None else None
+            if loudness["input_i"] is not None and (loudness["input_i"] < -20 or loudness["input_i"] > -9):
+                warnings.append(f"integrated loudness {loudness['input_i']:.1f} LUFS outside -20..-9")
+                score -= 4
+    except Exception:  # noqa: BLE001
+        checks["audio_lufs"] = None
+        checks["audio_true_peak"] = None
+
+    # ── A/V sync estimate (brief §23) ──
+    try:
+        sync_ms = _av_sync_ms(path)
+        checks["audio_sync_ms"] = sync_ms
+        if sync_ms is not None and abs(sync_ms) > 100:
+            warnings.append(f"A/V sync offset {sync_ms}ms")
+            score -= 5
+    except Exception:  # noqa: BLE001
+        checks["audio_sync_ms"] = None
 
     # ── Duration sanity ──
     try:

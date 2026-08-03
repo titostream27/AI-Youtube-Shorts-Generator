@@ -58,7 +58,7 @@ def _cut_subclip(source_path: str, start: float, end: float, out_path: str) -> s
     return out_path
 
 
-def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_events: Optional[List[Dict]] = None, layout_mode: str = "face_crop") -> str:
+def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_events: Optional[List[Dict]] = None, layout_mode: str = "face_crop", output_size: Optional[Tuple[int, int]] = None) -> str:
     """Crop the cut clip to the target aspect ratio, tracking faces if possible.
 
     Face tracking is DUAL-MODE: YuNet (ONNX DNN, stable) is tried first per
@@ -574,10 +574,14 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
 
     # ── Phase 2: separate crop resolution from output resolution (brief §36) ──
     # The crop window is chosen from the source for framing; the OUTPUT is a
-    # fixed 1080x1920 9:16 canvas. Resizing here (LANCZOS4) upscales the crop
-    # once, at the end — never progressively.
-    output_w = int(os.getenv("RENDER_OUTPUT_WIDTH", "1080"))
-    output_h = int(os.getenv("RENDER_OUTPUT_HEIGHT", "1920"))
+    # fixed 9:16 canvas. Resizing here (LANCZOS4) upscales the crop once, at
+    # the end — never progressively. `output_size` (preview mode, brief §21)
+    # overrides the env default 1080x1920.
+    if output_size:
+        output_w, output_h = int(output_size[0]), int(output_size[1])
+    else:
+        output_w = int(os.getenv("RENDER_OUTPUT_WIDTH", "1080"))
+        output_h = int(os.getenv("RENDER_OUTPUT_HEIGHT", "1920"))
     if output_h <= 0:
         output_h = int(output_w * 16 / 9)
     output_w = max(2, output_w - (output_w % 2))
@@ -1065,17 +1069,21 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
     return silent_path
 
 
-def _cache_key(source_path: str, start_time: float, end_time: float, aspect_ratio: str) -> str:
+def _cache_key(source_path: str, start_time: float, end_time: float, aspect_ratio: str, output_size: Optional[Tuple[int, int]] = None) -> str:
     """Deterministic cache filename for a cut+reframe operation.
 
     Phase 2/3: the key includes the OUTPUT resolution and the pipeline version
     so a 606x1080 mp4v cache from before the upgrade is never reused by the
-    1080x1920 FFV1 pipeline.
+    1080x1920 FFV1 pipeline. Phase 2 (brief §21): preview renders use the
+    explicit output_size so they never collide with final 1080x1920 caches.
     """
     src = os.path.splitext(os.path.basename(source_path))[0]
     ratio = aspect_ratio.replace(":", "x")
-    out_w = os.getenv("RENDER_OUTPUT_WIDTH", "1080")
-    out_h = os.getenv("RENDER_OUTPUT_HEIGHT", "1920")
+    if output_size:
+        out_w, out_h = int(output_size[0]), int(output_size[1])
+    else:
+        out_w = os.getenv("RENDER_OUTPUT_WIDTH", "1080")
+        out_h = os.getenv("RENDER_OUTPUT_HEIGHT", "1920")
     return f"{src}_{start_time:.2f}_{end_time:.2f}_{ratio}_{out_w}x{out_h}.mp4"
 
 
@@ -1089,6 +1097,7 @@ def crop_clip_local(
     final_encode: bool = True,
     emphasis_events: Optional[List[Dict]] = None,
     layout_mode: str = "face_crop",
+    output_size: Optional[Tuple[int, int]] = None,
 ) -> str:
     """Cut + reframe one highlight, returning the local mp4 path.
 
@@ -1106,7 +1115,7 @@ def crop_clip_local(
     """
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
-        cache_path = os.path.join(cache_dir, _cache_key(source_path, start_time, end_time, aspect_ratio))
+        cache_path = os.path.join(cache_dir, _cache_key(source_path, start_time, end_time, aspect_ratio, output_size))
         if os.path.exists(cache_path):
             print(f"[clip/local] cache hit: {os.path.basename(cache_path)}", flush=True)
             import shutil
@@ -1117,7 +1126,7 @@ def crop_clip_local(
     try:
         _cut_subclip(source_path, start_time, end_time, cut_path)
         # FFV1 lossless reframe; _reframe_vertical returns the silent mkv.
-        silent_path = _reframe_vertical(cut_path, out_path, aspect_ratio, emphasis_events=emphasis_events, layout_mode=layout_mode)
+        silent_path = _reframe_vertical(cut_path, out_path, aspect_ratio, emphasis_events=emphasis_events, layout_mode=layout_mode, output_size=output_size)
         if final_encode:
             # Final H.264 (used by CLI/local mode).
             crf = os.getenv("RENDER_VIDEO_CRF", "17")
