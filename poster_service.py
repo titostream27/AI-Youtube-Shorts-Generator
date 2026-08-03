@@ -238,6 +238,29 @@ try:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"publish failed: {e}") from e
 
+    class DeleteRequest(BaseModel):
+        video_id: str
+
+    class DeleteResponse(BaseModel):
+        video_id: str
+        status: str
+        error: Optional[str] = None
+
+    @app.post("/api/videos/delete", response_model=DeleteResponse)
+    async def delete_video(req: DeleteRequest):
+        """Delete a video from the connected YouTube channel (videos.delete)."""
+        try:
+            creds = _credentials()
+            youtube = build("youtube", "v3", credentials=creds)
+            youtube.videos().delete(id=req.video_id).execute()
+            print(f"[poster] deleted video {req.video_id}", flush=True)
+            return DeleteResponse(video_id=req.video_id, status="deleted")
+        except HttpError as e:
+            detail = f"YouTube API error {e.resp.status}: {e.error.get('message', str(e)) if isinstance(e.error, dict) else e}"
+            raise HTTPException(status_code=502, detail=detail) from e
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"delete failed: {e}") from e
+
 except ImportError:
     # Minimal fallback so the module still imports for credential checks.
     app = None
