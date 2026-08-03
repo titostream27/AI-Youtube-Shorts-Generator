@@ -109,6 +109,38 @@ def _black_or_frozen_frames(path: str) -> List[float]:
         return []
 
 
+def _frozen_frame_ratio(path: str) -> float:
+    """Estimate the fraction of frames that are near-identical to the previous
+    frame (frozen/paused content). Samples via ffmpeg freezedetect."""
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", path,
+             "-vf", "freezedetect=d=1.5:n=0.001", "-an", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=60,
+        )
+        import re
+        durations = []
+        for line in out.stderr.splitlines():
+            m = re.search(r"freeze_duration:([\d.]+)", line)
+            if m:
+                durations.append(float(m.group(1)))
+        if not durations:
+            return 0.0
+        # Probe total duration for the ratio.
+        info = _ffprobe_json(path)
+        total = 0.0
+        if info:
+            try:
+                total = float(info.get("format", {}).get("duration", 0))
+            except (TypeError, ValueError):
+                total = 0.0
+        if total <= 0:
+            return 0.0
+        return min(1.0, sum(durations) / total)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def run_quality_checks(path: str) -> Dict:
     """Run the automated quality gate. Returns a report dict."""
     report: Dict = {
@@ -207,6 +239,14 @@ def run_quality_checks(path: str) -> Dict:
         warnings.append(f"{len(black)} black frames at {[round(b,1) for b in black[:3]]}")
         score -= 5 * min(3, len(black))
     checks["black_frames"] = len(black)
+    checks["black_frame_ratio"] = min(1.0, len(black) / 5.0)
+
+    # ── Frozen frames (brief §23 structured QC) ──
+    frozen = _frozen_frame_ratio(path)
+    checks["frozen_frame_ratio"] = round(frozen, 3)
+    if frozen > 0.5:
+        warnings.append(f"frozen frame ratio {frozen:.2f} > 0.5")
+        score -= 10
 
     # ── Excessive upscale (brief §42) ──
     # 1080x1920 output from a source <=720p implies upscale; we can't see the

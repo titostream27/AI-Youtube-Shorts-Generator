@@ -70,6 +70,22 @@ def _aspect_ratio_from(request) -> str:
     return ratio or "9:16"
 
 
+def _estimate_upscale(source_path: str, out_w: int, out_h: int) -> float:
+    """Approximate the upscale factor from source to output (brief §23)."""
+    try:
+        from visual_effects import probe_source_resolution
+        probe = probe_source_resolution(source_path)
+        if not probe:
+            return 0.0
+        sw, sh, _ = probe
+        if sw <= 0 or sh <= 0:
+            return 0.0
+        # Vertical short: compare along the width (crop keeps source height).
+        return round(min(1.0, out_w / sw), 2)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 # ── Job persistence (Master Task Brief §19) ────────────────────────────────
 # Render jobs are stored in a small SQLite DB (RENDER_JOB_DB, default
 # rendered/render_jobs.db) so a service restart does not lose job status.
@@ -139,6 +155,48 @@ def _load_job(job_id: str) -> Optional[Dict]:
             "response": json.loads(row[3]) if row[3] else None,
             "error": row[4],
         }
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _find_job_by_request(request_id: str) -> Optional[str]:
+    """Idempotency (brief §20): find a persisted non-failed job that carried
+    the same request_id. Returns its job_id or None."""
+    if not request_id:
+        return None
+    try:
+        conn = _job_db()
+        rows = conn.execute(
+            "SELECT job_id, status, request FROM render_jobs WHERE status != 'failed' ORDER BY id DESC LIMIT 50",
+        ).fetchall()
+        import json
+        for job_id, status, request in rows:
+            if not request:
+                continue
+            try:
+                parsed = json.loads(request)
+            except Exception:  # noqa: BLE001
+                continue
+            rid = parsed.get("request_id") if isinstance(parsed, dict) else None
+            if rid == request_id:
+                return job_id
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _load_job_request(job_id: str) -> Optional[Dict]:
+    """Return the original request JSON for a job (for retry)."""
+    try:
+        conn = _job_db()
+        row = conn.execute(
+            "SELECT request FROM render_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        import json
+        return json.loads(row[0])
     except Exception:  # noqa: BLE001
         return None
 
@@ -721,6 +779,11 @@ def _speaker_color(speaker: str) -> tuple:
     return ((h >> 16) & 255, (h >> 8) & 255, h & 255)
 
 
+# Structured QC (brief §23): caption metrics collected during burn.
+_CAPTION_COLLISION_HITS = 0
+_CAPTION_OVERFLOW_HITS = 0
+
+
 def _burn_karaoke_captions(
     video_path: str,
     captions: List[CaptionRequest],
@@ -872,6 +935,7 @@ def _burn_karaoke_captions(
     hold_sec = CAPTION_HOLD_MS / 1000.0
 
     def compose(ts: float, path: str) -> None:
+        global _CAPTION_COLLISION_HITS, _CAPTION_OVERFLOW_HITS
         canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         # A line is active from its first word's reveal (start - lead) until its
         # last word's end + hold.
@@ -912,6 +976,10 @@ def _burn_karaoke_captions(
         # block would go, move the block ABOVE the face instead.
         if mouth_zone is not None and y < mouth_zone[3] and mouth_zone[3] > height * 0.35:
             y = max(int(height * 0.12), mouth_zone[1] - total_h - line_gap)
+            _CAPTION_COLLISION_HITS += 1
+        # Overflow: caption block taller than 40% of the frame (bad wrapping).
+        if total_h > height * 0.4:
+            _CAPTION_OVERFLOW_HITS += 1
         for line in active_lines:
             x = (width - line["width"]) // 2
             for item in line["items"]:
@@ -1339,6 +1407,7 @@ def _render(request) -> RenderResponse:
             fmt=FORMAT,
             out_dir=str(RENDER_ROOT / "source"),
         )
+        _persist_job(job_id, "analysing_source", mode=mode, episode_id=episode_id)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"download failed: {e}") from e
 
@@ -1373,6 +1442,8 @@ def _render(request) -> RenderResponse:
     start = time.time()
     rendered = []
     artifacts = []
+    _persist_job(job_id, "rendering_preview" if preview else "rendering_final",
+                 mode=mode, episode_id=episode_id)
     for i, c in enumerate(clips, 1):
         out_path = os.path.join(job_dir, f"short_{i:02d}.mp4")
         item = {
@@ -1530,6 +1601,9 @@ def _render(request) -> RenderResponse:
                         item["caption_lines"] = burned
                     else:
                         print(f"[render] clip {i}: no captions inside window, skipping burn", flush=True)
+                    # Structured QC (brief §23): caption overflow / face collision.
+                    artifact.qc.caption_overflow = _CAPTION_OVERFLOW_HITS > 0
+                    artifact.qc.caption_face_collision = _CAPTION_COLLISION_HITS > 0
 
             # Phase 5: prepend the hook intro (frame + dim + hook text + TTS).
             if c["hook"]:
@@ -1620,6 +1694,7 @@ def _render(request) -> RenderResponse:
             # Run QC on the FINAL file (after hook + final encode + mastering).
             # When QC_BLOCK_UPLOAD=1 and the video fails, mark the clip failed
             # so the publisher refuses to upload.
+            _persist_job(job_id, "quality_check", mode=mode, episode_id=episode_id)
             try:
                 from quality_gate import quality_gate
                 qc = quality_gate(out_path)
@@ -1640,7 +1715,9 @@ def _render(request) -> RenderResponse:
                 artifact.qc.audio_lufs = qc.get("checks", {}).get("audio_lufs")
                 artifact.qc.audio_true_peak = qc.get("checks", {}).get("audio_true_peak")
                 artifact.qc.audio_sync_ms = qc.get("checks", {}).get("audio_sync_ms")
-                artifact.qc.black_frame_ratio = min(1.0, (qc.get("checks", {}).get("black_frames", 0) or 0) / 5.0)
+                artifact.qc.black_frame_ratio = qc.get("checks", {}).get("black_frame_ratio", 0) or 0
+                artifact.qc.frozen_frame_ratio = qc.get("checks", {}).get("frozen_frame_ratio", 0) or 0
+                artifact.qc.upscale_factor = _estimate_upscale(source, output_w, output_h)
                 artifact.qc.warnings = qc["warnings"][:6]
                 if qc["status"] != "pass":
                     item["status"] = "error"
@@ -1682,8 +1759,11 @@ def _render(request) -> RenderResponse:
 
     print(f"[render] job {job_id} finished in {time.time() - start:.1f}s", flush=True)
     # Persist final job status (brief §19) so a restart keeps the result.
+    # Status: completed (all ok) | partial_failure (some clips failed).
     try:
         import json
+        ok_count = sum(1 for a in artifacts if a.status == "ok")
+        final_status = "completed" if ok_count == len(artifacts) else "partial_failure"
         src_info = None
         try:
             from visual_effects import probe_source_resolution
@@ -1701,7 +1781,7 @@ def _render(request) -> RenderResponse:
             "source": src_info or {},
         }
         _persist_job(
-            job_id, "completed", mode=mode, episode_id=episode_id,
+            job_id, final_status, mode=mode, episode_id=episode_id,
             response=json.dumps(resp_payload, default=str),
         )
     except Exception as e:  # noqa: BLE001
@@ -1775,12 +1855,29 @@ def render_async(request: Union[RenderRequest, RenderRequestV2]):
     The job runs in a background thread (still serialized by the process-wide
     lock). Clients poll GET /api/render/status/{job_id} for completion. This
     avoids the ~5min client timeout that killed long batch renders.
+
+    Idempotency (brief §20): when the request carries a request_id that already
+    exists in a non-failed job, the EXISTING job id is returned instead of
+    starting a duplicate render.
     """
+    request_id = getattr(request, "request_id", "") or ""
+    if request_id:
+        with _async_jobs_lock:
+            for jid, job in _async_jobs.items():
+                if job.get("request_id") == request_id and job.get("state") != "error":
+                    print(f"[render] idempotent hit: {request_id} -> {jid}", flush=True)
+                    return RenderResponse(job_id=jid, source_video="", rendered=[])
+        # Fall back to the persisted job store (survived a restart).
+        stored_id = _find_job_by_request(request_id)
+        if stored_id:
+            print(f"[render] idempotent hit (persisted): {request_id} -> {stored_id}", flush=True)
+            return RenderResponse(job_id=stored_id, source_video="", rendered=[])
+
     job_id = uuid.uuid4().hex[:10]
     mode = getattr(request, "mode", "final") or "final"
     episode_id = getattr(request, "episode_id", "") or ""
     with _async_jobs_lock:
-        _async_jobs[job_id] = {"state": "running", "response": None, "error": None}
+        _async_jobs[job_id] = {"state": "running", "response": None, "error": None, "request_id": request_id}
     _persist_job(job_id, "queued", mode=mode, episode_id=episode_id,
                  request=request.model_dump_json() if hasattr(request, "model_dump_json") else "")
 
@@ -1821,6 +1918,56 @@ def render_job_cancel(job_id: str):
     if not stored:
         raise HTTPException(status_code=404, detail="job not found")
     return {"job_id": job_id, "state": stored["status"]}
+
+
+@app.post("/api/render/jobs/{job_id}/retry")
+def render_job_retry(job_id: str):
+    """Re-queue a FAILED or PARTIAL_FAILURE job using its original request.
+    Returns the NEW job id (the old one is kept for history)."""
+    stored = _load_job(job_id)
+    if not stored:
+        raise HTTPException(status_code=404, detail="job not found")
+    original = _load_job_request(job_id)
+    if not original:
+        raise HTTPException(status_code=400, detail="original request not available for retry")
+
+    # Rebuild the request object from its JSON (works for v1 and v2).
+    try:
+        if original.get("contract_version") == "2.0":
+            request = RenderRequestV2(**original)
+        else:
+            request = RenderRequest(**original)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"stored request invalid: {e}") from e
+
+    new_job_id = uuid.uuid4().hex[:10]
+    mode = getattr(request, "mode", "final") or "final"
+    episode_id = getattr(request, "episode_id", "") or ""
+    with _async_jobs_lock:
+        _async_jobs[new_job_id] = {"state": "running", "response": None, "error": None,
+                                   "request_id": getattr(request, "request_id", "") or ""}
+    _persist_job(new_job_id, "queued", mode=mode, episode_id=episode_id,
+                 request=request.model_dump_json() if hasattr(request, "model_dump_json") else "")
+
+    def worker():
+        global _render_busy
+        try:
+            _render_lock.acquire()
+            _render_busy = True
+            try:
+                resp = _render(request)
+            finally:
+                _render_busy = False
+                _render_lock.release()
+            with _async_jobs_lock:
+                _async_jobs[new_job_id] = {"state": "done", "response": resp, "error": None}
+        except Exception as e:  # noqa: BLE001
+            with _async_jobs_lock:
+                _async_jobs[new_job_id] = {"state": "error", "response": None, "error": str(e)}
+            _persist_job(new_job_id, "failed", mode=mode, episode_id=episode_id, error=str(e))
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"job_id": new_job_id, "original_job_id": job_id, "state": "queued"}
 
 
 @app.post("/api/render", response_model=RenderResponse)
