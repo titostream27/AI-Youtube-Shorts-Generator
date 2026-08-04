@@ -354,7 +354,7 @@ CAPTION_HOLD_MS = int(os.getenv("RENDER_CAPTION_HOLD_MS", "400"))
 # the BOTTOM. Lower value = higher on screen. Many source videos carry their
 # own burned-in lower-third text/watermarks, so the default sits in the lower-
 # middle area rather than hugging the bottom edge.
-CAPTION_BOTTOM_MARGIN = float(os.getenv("RENDER_CAPTION_BOTTOM_MARGIN", "0.18"))
+CAPTION_BOTTOM_MARGIN = float(os.getenv("RENDER_CAPTION_BOTTOM_MARGIN", "0.22"))
 
 # Phase 5: hook intro scene. When a clip carries a hook line we prepend a
 # short intro: first frame of the clip, darkened, with the hook rendered large
@@ -861,7 +861,7 @@ def _burn_karaoke_captions(
     # visual lines (max ~92% of frame width). Each visual line keeps the word
     # ordering so we can compute the active word from elapsed time.
     from PIL import ImageFont
-    font_scale = float(os.getenv("RENDER_CAPTION_FONT_SCALE", "0.05"))
+    font_scale = float(os.getenv("RENDER_CAPTION_FONT_SCALE", "0.042"))
     base_size = max(int(height * font_scale), 14)
     font_path = "C:/Windows/Fonts/arialbd.ttf"
     font = ImageFont.truetype(font_path, base_size)
@@ -898,9 +898,9 @@ def _burn_karaoke_captions(
     # Max 3-6 words per visual line and max 2 lines per caption display. The
     # wrap breaks on BOTH width and word count so short bursts don't stretch
     # into one long line, and a 3-word sentence never fills 6 slots.
-    caption_max_words = int(os.getenv("RENDER_CAPTION_MAX_WORDS", "6"))
+    caption_max_words = int(os.getenv("RENDER_CAPTION_MAX_WORDS", "4"))
     caption_min_words = int(os.getenv("RENDER_CAPTION_MIN_WORDS", "2"))
-    caption_max_lines = int(os.getenv("RENDER_CAPTION_MAX_LINES", "2"))
+    caption_max_lines = int(os.getenv("RENDER_CAPTION_MAX_LINES", "1"))
 
     # Wrap into visual lines by cumulative width AND word budget. Each caption
     # cue is wrapped independently so two cues never share a visual line.
@@ -1886,10 +1886,25 @@ def render_job_status(job_id: str):
     stored = _load_job(job_id)
     if not stored:
         raise HTTPException(status_code=404, detail="job not found")
+    state = stored["status"]
+    # Orphan detection (self-heal): a job that is still 'queued'/'running' in
+    # the persisted store but ABSENT from _async_jobs can only mean the service
+    # was restarted after persisting that state — the worker thread that would
+    # advance it died with the old process and will never resume. Reporting it
+    # as 'queued' forever freezes the clip in renderStatus='rendering' upstream
+    # and blocks re-render. Surface it as a terminal 'orphaned' state so the
+    # caller's self-heal can clear it. Persisted terminal states (done/failed/
+    # cancelled) pass through unchanged.
+    if state in ("queued", "running", "downloading", "analysing_source",
+                 "rendering_preview", "rendering_final", "quality_check"):
+        _persist_job(job_id, "orphaned", mode=stored.get("mode", "final"),
+                     error="job orphaned by render service restart")
+        state = "orphaned"
     payload = {
         "job_id": job_id,
-        "state": stored["status"],
-        "error": stored.get("error"),
+        "state": state,
+        "error": stored.get("error") or ("job orphaned by render service restart"
+                                         if state == "orphaned" else None),
         "mode": stored.get("mode", "final"),
     }
     resp = stored.get("response") or {}
