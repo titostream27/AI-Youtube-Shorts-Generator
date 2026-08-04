@@ -8,9 +8,12 @@ Credentials are read from .env (YT_CLIENT_ID / YT_CLIENT_SECRET /
 YT_REFRESH_TOKEN) or process env. The refresh token decides WHICH YouTube
 account receives the upload — swap it to post as a different account.
 
-Endpoints:
+* Endpoints:
   GET  /health
-  POST /api/publish   body: { clip_id, title, description, tags, file_url }
+  POST /api/publish   body: { clip_id, title, description, tags, file_url,
+                              thumbnail_url?, privacy?, publish_at? }
+    publish_at (ISO 8601) schedules the upload: private until that instant,
+    then public automatically (YouTube native scheduled publish).
 """
 import os
 import sys
@@ -115,9 +118,22 @@ def _upload_to_youtube(
     description: str,
     tags: List[str],
     privacy: str = "private",
+    publish_at: Optional[str] = None,
 ) -> dict:
     creds = _credentials()
     youtube = build("youtube", "v3", credentials=creds)
+
+    status = {
+        "privacyStatus": privacy,
+        "selfDeclaredMadeForKids": False,
+    }
+    # Scheduled publish: YouTube only allows a future publishAt when the
+    # video is uploaded private; it flips to public automatically at that
+    # instant. Sending publishAt with a public/privacyStatus mismatch is
+    # rejected by the API, so force private when scheduling.
+    if publish_at:
+        status["privacyStatus"] = "private"
+        status["publishAt"] = publish_at
 
     body = {
         "snippet": {
@@ -126,10 +142,7 @@ def _upload_to_youtube(
             "tags": [t[:100] for t in tags[:500]],
             "categoryId": "22",  # People & Blogs
         },
-        "status": {
-            "privacyStatus": privacy,
-            "selfDeclaredMadeForKids": False,
-        },
+        "status": status,
     }
 
     media = MediaFileUpload(video_path, mimetype="video/mp4", chunksize=8 * 1024 * 1024, resumable=True)
@@ -186,6 +199,7 @@ try:
         file_url: str
         thumbnail_url: str = ""
         privacy: str = "private"
+        publish_at: Optional[str] = None
 
     class PublishResponse(BaseModel):
         clip_id: int
@@ -210,6 +224,7 @@ try:
                 description=req.description,
                 tags=req.tags,
                 privacy=req.privacy,
+                publish_at=req.publish_at,
             )
             # Custom thumbnail (non-fatal if it fails).
             thumbnail_set = False
