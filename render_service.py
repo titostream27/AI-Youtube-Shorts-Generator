@@ -1722,7 +1722,27 @@ def _render(request) -> RenderResponse:
                 sp.run(cmd, check=True)
                 os.replace(final_h264, out_path)
             except Exception as e:  # noqa: BLE001
-                print(f"[render] clip {i}: final encode failed ({e}), keeping lossless intermediate", flush=True)
+                # The styled pass (color + watermark) can crash on some ffmpeg
+                # builds when drawtext/fontconfig is broken behind a segfault.
+                # Never store the lossless intermediate as the FINAL artifact
+                # (YouTube rejects FFV1) — retry a clean H.264 encode without
+                # any filter to guarantee a publishable file.
+                print(f"[render] clip {i}: styled final encode failed ({e}); retrying clean H.264 encode", flush=True)
+                try:
+                    cmd_clean = [
+                        "ffmpeg", "-y", "-loglevel", "error",
+                        "-i", out_path,
+                        "-c:v", "libx264", "-preset", preset, "-crf", crf,
+                        "-profile:v", "high", "-level", "4.0",
+                        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                        "-c:a", "copy",
+                        final_h264,
+                    ]
+                    sp.run(cmd_clean, check=True)
+                    os.replace(final_h264, out_path)
+                    print(f"[render] clip {i}: clean H.264 fallback encode succeeded", flush=True)
+                except Exception as e2:  # noqa: BLE001
+                    print(f"[render] clip {i}: clean retry failed ({e2}), keeping lossless intermediate", flush=True)
 
             # ── Phase 3 (brief §45): audio mastering chain ──
             # Applied AFTER the final video encode: re-encodes audio only

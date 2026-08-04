@@ -92,10 +92,30 @@ def build_watermark_filter(frame_w: int, frame_h: int) -> Optional[str]:
         f"y={y_expr}",
     ]
     font_path = os.getenv("RENDER_WATERMARK_FONT", "").strip()
-    if font_path:
-        # drawtext needs forward slashes / escaped colon on Windows paths.
-        fp = font_path.replace("\\", "/").replace(":", "\\:")
-        parts.append(f"fontfile='{fp}'")
+    if not font_path:
+        # Windows ffmpeg drawtext SEGFAULTS (0xC0000005) when no fontfile is
+        # given and fontconfig is unavailable (no fonts.conf on this host).
+        # Auto-detect a real Windows font; if none exists, skip the watermark
+        # instead of letting render_service crash and fall back to FFV1.
+        _font_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+        _candidates = [
+            "arialbd.ttf", "arial.ttf", "arialbi.ttf",
+            "segoeuib.ttf", "segoeui.ttf",
+            "calibrib.ttf", "calibri.ttf",
+            "verdanab.ttf", "verdana.ttf",
+            "tahomabd.ttf", "tahoma.ttf",
+            "ariblk.ttf",
+        ]
+        for _cand in _candidates:
+            _p = os.path.join(_font_dir, _cand)
+            if os.path.exists(_p):
+                font_path = _p
+                break
+    if not font_path:
+        return None
+    # drawtext needs forward slashes / escaped colon on Windows paths.
+    fp = font_path.replace("\\", "/").replace(":", "\\:")
+    parts.append(f"fontfile='{fp}'")
     return "drawtext=" + ":".join(parts)
 
 
