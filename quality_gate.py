@@ -56,9 +56,19 @@ def _audio_loudness(path: str) -> Optional[Dict]:
         if end < 0:
             return None
         data = json.loads(payload[:end + 1])
+
+        def _f(v):
+            # loudnorm's print_format=json emits every value as a STRING
+            # (e.g. "-14.20"). Without coercion, round(str, 1) raises
+            # TypeError and the caller's try/except silently nulls audio_lufs.
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
         return {
-            "input_i": data.get("input_i"),   # integrated LUFS
-            "input_tp": data.get("input_tp"), # true peak dBTP
+            "input_i": _f(data.get("input_i")),   # integrated LUFS
+            "input_tp": _f(data.get("input_tp")), # true peak dBTP
         }
     except Exception:  # noqa: BLE001
         return None

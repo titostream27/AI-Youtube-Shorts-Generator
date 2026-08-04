@@ -337,6 +337,13 @@ def _write_srt(captions: List[CaptionRequest], clip_start: float, srt_path: str)
 
 ACTIVE_COLOR = (255, 255, 255)      # all visible words
 OUTLINE_COLOR = (10, 10, 10)
+# True karaoke highlight (brief §1.1): the word currently being spoken pops in
+# an accent color while already-spoken / not-yet-spoken visible words stay in
+# the base color. Set RENDER_CAPTION_HIGHLIGHT=0 to fall back to plain reveal.
+CAPTION_HIGHLIGHT = os.getenv("RENDER_CAPTION_HIGHLIGHT", "1") != "0"
+HIGHLIGHT_COLOR = tuple(
+    int(x) for x in os.getenv("RENDER_CAPTION_HIGHLIGHT_COLOR", "255,214,10").split(",")
+)[:3]
 
 # Reveal style: words appear one-by-one as the audio reaches them, all white.
 # LEAD_MS shows each word slightly BEFORE its audio so it is readable in time;
@@ -880,6 +887,12 @@ def _burn_karaoke_captions(
     # Render sprites (one per word, colored by speaker — reveal style).
     for item in flat:
         item["sprite"] = _make_word_sprite(item["word"], font, item["color"])
+        # Karaoke highlight: a second sprite in the accent color, shown only
+        # while this word is the one being spoken.
+        if CAPTION_HIGHLIGHT:
+            item["sprite_hi"] = _make_word_sprite(item["word"], font, HIGHLIGHT_COLOR)
+        else:
+            item["sprite_hi"] = item["sprite"]
 
     # ── Phase 3 (brief §44): word/line budget ──
     # Max 3-6 words per visual line and max 2 lines per caption display. The
@@ -986,7 +999,14 @@ def _burn_karaoke_captions(
             for item in line["items"]:
                 # Reveal: the word appears (lead_sec early) and stays visible.
                 if ts >= item["start"] - lead_sec:
-                    canvas.paste(item["sprite"], (x, y), item["sprite"])
+                    # Karaoke: use the accent sprite while this word is the one
+                    # currently being spoken (between its own start and end),
+                    # otherwise the base-color sprite.
+                    if CAPTION_HIGHLIGHT and item["start"] <= ts < item["end"]:
+                        spr = item["sprite_hi"]
+                    else:
+                        spr = item["sprite"]
+                    canvas.paste(spr, (x, y), spr)
                 x += item["sprite"].width + space
             y += line["items"][0]["sprite"].height + line_gap
         canvas.save(path)
@@ -1679,6 +1699,16 @@ def _render(request) -> RenderResponse:
                 vf_parts = ["format=yuv420p"]
                 if color_filter and not preview:
                     vf_parts.insert(0, color_filter)
+                # Brand watermark (brief §3.3): channel handle in a corner.
+                # Opt-in via RENDER_WATERMARK_TEXT; skipped in preview.
+                if not preview:
+                    try:
+                        from visual_effects import build_watermark_filter
+                        wm = build_watermark_filter(output_w, output_h)
+                        if wm:
+                            vf_parts.append(wm)
+                    except Exception:  # noqa: BLE001
+                        pass
                 cmd = [
                     "ffmpeg", "-y", "-loglevel", "error",
                     "-i", out_path,

@@ -53,6 +53,52 @@ def build_color_filter() -> Optional[str]:
     return ",".join(parts)
 
 
+def build_watermark_filter(frame_w: int, frame_h: int) -> Optional[str]:
+    """Return an ffmpeg drawtext filter that stamps the channel handle in a
+    corner, or None if disabled (brief §3.3 brand consistency).
+
+    Opt-in and non-intrusive by design: OFF unless RENDER_WATERMARK_TEXT is
+    set. The handle sits in the upper area (away from the bottom caption band
+    and the YouTube Shorts UI overlay) at low opacity so it reads as a subtle
+    brand mark, not a distraction.
+    """
+    text = os.getenv("RENDER_WATERMARK_TEXT", "").strip()
+    if not text or os.getenv("RENDER_WATERMARK", "1") == "0":
+        return None
+
+    # Escape characters that are special inside a drawtext expression.
+    safe = (
+        text.replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace("%", "\\%")
+    )
+    opacity = float(os.getenv("RENDER_WATERMARK_OPACITY", "0.45"))
+    size = max(int(frame_h * float(os.getenv("RENDER_WATERMARK_FONT_SCALE", "0.028"))), 12)
+    margin = max(int(frame_w * 0.04), 12)
+    # Position: tl | tr | bl | br. Default top-right, clear of the bottom
+    # caption band. y kept in the top ~8% so it never collides with captions.
+    pos = os.getenv("RENDER_WATERMARK_POSITION", "tr").lower()
+    x_expr = f"{margin}" if pos in ("tl", "bl") else f"w-text_w-{margin}"
+    y_expr = f"h-text_h-{margin}" if pos in ("bl", "br") else f"{margin}"
+
+    parts = [
+        f"text='{safe}'",
+        f"fontsize={size}",
+        "fontcolor=white@%.2f" % opacity,
+        "borderw=%d" % max(1, size // 12),
+        "bordercolor=black@%.2f" % min(1.0, opacity + 0.25),
+        f"x={x_expr}",
+        f"y={y_expr}",
+    ]
+    font_path = os.getenv("RENDER_WATERMARK_FONT", "").strip()
+    if font_path:
+        # drawtext needs forward slashes / escaped colon on Windows paths.
+        fp = font_path.replace("\\", "/").replace(":", "\\:")
+        parts.append(f"fontfile='{fp}'")
+    return "drawtext=" + ":".join(parts)
+
+
 def build_emphasis_events(captions: List[dict], duration_sec: float) -> List[dict]:
     """Derive punch-in events from caption content.
 

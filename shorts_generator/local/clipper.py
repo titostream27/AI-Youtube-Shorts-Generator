@@ -216,6 +216,12 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
     focus_lost_grace_frames = int(fps * RENDER_FOCUS_LOST_GRACE_S) if fps > 0 else 15
     active_focus_track_id: Optional[int] = None
     focus_track: Optional[Dict] = None  # set each frame in the focus-lock phase
+    # Running EMA of the focused face's area. A challenger whose area deviates
+    # wildly from this is almost certainly a non-face object (poster, bust,
+    # hand) that YuNet mis-detected — it must NOT steal focus from the speaker.
+    focus_area_ema: Optional[float] = None
+    FOCUS_SIZE_MIN_RATIO = float(os.getenv("RENDER_FOCUS_SIZE_MIN", "0.35"))
+    FOCUS_SIZE_MAX_RATIO = float(os.getenv("RENDER_FOCUS_SIZE_MAX", "2.8"))
     # Anti-shake / anti-zoom state for the blur_background tight speaker crop.
     blur_fg_cx: Optional[float] = None
     blur_fg_cy: Optional[float] = None
@@ -800,11 +806,26 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
             else:
                 focus_lost_frames = 0
                 focus_hold_frames += 1
+                # Track the focused face's area so the size guard has a
+                # reference. EMA adapts as the subject moves toward/away.
+                if focus_area_ema is None:
+                    focus_area_ema = float(active.get("area", 0.0)) or None
+                elif active.get("area", 0.0) > 0:
+                    focus_area_ema = focus_area_ema * 0.9 + float(active["area"]) * 0.1
+                # Size-consistency guard (mirror of _pick_speaker): a challenger
+                # whose area is wildly off the focused face is almost certainly
+                # a mis-detected object (poster, bust, hand) — reject it so the
+                # crop never gets yanked off the speaker onto a background item.
+                size_ok = True
+                if focus_area_ema and best_track.get("area", 0) > 0:
+                    ratio = best_track["area"] / focus_area_ema
+                    size_ok = FOCUS_SIZE_MIN_RATIO <= ratio <= FOCUS_SIZE_MAX_RATIO
                 # Candidate confirmation: a different track must beat the
                 # active one by the margin, consistently, for the confirm
                 # window, AND the active track must have held its minimum.
                 if (
                     best_track["track_id"] != active_focus_track_id
+                    and size_ok
                     and focus_hold_frames >= focus_min_hold_frames
                     and best_track.get("score", 0)
                     > active.get("score", 0) + RENDER_FOCUS_SCORE_MARGIN
