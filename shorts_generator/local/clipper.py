@@ -22,6 +22,12 @@ _LAST_SPEAKER_TRACK_ID: Optional[int] = None
 # of the frame while the reaction split is active, instead of covering the
 # reactor's face in the bottom pane.
 _LAST_SPLIT_ALPHA: float = 0.0
+# Time ranges (start_sec, end_sec) during which the reaction split was ACTIVE
+# (blend alpha above threshold) in the last reframe pass. The caption
+# compositor needs per-frame knowledge, not just the final frame's alpha —
+# a clip can alternate single/split multiple times, and the last frame is
+# usually single view.
+_SPLIT_RANGES: List[Tuple[float, float]] = []
 
 # Phase 4 (Master Task Brief §23): structured QC tracking stats collected
 # during reframing, exposed via get_render_stats() for the renderer's QC.
@@ -52,6 +58,16 @@ def get_last_split_alpha() -> float:
     the reactor's face in the bottom pane is not covered.
     """
     return _LAST_SPLIT_ALPHA
+
+
+def get_split_ranges() -> List[Tuple[float, float]]:
+    """Return (start_sec, end_sec) intervals where the reaction split was
+    ACTIVE (blend weight >= SPLIT_RANGE_THRESHOLD) during the last reframe.
+
+    Used by the caption compositor to shift captions to the center of the
+    frame for exactly the frames where the split layout is on screen.
+    """
+    return list(_SPLIT_RANGES)
 
 import numpy as np
 
@@ -259,6 +275,7 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
     # Phase 4 (brief §23): per-reframe QC stats.
     global _RENDER_STATS
     global _LAST_SPLIT_ALPHA
+    global _SPLIT_RANGES
     _RENDER_STATS = {
         "focus_switch_count": 0,
         "focus_ping_pong_detected": False,
@@ -267,6 +284,8 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         "frames": 0,
         "switch_history": [],
     }
+    _LAST_SPLIT_ALPHA = 0.0
+    _SPLIT_RANGES = []
     switch_history: List[Tuple[Optional[int], int]] = []
     candidate_focus_track_id: Optional[int] = None
     candidate_focus_since = 0
@@ -1042,6 +1061,19 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         # the reaction split is active, keeping the bottom pane's face clear.
         _LAST_SPLIT_ALPHA = split_alpha if (split_enabled and split_alpha > 0.0) else 0.0
 
+        # Track the time ranges where the split is VISIBLE (>= threshold), so
+        # the caption compositor can place captions at the center for exactly
+        # those frames even when the clip alternates single/split multiple
+        # times and the last frame is single view.
+        _SPLIT_RANGE_THRESHOLD = 0.5
+        _cur_split_on = split_enabled and split_alpha >= _SPLIT_RANGE_THRESHOLD
+        if _cur_split_on and (not _SPLIT_RANGES or _SPLIT_RANGES[-1][1] is not None):
+            # New split interval starts now.
+            _SPLIT_RANGES.append([frame_no / max(fps, 1), None])
+        elif not _cur_split_on and _SPLIT_RANGES and _SPLIT_RANGES[-1][1] is None:
+            # Close the open interval at the current frame time.
+            _SPLIT_RANGES[-1][1] = frame_no / max(fps, 1)
+
         # ------------------------------------------------------------------
         # Render the frame: single view (default) or split layout.
         # ------------------------------------------------------------------
@@ -1307,6 +1339,9 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         writer.write(cropped)
 
     cap.release()
+    # Close any split interval still open at the end of the clip.
+    if _SPLIT_RANGES and _SPLIT_RANGES[-1][1] is None:
+        _SPLIT_RANGES[-1][1] = frame_no / max(fps, 1)
     writer.release()
     # Windows keeps the file handle alive until the cv2 objects are garbage
     # collected — release references explicitly before any os.remove() below.
