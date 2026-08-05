@@ -27,6 +27,7 @@ from shorts_generator.local.clipper import crop_highlights_local
 from shorts_generator.local.downloader import download_youtube_local
 
 from render_contract import (
+    CONTRACT_VERSION,
     CaptionRequest,
     CaptionWord,
     ClipRequest,
@@ -1572,10 +1573,28 @@ def _build_thumbnail(video_path: str, hook: str, work_dir: str) -> Optional[str]
     return thumb_path
 
 
-def _render(request, job_id: str) -> RenderResponse:
+class RenderOutcome:
+    """Phase-2 correctness: _render returns BOTH the response and the final
+    status it computed. The job orchestration layer (async/retry/sync
+    wrappers) is the ONLY place allowed to persist terminal status, so
+    partial_failure is never overwritten by a wrapper's blanket completed.
+    """
+
+    __slots__ = ("response", "final_status")
+
+    def __init__(self, response: RenderResponse, final_status: str) -> None:
+        self.response = response
+        self.final_status = final_status
+
+
+def _render(request, job_id: str) -> RenderOutcome:
     # job_id is supplied by the job service (Phase 1 §5.1). This function must
     # NEVER generate a replacement identity: the same id must appear in the
     # response, output directory, SQLite row, and artifact URLs.
+    #
+    # Phase-2 correctness: _render performs NON-terminal transitions and
+    # returns RenderOutcome(response, final_status). It must NOT persist the
+    # terminal status — the caller does that, exactly once.
     job_dir = RENDER_ROOT / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2015,35 +2034,20 @@ def _render(request, job_id: str) -> RenderResponse:
         artifacts.append(artifact)
 
     print(f"[render] job {job_id} finished in {time.time() - start:.1f}s", flush=True)
-    # Persist final job status (brief §19) so a restart keeps the result.
-    # Status: completed (all ok) | partial_failure (some clips failed).
+    # Phase-2 correctness: compute the terminal status but DO NOT persist it.
+    # The orchestration layer persists it exactly once (RenderOutcome).
+    import json
+    ok_count = sum(1 for a in artifacts if a.status == "ok")
+    final_status = "completed" if ok_count == len(artifacts) else "partial_failure"
+    src_info = None
     try:
-        import json
-        ok_count = sum(1 for a in artifacts if a.status == "ok")
-        final_status = "completed" if ok_count == len(artifacts) else "partial_failure"
-        src_info = None
-        try:
-            from visual_effects import probe_source_resolution
-            src_probe = probe_source_resolution(source)
-            if src_probe:
-                src_info = {"width": src_probe[0], "height": src_probe[1]}
-        except Exception:  # noqa: BLE001
-            pass
-        resp_payload = {
-            "job_id": job_id,
-            "source_video": source,
-            "rendered": rendered,
-            "mode": mode,
-            "artifacts": [a.model_dump() for a in artifacts],
-            "source": src_info or {},
-        }
-        _persist_job(
-            job_id, final_status, mode=mode, episode_id=episode_id,
-            response=json.dumps(resp_payload, default=str),
-        )
-    except Exception as e:  # noqa: BLE001
-        print(f"[render] job persist failed: {e}", flush=True)
-    return RenderResponse(
+        from visual_effects import probe_source_resolution
+        src_probe = probe_source_resolution(source)
+        if src_probe:
+            src_info = {"width": src_probe[0], "height": src_probe[1]}
+    except Exception:  # noqa: BLE001
+        pass
+    resp = RenderResponse(
         job_id=job_id,
         source_video=source,
         rendered=rendered,
@@ -2051,6 +2055,7 @@ def _render(request, job_id: str) -> RenderResponse:
         mode=mode,
         source=src_info or {},
     )
+    return RenderOutcome(resp, final_status)
 
 
 # Serial render queue: only ONE render job runs at a time. Concurrent
@@ -2188,6 +2193,29 @@ def render_job_status(job_id: str):
     return payload
 
 
+def parse_render_request(request):
+    """Parse a raw dict into the correct request model (V1 or V2).
+
+    Phase-2 correctness:
+    - V2 bodies (contract_version == '2.0') parse as RenderRequestV2.
+    - A PRESENT but unsupported contract_version (e.g. '2.1') is rejected
+      explicitly instead of falling through to the V1 parser.
+    - Legacy v1 bodies (no contract_version) parse as RenderRequest.
+    Used by sync, async and retry so all three paths behave identically.
+    """
+    if not isinstance(request, dict):
+        return request
+    if "contract_version" in request:
+        if request["contract_version"] != CONTRACT_VERSION:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported contract_version {request['contract_version']!r}; "
+                       f"supported: {CONTRACT_VERSION!r}",
+            )
+        return RenderRequestV2(**request)
+    return RenderRequest(**request)
+
+
 @app.post("/api/render/async", response_model=RenderResponse)
 def render_async(request: Dict[str, Any]):
     """Queue a render job (v1 or v2 contract) and return immediately.
@@ -2205,12 +2233,9 @@ def render_async(request: Dict[str, Any]):
     exists in a non-failed job, the EXISTING job id is returned instead of
     starting a duplicate render.
     """
-    # Parse manually: v2 body -> RenderRequestV2, otherwise v1 (legacy).
-    if isinstance(request, dict):
-        if request.get("contract_version") == "2.0":
-            request = RenderRequestV2(**request)
-        else:
-            request = RenderRequest(**request)
+    # Parse manually via the shared parse_render_request(): v2 -> V2 model,
+    # unsupported versions fail explicitly, legacy v1 -> V1 model.
+    request = parse_render_request(request)
     request_id = getattr(request, "request_id", "") or ""
     if request_id:
         with _async_jobs_lock:
@@ -2245,16 +2270,17 @@ def render_async(request: Dict[str, Any]):
                     if job and job.get("state") == "cancelled":
                         cancelled_before_render = True
                 if not cancelled_before_render:
-                    resp = _render(request, job_id)
+                    outcome = _render(request, job_id)
             finally:
                 _render_busy = False
                 _render_lock.release()
             if cancelled_before_render:
                 return
             with _async_jobs_lock:
-                _async_jobs[job_id] = {"state": "completed", "response": resp, "error": None}
-            _persist_job(job_id, "completed", mode=mode, episode_id=episode_id,
-                         response=resp.model_dump_json() if hasattr(resp, "model_dump_json") else "")
+                _async_jobs[job_id] = {"state": outcome.final_status, "response": outcome.response, "error": None}
+            # Phase-2 correctness: terminal status is persisted HERE, once.
+            _persist_job(job_id, outcome.final_status, mode=mode, episode_id=episode_id,
+                         response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "")
         except Exception as e:  # noqa: BLE001
             with _async_jobs_lock:
                 _async_jobs[job_id] = {"state": "failed", "response": None, "error": str(e)}
@@ -2310,11 +2336,12 @@ def render_job_retry(job_id: str):
         raise HTTPException(status_code=400, detail="original request not available for retry")
 
     # Rebuild the request object from its JSON (works for v1 and v2).
+    # Phase-2 correctness: use the same parse_render_request() so unsupported
+    # versions stored in old rows are rejected explicitly.
     try:
-        if original.get("contract_version") == "2.0":
-            request = RenderRequestV2(**original)
-        else:
-            request = RenderRequest(**original)
+        request = parse_render_request(original)
+    except HTTPException:
+        raise
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"stored request invalid: {e}") from e
 
@@ -2346,16 +2373,17 @@ def render_job_retry(job_id: str):
                     if job and job.get("state") == "cancelled":
                         cancelled_before_render = True
                 if not cancelled_before_render:
-                    resp = _render(request, new_job_id)
+                    outcome = _render(request, new_job_id)
             finally:
                 _render_busy = False
                 _render_lock.release()
             if cancelled_before_render:
                 return
             with _async_jobs_lock:
-                _async_jobs[new_job_id] = {"state": "completed", "response": resp, "error": None}
-            _persist_job(new_job_id, "completed", mode=mode, episode_id=episode_id,
-                         response=resp.model_dump_json() if hasattr(resp, "model_dump_json") else "",
+                _async_jobs[new_job_id] = {"state": outcome.final_status, "response": outcome.response, "error": None}
+            # Phase-2 correctness: terminal status persisted here, once.
+            _persist_job(new_job_id, outcome.final_status, mode=mode, episode_id=episode_id,
+                         response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "",
                          parent_job_id=job_id, attempt=attempt)
         except Exception as e:  # noqa: BLE001
             with _async_jobs_lock:
@@ -2368,15 +2396,20 @@ def render_job_retry(job_id: str):
 
 
 @app.post("/api/render", response_model=RenderResponse)
-def render(request: Union[RenderRequest, RenderRequestV2]):
+def render(request: Dict[str, Any]):
     """Render clips synchronously (v1 or v2 contract). Long videos download
     first — poll client-side.
 
     Serialized by a process-wide lock so concurrent render requests never run
     in parallel (downloads of multi-hundred-MB sources and OpenCV encodes are
     CPU/disk heavy; parallelism just slows everything down and crashes).
+
+    Phase-2 correctness: parsed through parse_render_request() like async and
+    retry — V2 is never mis-parsed as V1 and unsupported contract versions
+    fail explicitly. Terminal status persisted here once from RenderOutcome.
     """
     global _render_busy
+    request = parse_render_request(request)
     # Phase 1 §5.1: synchronous rendering follows the same identity rule —
     # the API creates job_id exactly once, _render never generates its own.
     job_id = uuid.uuid4().hex[:10]
@@ -2389,13 +2422,13 @@ def render(request: Union[RenderRequest, RenderRequestV2]):
     _render_lock.acquire()
     _render_busy = True
     try:
-        resp = _render(request, job_id)
+        outcome = _render(request, job_id)
     finally:
         _render_busy = False
         _render_lock.release()
-    _persist_job(job_id, "completed", mode=mode, episode_id=episode_id,
-                 response=resp.model_dump_json() if hasattr(resp, "model_dump_json") else "")
-    return resp
+    _persist_job(job_id, outcome.final_status, mode=mode, episode_id=episode_id,
+                 response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "")
+    return outcome.response
 
 
 if __name__ == "__main__":

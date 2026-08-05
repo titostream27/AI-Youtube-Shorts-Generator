@@ -25,7 +25,7 @@ reject the same fixtures.
 """
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 CONTRACT_VERSION = "2.0"
 
@@ -123,6 +123,9 @@ class V2Clip(BaseModel):
 
 
 class RenderRequestV2(BaseModel):
+    # Phase-2 correctness: unknown fields are rejected, not silently dropped —
+    # a typo'd key must not be mistaken for a valid contract.
+    model_config = ConfigDict(extra="forbid")
     contract_version: str = CONTRACT_VERSION
     request_id: str = ""
     episode_id: str = ""
