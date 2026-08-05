@@ -69,6 +69,58 @@ def get_split_ranges() -> List[Tuple[float, float]]:
     """
     return list(_SPLIT_RANGES)
 
+
+# ── Phase 2 (Render timelines): explicit artifact ──────────────────────────
+# Replaces the module-global snapshots for NEW callers. crop_clip_local with
+# return_timeline=True returns (path, RenderTimeline) so the renderer never
+# has to read module globals; the globals + getters remain for legacy callers.
+
+class RenderTimeline:
+    """Explicit per-clip render timeline artifact (Phase 2 §render timelines).
+
+    Captured ONCE per crop_clip_local call. Carries everything downstream
+    (caption compositor, QC, analytics) needs without module-global state:
+    face tracks, active speaker, split windows, and QC tracking stats.
+    """
+
+    def __init__(self) -> None:
+        self.face_tracks: List[Dict] = []
+        self.speaker_track_id: Optional[int] = None
+        self.split_alpha: float = 0.0
+        self.split_ranges: List[Tuple[float, float]] = []
+        self.stats: Dict[str, object] = {
+            "focus_switch_count": 0,
+            "focus_ping_pong_detected": False,
+            "random_crop_detected": False,
+            "face_cutoff_ratio": 0.0,
+            "frames": 0,
+            "switch_history": [],
+        }
+
+    @classmethod
+    def capture(cls) -> "RenderTimeline":
+        """Capture the current module state as an explicit artifact.
+
+        Safe because rendering is serialized by the render lock: within one
+        crop_clip_local call the globals belong to this clip only.
+        """
+        t = cls()
+        t.face_tracks = list(_LAST_FACE_TRACKS)
+        t.speaker_track_id = _LAST_SPEAKER_TRACK_ID
+        t.split_alpha = _LAST_SPLIT_ALPHA
+        t.split_ranges = list(_SPLIT_RANGES)
+        t.stats = dict(_RENDER_STATS)
+        return t
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "face_tracks": self.face_tracks,
+            "speaker_track_id": self.speaker_track_id,
+            "split_alpha": self.split_alpha,
+            "split_ranges": self.split_ranges,
+            "stats": self.stats,
+        }
+
 import numpy as np
 
 from ..config import LOCAL_OUTPUT_DIR
@@ -1405,7 +1457,8 @@ def crop_clip_local(
     emphasis_events: Optional[List[Dict]] = None,
     layout_mode: str = "face_crop",
     output_size: Optional[Tuple[int, int]] = None,
-) -> str:
+    return_timeline: bool = False,
+) -> str | Tuple[str, RenderTimeline]:
     """Cut + reframe one highlight, returning the local mp4 path.
 
     When `cache_dir` is given, the reframed (vertical, caption-free) result is
@@ -1419,6 +1472,11 @@ def crop_clip_local(
     function finishes with H.264 (used by the CLI path).
 
     Phase 4 (brief §47): `emphasis_events` drives semantic punch-in zoom.
+
+    Phase 2 (render timelines): with `return_timeline=True`, returns
+    `(out_path, RenderTimeline)` — an explicit artifact carrying face tracks,
+    active speaker, split windows and QC stats. Callers should prefer this
+    over the module-global getters.
     """
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
@@ -1482,6 +1540,11 @@ def crop_clip_local(
         shutil.copyfile(out_path, cache_path)
         print(f"[clip/local] cached: {os.path.basename(cache_path)}", flush=True)
 
+    if return_timeline:
+        # Phase 2 (render timelines): return an explicit artifact so callers
+        # never read module globals. Rendering is serialized, so capturing
+        # the module state here is safe (it belongs to THIS clip).
+        return out_path, RenderTimeline.capture()
     return out_path
 
 

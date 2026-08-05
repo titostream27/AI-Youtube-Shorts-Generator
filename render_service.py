@@ -947,6 +947,7 @@ def _burn_karaoke_captions(
     clip_start: float,
     out_path: str,
     work_dir: str,
+    timeline: Optional[object] = None,
 ) -> int:
     """Burn karaoke word-highlight captions by compositing per-frame overlays.
 
@@ -954,6 +955,10 @@ def _burn_karaoke_captions(
     canvas: the active word in white, all others in grey. The overlay PNG
     sequence is then composited over the video with ffmpeg and re-encoded
     to H.264.
+
+    Phase 2 (render timelines): pass the clip's RenderTimeline artifact to
+    avoid module-global reads for face/split data. When None, falls back to
+    the legacy module getters (kept for old callers).
 
     Returns the number of caption dialogue lines written.
     """
@@ -996,17 +1001,20 @@ def _burn_karaoke_captions(
     print(f"[caption] video {os.path.basename(video_path)}: {width}x{height} fps={fps:.3f}", flush=True)
 
     # ── Phase 3 (brief §44): face collision avoidance needs face boxes ──
-    # The clipper tracks faces per frame; the reframe stage exports the last
-    # frame's tracks via get_last_face_tracks() so the caption composer can
-    # avoid covering the speaker's mouth.
-    try:
-        from shorts_generator.local.clipper import get_last_face_tracks, get_split_ranges
-        face_tracks_ref, speaker_track_id_ref = get_last_face_tracks()
-        split_ranges_ref = get_split_ranges()
-    except Exception:  # noqa: BLE001
-        face_tracks_ref = []
-        speaker_track_id_ref = None
-        split_ranges_ref = []
+    # Phase 2: prefer the explicit timeline artifact when provided.
+    if timeline is not None:
+        face_tracks_ref = list(getattr(timeline, "face_tracks", []) or [])
+        speaker_track_id_ref = getattr(timeline, "speaker_track_id", None)
+        split_ranges_ref = list(getattr(timeline, "split_ranges", []) or [])
+    else:
+        try:
+            from shorts_generator.local.clipper import get_last_face_tracks, get_split_ranges
+            face_tracks_ref, speaker_track_id_ref = get_last_face_tracks()
+            split_ranges_ref = get_split_ranges()
+        except Exception:  # noqa: BLE001
+            face_tracks_ref = []
+            speaker_track_id_ref = None
+            split_ranges_ref = []
     # Time intervals (start_sec, end_sec) where the shot uses the reaction
     # split layout. When split is active the speaker is in the TOP pane and
     # the reactor in the BOTTOM pane, so a bottom-anchored caption would cover
@@ -1698,7 +1706,9 @@ def _render(request, job_id: str) -> RenderResponse:
             except Exception as e:  # noqa: BLE001
                 print(f"[render] clip {i}: layout fallback check failed ({e}), using {clip_layout}", flush=True)
 
-            crop_clip_local(
+            # Phase 2 (render timelines): request the explicit artifact so we
+            # never read module globals for QC/caption data.
+            crop_result = crop_clip_local(
                 source,
                 float(c["start_sec"]),
                 float(c["end_sec"]),
@@ -1709,7 +1719,13 @@ def _render(request, job_id: str) -> RenderResponse:
                 emphasis_events=emphasis_events,
                 layout_mode=clip_layout,
                 output_size=(output_w, output_h) if preview else None,
+                return_timeline=True,
             )
+            if isinstance(crop_result, tuple):
+                _, timeline = crop_result
+            else:
+                # Legacy callers (or mock) return a bare path.
+                timeline = None
             # The crop succeeded; final status may still flip to error later if
             # the quality gate fails.
             item["status"] = "ok"
@@ -1717,8 +1733,11 @@ def _render(request, job_id: str) -> RenderResponse:
 
             # Phase 4 (brief §23): structured tracking QC from the clipper.
             try:
-                from shorts_generator.local.clipper import get_render_stats
-                stats = get_render_stats()
+                if timeline is None:
+                    from shorts_generator.local.clipper import get_render_stats
+                    stats = get_render_stats()
+                else:
+                    stats = timeline.stats
                 artifact.qc.focus_switch_count = int(stats.get("focus_switch_count", 0) or 0)
                 artifact.qc.focus_ping_pong_detected = bool(stats.get("focus_ping_pong_detected", False))
                 artifact.qc.random_crop_detected = bool(stats.get("random_crop_detected", False))
@@ -1800,6 +1819,9 @@ def _render(request, job_id: str) -> RenderResponse:
                         float(c["start_sec"]),
                         out_path,
                         job_dir,
+                        # Phase 2 (render timelines): pass the explicit
+                        # artifact instead of reading module globals.
+                        timeline=timeline,
                     )
                     if burned > 0:
                         item["caption_lines"] = burned
