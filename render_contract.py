@@ -17,14 +17,24 @@ v1 (legacy, still accepted): {video_url, clips:[{clip_id,title,start_sec,
   end_sec,captions,hook}], aspect_ratio}
 v2: full contract with contract_version="2.0", mode, narrative, layout_plan,
   caption_plan, editing_events, source_preferences, output.
+
+Phase 1 §5.5: validation rules are shared with the TypeScript schema
+(src/lib/render/contract.ts in youtube-content-miner) and the neutral JSON
+Schema in contracts/render-request-v2.schema.json. Both sides must pass and
+reject the same fixtures.
 """
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 CONTRACT_VERSION = "2.0"
 
+VALID_MODES = ("preview", "final")
+VALID_LAYOUTS = ("auto", "face_crop", "dual_face", "blur_background",
+                 "stacked_source", "screen_plus_face")
+VALID_EVENT_TYPES = ("emphasis", "punchline", "important_number", "topic_label")
 
+CONTRACT_VERSION = "2.0"
 # ── Shared leaf types ──────────────────────────────────────────────────────
 
 class CaptionWord(BaseModel):
@@ -121,6 +131,59 @@ class RenderRequestV2(BaseModel):
     source_preferences: SourcePreferences = Field(default_factory=SourcePreferences)
     output: RenderOutput = Field(default_factory=RenderOutput)
     clips: List[V2Clip] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_contract_rules(self):
+        """Phase 1 §5.5: enforce the shared contract rules (mirrors the
+        TypeScript schema and the JSON Schema in contracts/)."""
+        if self.contract_version != CONTRACT_VERSION:
+            raise ValueError(
+                f"unsupported contract_version {self.contract_version!r}; "
+                f"expected {CONTRACT_VERSION!r}"
+            )
+        if not self.request_id:
+            raise ValueError("request_id must be non-empty")
+        if not self.video_url:
+            raise ValueError("video_url must be non-empty")
+        if self.mode not in VALID_MODES:
+            raise ValueError(f"mode must be one of {VALID_MODES}, got {self.mode!r}")
+        if self.output.width <= 0 or self.output.height <= 0:
+            raise ValueError("output width and height must be positive")
+        seen_ids = set()
+        for clip in self.clips:
+            if clip.start_sec < 0:
+                raise ValueError(f"clip {clip.clip_id}: start_sec must be >= 0")
+            if clip.end_sec <= clip.start_sec:
+                raise ValueError(
+                    f"clip {clip.clip_id}: end_sec ({clip.end_sec}) must be > "
+                    f"start_sec ({clip.start_sec})"
+                )
+            if clip.clip_id in seen_ids:
+                raise ValueError(f"duplicate clip_id {clip.clip_id!r}")
+            seen_ids.add(clip.clip_id)
+            if clip.layout_plan.preferred_layout not in VALID_LAYOUTS:
+                raise ValueError(
+                    f"clip {clip.clip_id}: invalid preferred_layout "
+                    f"{clip.layout_plan.preferred_layout!r}"
+                )
+            for cue in clip.caption_plan.cues:
+                if cue.start_sec < clip.start_sec or cue.end_sec > clip.end_sec:
+                    raise ValueError(
+                        f"clip {clip.clip_id}: caption cue [{cue.start_sec},"
+                        f"{cue.end_sec}] outside clip range "
+                        f"[{clip.start_sec},{clip.end_sec}]"
+                    )
+            for ev in clip.editing_events:
+                if ev.time_sec < clip.start_sec or ev.time_sec > clip.end_sec:
+                    raise ValueError(
+                        f"clip {clip.clip_id}: editing event at {ev.time_sec} "
+                        f"outside clip range [{clip.start_sec},{clip.end_sec}]"
+                    )
+                if ev.type not in VALID_EVENT_TYPES:
+                    raise ValueError(
+                        f"clip {clip.clip_id}: invalid editing event type {ev.type!r}"
+                    )
+        return self
 
 
 # ── Legacy v1 request (still accepted, upgraded internally) ────────────────
