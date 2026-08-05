@@ -1061,18 +1061,12 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         # the reaction split is active, keeping the bottom pane's face clear.
         _LAST_SPLIT_ALPHA = split_alpha if (split_enabled and split_alpha > 0.0) else 0.0
 
-        # Track the time ranges where the split is VISIBLE (>= threshold), so
-        # the caption compositor can place captions at the center for exactly
-        # those frames even when the clip alternates single/split multiple
-        # times and the last frame is single view.
-        _SPLIT_RANGE_THRESHOLD = 0.5
-        _cur_split_on = split_enabled and split_alpha >= _SPLIT_RANGE_THRESHOLD
-        if _cur_split_on and (not _SPLIT_RANGES or _SPLIT_RANGES[-1][1] is not None):
-            # New split interval starts now.
-            _SPLIT_RANGES.append([frame_no / max(fps, 1), None])
-        elif not _cur_split_on and _SPLIT_RANGES and _SPLIT_RANGES[-1][1] is None:
-            # Close the open interval at the current frame time.
-            _SPLIT_RANGES[-1][1] = frame_no / max(fps, 1)
+        # Reaction-split visibility flag for this frame. The blur_background
+        # layout has its OWN two-panel split (decided later in the frame) — we
+        # OR both flags together and write _SPLIT_RANGES once, right before the
+        # writer, so captions center during ANY split layout.
+        _reaction_split_on = split_enabled and split_alpha >= 0.5
+        _blur_split_on = False
 
         # ------------------------------------------------------------------
         # Render the frame: single view (default) or split layout.
@@ -1226,6 +1220,7 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                                 blur_second_id = second["track_id"]
                                 blur_second_miss = 0
                         if second is not None:
+                            _blur_split_on = True
                             top_h = int(crop_h * 0.55)
                             bot_h = crop_h - top_h
                             # Panel width: tight around the FACE (2.6x face
@@ -1336,6 +1331,17 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         # end — the single lossy encode happens later in ffmpeg.
         if cropped.shape[1] != output_w or cropped.shape[0] != output_h:
             cropped = cv2.resize(cropped, (output_w, output_h), interpolation=cv2.INTER_LANCZOS4)
+
+        # Track the time ranges where ANY split layout is VISIBLE, so the
+        # caption compositor can place captions at the center for exactly
+        # those frames even when a clip alternates single/split multiple times
+        # and the final frame is single view.
+        _cur_split_on = _reaction_split_on or _blur_split_on
+        if _cur_split_on and (not _SPLIT_RANGES or _SPLIT_RANGES[-1][1] is not None):
+            _SPLIT_RANGES.append([frame_no / max(fps, 1), None])
+        elif not _cur_split_on and _SPLIT_RANGES and _SPLIT_RANGES[-1][1] is None:
+            _SPLIT_RANGES[-1][1] = frame_no / max(fps, 1)
+
         writer.write(cropped)
 
     cap.release()
