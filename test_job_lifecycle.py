@@ -75,20 +75,15 @@ class JobLifecycleTestBase(unittest.TestCase):
         for p in self._patchers:
             p.start()
             self.addCleanup(p.stop)
-        # Force fresh connection to the temp DB.
-        rs._job_db_conn = None
+        # Force fresh connections to the temp DB (Phase-2: per-operation).
+        rs._close_db_conns()
         # Sanitize memory registry between tests.
         with rs._async_jobs_lock:
             rs._async_jobs.clear()
 
     def tearDown(self):
-        # Close the module connection so Windows can delete the temp DB.
-        if rs._job_db_conn is not None:
-            try:
-                rs._job_db_conn.close()
-            except Exception:
-                pass
-            rs._job_db_conn = None
+        # Close tracked connections so Windows can delete the temp DB.
+        rs._close_db_conns()
         self._tmp.cleanup()
 
 
@@ -256,6 +251,9 @@ class TestRetryHistory(JobLifecycleTestBase):
             reg = rs._async_jobs.get(new_id, {})
         self.assertEqual(reg.get("parent_job_id"), "job-old-1")
         self.assertEqual(reg.get("attempt", 1), 2)
+        # Let the retry worker finish so it never leaks the DB lock into the
+        # next test (Windows keeps the file locked while a handle is open).
+        wait_until(lambda: rs._async_jobs.get(new_id, {}).get("state") in ("completed", "partial_failure", "failed"), timeout=5)
 
 
 class TestPersistenceErrorsSurfaced(JobLifecycleTestBase):

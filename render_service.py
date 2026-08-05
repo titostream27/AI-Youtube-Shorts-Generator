@@ -98,6 +98,28 @@ _job_db_conn = None
 # degraded DB is visible to ops instead of failing silently.
 _last_persist_error = None
 _last_persist_error_at = None
+_last_db_error = None
+_last_db_error_at = None
+_last_db_error_stage = None
+
+
+def _record_db_error(stage: str, error: Exception) -> None:
+    """Surface a DB read/write failure in structured health diagnostics.
+
+    Phase-2 correctness (F9): _load_job / _load_job_request /
+    _find_job_by_request previously swallowed SQLite errors and returned
+    None — indistinguishable from a genuine not-found. Every failure is now
+    recorded so /api/render/health can report db.read_errors separately.
+    """
+    global _last_db_error, _last_db_error_at, _last_db_error_stage
+    import datetime
+    _last_db_error = f"{type(error).__name__}: {error}"
+    _last_db_error_at = datetime.datetime.utcnow().isoformat()
+    _last_db_error_stage = stage
+    # Keep the legacy write-error field in sync so older consumers still see it.
+    global _last_persist_error, _last_persist_error_at
+    _last_persist_error = _last_db_error
+    _last_persist_error_at = _last_db_error_at
 
 # ── Canonical job state machine (Phase 1 §5.2) ─────────────────────────────
 # One vocabulary in memory, SQLite, API responses, logs, and docs.
@@ -145,33 +167,82 @@ def is_active(status: str) -> bool:
 
 
 def _job_db():
-    global _job_db_conn
-    if _job_db_conn is None:
-        import sqlite3
-        conn = sqlite3.connect(str(JOB_DB_PATH), check_same_thread=False, timeout=30)
-        # Phase 1 §5.3: WAL + busy timeout for threaded access. Short
-        # transactions: every writer commits immediately.
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS render_jobs (
-                job_id TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                mode TEXT NOT NULL DEFAULT 'final',
-                episode_id TEXT,
-                request TEXT,
-                response TEXT,
-                error TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )"""
-        )
-        # Phase 1 §5.3: additive, idempotent migration. Preserves existing
-        # records; safe to rerun (each ALTER is guarded by a column check).
-        _migrate_render_jobs(conn)
-        conn.commit()
-        _job_db_conn = conn
-    return _job_db_conn
+    """Open a FRESH connection for the current operation (Phase-2 F8).
+
+    The previous module-global connection (check_same_thread=False) allowed
+    API and worker threads to interleave transactions on one handle, which
+    surfaced as 'cannot commit - no transaction is active' under concurrency.
+    Each call now opens its own short-lived connection; _db_lock serializes
+    writers so WAL stays consistent. Opened handles are tracked so tests can
+    close them on teardown (Windows keeps DB files locked while open).
+    """
+    import sqlite3
+    conn = sqlite3.connect(str(JOB_DB_PATH), timeout=30)
+    with _opened_db_conns_lock:
+        _opened_db_conns.add(conn)
+    # Phase 1 §5.3: WAL + busy timeout for threaded access. Short
+    # transactions: every writer commits immediately.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS render_jobs (
+            job_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'final',
+            episode_id TEXT,
+            request TEXT,
+            response TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )"""
+    )
+    # Phase 1 §5.3: additive, idempotent migration. Preserves existing
+    # records; safe to rerun (each ALTER is guarded by a column check).
+    _migrate_render_jobs(conn)
+    conn.commit()
+    return conn
+
+
+_opened_db_conns: set = set()
+_opened_db_conns_lock = threading.Lock()
+
+
+def _close_db_conns() -> None:
+    """Close every tracked connection (used by tests + shutdown)."""
+    with _opened_db_conns_lock:
+        conns = list(_opened_db_conns)
+        _opened_db_conns.clear()
+    for conn in conns:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _db_conn():
+    """Context manager: open a fresh connection, yield it, always close it.
+
+    Phase-2 correctness (F8): every DB operation opens its own short-lived
+    connection and closes it when done, so no handle lingers (Windows keeps
+    the DB file locked while a connection is open).
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _cm():
+        conn = _job_db()
+        try:
+            yield conn
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with _opened_db_conns_lock:
+                _opened_db_conns.discard(conn)
+
+    return _cm()
 
 
 def _migrate_render_jobs(conn) -> None:
@@ -210,8 +281,7 @@ def _persist_job(job_id: str, status: str, *, mode: str = "final",
     import datetime
     status = canonical_status(status)
     try:
-        with _db_lock:
-            conn = _job_db()
+        with _db_lock, _db_conn() as conn:
             now = datetime.datetime.utcnow().isoformat()
             conn.execute(
                 """INSERT INTO render_jobs
@@ -285,8 +355,7 @@ def transition_job(job_id: str, status: str, *, mode: str = "final",
 
 def _load_job(job_id: str) -> Optional[Dict]:
     try:
-        with _db_lock:
-            conn = _job_db()
+        with _db_lock, _db_conn() as conn:
             row = conn.execute(
                 "SELECT status, mode, episode_id, response, error, attempt, parent_job_id, "
                 "COALESCE(request_id, '') FROM render_jobs WHERE job_id = ?",
@@ -308,25 +377,26 @@ def _load_job(job_id: str) -> Optional[Dict]:
     except Exception:  # noqa: BLE001
         # Fall back to the legacy column set (pre-migration DB).
         try:
-            conn = _job_db()
-            row = conn.execute(
-                "SELECT status, mode, episode_id, response, error FROM render_jobs WHERE job_id = ?",
-                (job_id,),
-            ).fetchone()
-            if not row:
-                return None
-            import json
-            return {
-                "status": canonical_status(row[0]),
-                "mode": row[1],
-                "episode_id": row[2],
-                "response": json.loads(row[3]) if row[3] else None,
-                "error": row[4],
-                "attempt": 1,
-                "parent_job_id": None,
-                "request_id": "",
-            }
-        except Exception:  # noqa: BLE001
+            with _db_conn() as conn:
+                row = conn.execute(
+                    "SELECT status, mode, episode_id, response, error FROM render_jobs WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if not row:
+                    return None
+                import json
+                return {
+                    "status": canonical_status(row[0]),
+                    "mode": row[1],
+                    "episode_id": row[2],
+                    "response": json.loads(row[3]) if row[3] else None,
+                    "error": row[4],
+                    "attempt": 1,
+                    "parent_job_id": None,
+                    "request_id": "",
+                }
+        except Exception as e:  # noqa: BLE001
+            _record_db_error("load_job", e)
             return None
 
 
@@ -340,8 +410,7 @@ def _find_job_by_request(request_id: str) -> Optional[str]:
     if not request_id:
         return None
     try:
-        with _db_lock:
-            conn = _job_db()
+        with _db_lock, _db_conn() as conn:
             row = conn.execute(
                 "SELECT job_id FROM render_jobs "
                 "WHERE request_id = ? AND status IN "
@@ -354,26 +423,27 @@ def _find_job_by_request(request_id: str) -> Optional[str]:
         # Column may not exist yet on an un-migrated DB; fall back to the old
         # JSON scan only for backward compatibility (never silently ignore).
         try:
-            conn = _job_db()
-            rows = conn.execute(
-                "SELECT job_id, status, request FROM render_jobs "
-                "WHERE status IN ('queued','downloading','analysing','rendering',"
-                "'quality_check','completed') ORDER BY created_at DESC LIMIT 50"
-            ).fetchall()
-            import json
-            for job_id, status, request in rows:
-                if not request:
-                    continue
-                try:
-                    parsed = json.loads(request)
-                except Exception:  # noqa: BLE001
-                    continue
-                rid = parsed.get("request_id") if isinstance(parsed, dict) else None
-                if rid == request_id:
-                    return job_id
+            with _db_conn() as conn:
+                rows = conn.execute(
+                    "SELECT job_id, status, request FROM render_jobs "
+                    "WHERE status IN ('queued','downloading','analysing','rendering',"
+                    "'quality_check','completed') ORDER BY created_at DESC LIMIT 50"
+                ).fetchall()
+                import json
+                for job_id, status, request in rows:
+                    if not request:
+                        continue
+                    try:
+                        parsed = json.loads(request)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    rid = parsed.get("request_id") if isinstance(parsed, dict) else None
+                    if rid == request_id:
+                        return job_id
             return None
         except Exception as e:  # noqa: BLE001
             print(f"[idempotency] lookup failed for {request_id}: {e}", flush=True)
+            _record_db_error("find_job_by_request", e)
             return None
 
 
@@ -401,8 +471,7 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
     if not request_id:
         return new_job_id
     try:
-        with _db_lock:
-            conn = _job_db()
+        with _db_lock, _db_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT job_id FROM render_jobs WHERE request_id = ? "
@@ -429,8 +498,7 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
         except Exception:  # noqa: BLE001
             pass
         try:
-            with _db_lock:
-                conn = _job_db()
+            with _db_lock, _db_conn() as conn:
                 row = conn.execute(
                     "SELECT job_id FROM render_jobs WHERE request_id = ? "
                     "AND status IN ('queued','downloading','analysing','rendering',"
@@ -445,8 +513,7 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
 def _load_job_request(job_id: str) -> Optional[Dict]:
     """Return the original request JSON for a job (for retry)."""
     try:
-        with _db_lock:
-            conn = _job_db()
+        with _db_lock, _db_conn() as conn:
             row = conn.execute(
                 "SELECT request FROM render_jobs WHERE job_id = ?",
                 (job_id,),
@@ -455,7 +522,8 @@ def _load_job_request(job_id: str) -> Optional[Dict]:
                 return None
             import json
             return json.loads(row[0])
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _record_db_error("load_job_request", e)
         return None
 
 
@@ -2190,14 +2258,14 @@ def render_health():
     db_ok = False
     db_error = None
     try:
-        conn = _job_db()
-        conn.execute("SELECT COUNT(*) FROM render_jobs").fetchone()
-        # Write probe: insert into a temp table in a transaction we roll back.
-        conn.execute("CREATE TEMP TABLE IF NOT EXISTS _health_probe (v INTEGER)")
-        conn.execute("INSERT INTO _health_probe (v) VALUES (1)")
-        conn.execute("DELETE FROM _health_probe")
-        conn.commit()
-        db_ok = True
+        with _db_lock, _db_conn() as conn:
+            conn.execute("SELECT COUNT(*) FROM render_jobs").fetchone()
+            # Write probe: insert into a temp table in a transaction we roll back.
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS _health_probe (v INTEGER)")
+            conn.execute("INSERT INTO _health_probe (v) VALUES (1)")
+            conn.execute("DELETE FROM _health_probe")
+            conn.commit()
+            db_ok = True
     except Exception as e:  # noqa: BLE001
         db_error = f"{type(e).__name__}: {e}"
     # 2. Queue depth + active job.
@@ -2234,7 +2302,9 @@ def render_health():
         "status": "ok" if (db_ok and out_ok) else "degraded",
         "service": "shorts-render-service",
         "build": build,
-        "db": {"ok": db_ok, "error": db_error},
+        "db": {"ok": db_ok, "error": db_error,
+               "last_error": _last_db_error, "last_error_at": _last_db_error_at,
+               "last_error_stage": _last_db_error_stage},
         "queue": {"depth": queue_depth, "active_job_id": active_job_id},
         "ffmpeg": {"available": ffmpeg, "ffprobe": ffprobe},
         "output": {"writable": out_ok, "error": out_error, "free_bytes": free_bytes},
@@ -2385,15 +2455,17 @@ def render_async(request: Dict[str, Any]):
                 _render_lock.release()
             if cancelled_before_render:
                 return
-            with _async_jobs_lock:
-                _async_jobs[job_id] = {"state": outcome.final_status, "response": outcome.response, "error": None}
-            # Phase-2 correctness: terminal status is persisted HERE, once.
+            # Phase-2 correctness: terminal status is persisted HERE, once,
+            # BEFORE the memory registry is updated, so a caller that sees
+            # 'completed'/'partial_failure' knows the row is already durable.
             _persist_job(job_id, outcome.final_status, mode=mode, episode_id=episode_id,
                          response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "")
+            with _async_jobs_lock:
+                _async_jobs[job_id] = {"state": outcome.final_status, "response": outcome.response, "error": None}
         except Exception as e:  # noqa: BLE001
+            _persist_job(job_id, "failed", mode=mode, episode_id=episode_id, error=str(e))
             with _async_jobs_lock:
                 _async_jobs[job_id] = {"state": "failed", "response": None, "error": str(e)}
-            _persist_job(job_id, "failed", mode=mode, episode_id=episode_id, error=str(e))
 
     threading.Thread(target=worker, daemon=True).start()
     return RenderResponse(job_id=job_id, source_video="", rendered=[])
@@ -2498,17 +2570,18 @@ def render_job_retry(job_id: str):
                 _render_lock.release()
             if cancelled_before_render:
                 return
-            with _async_jobs_lock:
-                _async_jobs[new_job_id] = {"state": outcome.final_status, "response": outcome.response, "error": None}
-            # Phase-2 correctness: terminal status persisted here, once.
+            # Phase-2 correctness: persist BEFORE updating memory (durable
+            # state is the source of truth for terminal status).
             _persist_job(new_job_id, outcome.final_status, mode=mode, episode_id=episode_id,
                          response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "",
                          parent_job_id=job_id, attempt=attempt)
-        except Exception as e:  # noqa: BLE001
             with _async_jobs_lock:
-                _async_jobs[new_job_id] = {"state": "failed", "response": None, "error": str(e)}
+                _async_jobs[new_job_id] = {"state": outcome.final_status, "response": outcome.response, "error": None}
+        except Exception as e:  # noqa: BLE001
             _persist_job(new_job_id, "failed", mode=mode, episode_id=episode_id, error=str(e),
                          parent_job_id=job_id, attempt=attempt)
+            with _async_jobs_lock:
+                _async_jobs[new_job_id] = {"state": "failed", "response": None, "error": str(e)}
 
     threading.Thread(target=worker, daemon=True).start()
     return {"job_id": new_job_id, "original_job_id": job_id, "state": "queued"}
