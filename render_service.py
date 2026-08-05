@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from shorts_generator.local.clipper import crop_highlights_local
@@ -93,13 +93,55 @@ def _estimate_upscale(source_path: str, out_w: int, out_h: int) -> float:
 JOB_DB_PATH = Path(os.getenv("RENDER_JOB_DB", str(RENDER_ROOT / "render_jobs.db"))).resolve()
 _job_db_conn = None
 
+# ── Canonical job state machine (Phase 1 §5.2) ─────────────────────────────
+# One vocabulary in memory, SQLite, API responses, logs, and docs.
+# Active: queued -> downloading -> analysing -> rendering -> quality_check -> completed
+# Terminal: failed | partial_failure | cancelled | orphaned
+ACTIVE_JOB_STATES = frozenset(
+    {"queued", "downloading", "analysing", "rendering", "quality_check"}
+)
+TERMINAL_JOB_STATES = frozenset(
+    {"completed", "failed", "partial_failure", "cancelled", "orphaned"}
+)
+ALL_JOB_STATES = ACTIVE_JOB_STATES | TERMINAL_JOB_STATES
+
+# Legacy status values -> canonical (Phase 1 §5.2). Existing DB rows and old
+# clients may use the old names; we normalize at read/write boundaries.
+LEGACY_STATUS_MAP = {
+    "running": "rendering",
+    "done": "completed",
+    "error": "failed",
+    "analysing_source": "analysing",
+    "rendering_preview": "rendering",
+    "rendering_final": "rendering",
+}
+
+
+def canonical_status(status: str) -> str:
+    """Map legacy/API status names onto the canonical vocabulary."""
+    if status in ALL_JOB_STATES:
+        return status
+    return LEGACY_STATUS_MAP.get(status, status)
+
+
+def is_terminal(status: str) -> bool:
+    return canonical_status(status) in TERMINAL_JOB_STATES
+
+
+def is_active(status: str) -> bool:
+    return canonical_status(status) in ACTIVE_JOB_STATES
+
 
 def _job_db():
     global _job_db_conn
     if _job_db_conn is None:
         import sqlite3
-        _job_db_conn = sqlite3.connect(str(JOB_DB_PATH), check_same_thread=False)
-        _job_db_conn.execute(
+        conn = sqlite3.connect(str(JOB_DB_PATH), check_same_thread=False, timeout=30)
+        # Phase 1 §5.3: WAL + busy timeout for threaded access. Short
+        # transactions: every writer commits immediately.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute(
             """CREATE TABLE IF NOT EXISTS render_jobs (
                 job_id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
@@ -112,78 +154,177 @@ def _job_db():
                 updated_at TEXT NOT NULL
             )"""
         )
-        _job_db_conn.commit()
+        # Phase 1 §5.3: additive, idempotent migration. Preserves existing
+        # records; safe to rerun (each ALTER is guarded by a column check).
+        _migrate_render_jobs(conn)
+        conn.commit()
+        _job_db_conn = conn
     return _job_db_conn
+
+
+def _migrate_render_jobs(conn) -> None:
+    """Add Phase 1 columns + indexes. Additive only — never drops data."""
+    import sqlite3
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(render_jobs)").fetchall()}
+    columns = {
+        "request_id": "TEXT",
+        "parent_job_id": "TEXT",
+        "attempt": "INTEGER NOT NULL DEFAULT 1",
+        "started_at": "TEXT",
+        "finished_at": "TEXT",
+        "last_error_stage": "TEXT",
+    }
+    for name, decl in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE render_jobs ADD COLUMN {name} {decl}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_render_jobs_request_id ON render_jobs(request_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_render_jobs_status ON render_jobs(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_render_jobs_created_at ON render_jobs(created_at)")
 
 
 def _persist_job(job_id: str, status: str, *, mode: str = "final",
                  episode_id: str = "", request: str = "", response: str = "",
-                 error: str = "") -> None:
+                 error: str = "", parent_job_id: str = "", attempt: int = 1) -> None:
     import sqlite3
     import datetime
+    status = canonical_status(status)
     try:
         conn = _job_db()
         now = datetime.datetime.utcnow().isoformat()
         conn.execute(
             """INSERT INTO render_jobs
-               (job_id, status, mode, episode_id, request, response, error, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               (job_id, status, mode, episode_id, request, response, error, created_at, updated_at,
+                request_id, parent_job_id, attempt, started_at, finished_at, last_error_stage)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(job_id) DO UPDATE SET
-                 status=excluded.status, mode=excluded.mode,
-                 response=excluded.response, error=excluded.error,
-                 updated_at=excluded.updated_at""",
-            (job_id, status, mode, episode_id, request, response, error, now, now),
+                status=excluded.status, mode=excluded.mode,
+                response=excluded.response, error=excluded.error,
+                parent_job_id=excluded.parent_job_id, attempt=excluded.attempt,
+                request_id=excluded.request_id,
+                started_at=COALESCE(started_at, excluded.started_at),
+                finished_at=COALESCE(excluded.finished_at, finished_at),
+                last_error_stage=CASE WHEN excluded.error IS NOT NULL AND excluded.error != ''
+                    THEN excluded.last_error_stage ELSE last_error_stage END,
+                updated_at=excluded.updated_at""",
+            (job_id, status, mode, episode_id, request, response, error, now, now,
+             _extract_request_id(request), parent_job_id, attempt,
+             now if status != "queued" else None,
+             now if status in TERMINAL_JOB_STATES else None,
+             status if error else None),
         )
         conn.commit()
-    except Exception:  # noqa: BLE001
-        pass  # persistence must never break rendering
+    except Exception as e:  # noqa: BLE001
+        # Phase 1 §5.6: persistence failure must not break rendering, but it
+        # must be visible through health diagnostics. Full logging wiring is
+        # part of the health commit; at minimum surface it on stderr now.
+        try:
+            print(f"[persist] ERROR saving job {job_id} status={status}: {e}", flush=True)
+        except Exception:
+            pass
+
+
+def _extract_request_id(request_json: str) -> str:
+    """Pull request_id from a persisted request payload without full parsing."""
+    if not request_json:
+        return ""
+    import json
+    try:
+        parsed = json.loads(request_json)
+        if isinstance(parsed, dict):
+            return str(parsed.get("request_id") or "")
+    except Exception:
+        pass
+    return ""
 
 
 def _load_job(job_id: str) -> Optional[Dict]:
     try:
         conn = _job_db()
         row = conn.execute(
-            "SELECT status, mode, episode_id, response, error FROM render_jobs WHERE job_id = ?",
+            "SELECT status, mode, episode_id, response, error, attempt, parent_job_id, "
+            "COALESCE(request_id, '') FROM render_jobs WHERE job_id = ?",
             (job_id,),
         ).fetchone()
         if not row:
             return None
         import json
         return {
-            "status": row[0],
+            "status": canonical_status(row[0]),
             "mode": row[1],
             "episode_id": row[2],
             "response": json.loads(row[3]) if row[3] else None,
             "error": row[4],
+            "attempt": row[5] if row[5] is not None else 1,
+            "parent_job_id": row[6],
+            "request_id": row[7] or "",
         }
     except Exception:  # noqa: BLE001
-        return None
+        # Fall back to the legacy column set (pre-migration DB).
+        try:
+            conn = _job_db()
+            row = conn.execute(
+                "SELECT status, mode, episode_id, response, error FROM render_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                return None
+            import json
+            return {
+                "status": canonical_status(row[0]),
+                "mode": row[1],
+                "episode_id": row[2],
+                "response": json.loads(row[3]) if row[3] else None,
+                "error": row[4],
+                "attempt": 1,
+                "parent_job_id": None,
+                "request_id": "",
+            }
+        except Exception:  # noqa: BLE001
+            return None
 
 
 def _find_job_by_request(request_id: str) -> Optional[str]:
     """Idempotency (brief §20): find a persisted non-failed job that carried
-    the same request_id. Returns its job_id or None."""
+    the same request_id. Returns its job_id or None.
+
+    Phase 1 §5.3: queries the indexed request_id column directly — no JSON
+    scan, no dependence on a nonexistent id column.
+    """
     if not request_id:
         return None
     try:
         conn = _job_db()
-        rows = conn.execute(
-            "SELECT job_id, status, request FROM render_jobs WHERE status != 'failed' ORDER BY id DESC LIMIT 50",
-        ).fetchall()
-        import json
-        for job_id, status, request in rows:
-            if not request:
-                continue
-            try:
-                parsed = json.loads(request)
-            except Exception:  # noqa: BLE001
-                continue
-            rid = parsed.get("request_id") if isinstance(parsed, dict) else None
-            if rid == request_id:
-                return job_id
-        return None
+        row = conn.execute(
+            "SELECT job_id FROM render_jobs "
+            "WHERE request_id = ? AND status != 'failed' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (request_id,),
+        ).fetchone()
+        return row[0] if row else None
     except Exception:  # noqa: BLE001
-        return None
+        # Column may not exist yet on an un-migrated DB; fall back to the old
+        # JSON scan only for backward compatibility (never silently ignore).
+        try:
+            conn = _job_db()
+            rows = conn.execute(
+                "SELECT job_id, status, request FROM render_jobs "
+                "WHERE status != 'failed' ORDER BY created_at DESC LIMIT 50"
+            ).fetchall()
+            import json
+            for job_id, status, request in rows:
+                if not request:
+                    continue
+                try:
+                    parsed = json.loads(request)
+                except Exception:  # noqa: BLE001
+                    continue
+                rid = parsed.get("request_id") if isinstance(parsed, dict) else None
+                if rid == request_id:
+                    return job_id
+            return None
+        except Exception as e:  # noqa: BLE001
+            print(f"[idempotency] lookup failed for {request_id}: {e}", flush=True)
+            return None
 
 
 def _load_job_request(job_id: str) -> Optional[Dict]:
@@ -1415,8 +1556,10 @@ def _build_thumbnail(video_path: str, hook: str, work_dir: str) -> Optional[str]
     return thumb_path
 
 
-def _render(request) -> RenderResponse:
-    job_id = uuid.uuid4().hex[:10]
+def _render(request, job_id: str) -> RenderResponse:
+    # job_id is supplied by the job service (Phase 1 §5.1). This function must
+    # NEVER generate a replacement identity: the same id must appear in the
+    # response, output directory, SQLite row, and artifact URLs.
     job_dir = RENDER_ROOT / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1899,19 +2042,20 @@ def render_status():
 
 @app.get("/api/render/status/{job_id}")
 def render_job_status(job_id: str):
-    """Return the state of a render job: running | done | error (from memory
-    when active, from the persisted job DB after a restart — brief §19)."""
+    """Return the canonical state of a render job (from memory when active,
+    from the persisted job DB after a restart — brief §19)."""
     with _async_jobs_lock:
         job = _async_jobs.get(job_id)
     if job:
+        state = canonical_status(job["state"])
         payload = {
             "job_id": job_id,
-            "state": job["state"],
+            "state": state,
             "error": job.get("error"),
             "mode": job.get("mode", "final"),
         }
         resp = job.get("response")
-        if job["state"] == "done" and resp:
+        if state == "completed" and resp:
             payload["rendered"] = resp.rendered
             payload["source_video"] = resp.source_video
             payload["mode"] = getattr(resp, "mode", "final")
@@ -1922,16 +2066,14 @@ def render_job_status(job_id: str):
     if not stored:
         raise HTTPException(status_code=404, detail="job not found")
     state = stored["status"]
-    # Orphan detection (self-heal): a job that is still 'queued'/'running' in
-    # the persisted store but ABSENT from _async_jobs can only mean the service
-    # was restarted after persisting that state — the worker thread that would
-    # advance it died with the old process and will never resume. Reporting it
-    # as 'queued' forever freezes the clip in renderStatus='rendering' upstream
-    # and blocks re-render. Surface it as a terminal 'orphaned' state so the
-    # caller's self-heal can clear it. Persisted terminal states (done/failed/
-    # cancelled) pass through unchanged.
-    if state in ("queued", "running", "downloading", "analysing_source",
-                 "rendering_preview", "rendering_final", "quality_check"):
+    # Orphan detection (self-heal): a job that is still active in the persisted
+    # store but ABSENT from _async_jobs can only mean the service was restarted
+    # after persisting that state — the worker thread that would advance it
+    # died with the old process and will never resume. Reporting it as active
+    # forever freezes the clip upstream and blocks re-render. Surface it as a
+    # terminal 'orphaned' state so the caller's self-heal can clear it.
+    # Persisted terminal states pass through unchanged.
+    if is_active(state):
         _persist_job(job_id, "orphaned", mode=stored.get("mode", "final"),
                      error="job orphaned by render service restart")
         state = "orphaned"
@@ -1991,25 +2133,36 @@ def render_async(request: Dict[str, Any]):
     mode = getattr(request, "mode", "final") or "final"
     episode_id = getattr(request, "episode_id", "") or ""
     with _async_jobs_lock:
-        _async_jobs[job_id] = {"state": "running", "response": None, "error": None, "request_id": request_id, "mode": mode}
+        _async_jobs[job_id] = {"state": "queued", "response": None, "error": None, "request_id": request_id, "mode": mode}
     _persist_job(job_id, "queued", mode=mode, episode_id=episode_id,
                  request=request.model_dump_json() if hasattr(request, "model_dump_json") else "")
 
     def worker():
         global _render_busy
+        cancelled_before_render = False
         try:
             _render_lock.acquire()
             _render_busy = True
             try:
-                resp = _render(request)
+                # Phase 1 §5.4: re-check cancellation AFTER acquiring the lock.
+                with _async_jobs_lock:
+                    job = _async_jobs.get(job_id)
+                    if job and job.get("state") == "cancelled":
+                        cancelled_before_render = True
+                if not cancelled_before_render:
+                    resp = _render(request, job_id)
             finally:
                 _render_busy = False
                 _render_lock.release()
+            if cancelled_before_render:
+                return
             with _async_jobs_lock:
-                _async_jobs[job_id] = {"state": "done", "response": resp, "error": None}
+                _async_jobs[job_id] = {"state": "completed", "response": resp, "error": None}
+            _persist_job(job_id, "completed", mode=mode, episode_id=episode_id,
+                         response=resp.model_dump_json() if hasattr(resp, "model_dump_json") else "")
         except Exception as e:  # noqa: BLE001
             with _async_jobs_lock:
-                _async_jobs[job_id] = {"state": "error", "response": None, "error": str(e)}
+                _async_jobs[job_id] = {"state": "failed", "response": None, "error": str(e)}
             _persist_job(job_id, "failed", mode=mode, episode_id=episode_id, error=str(e))
 
     threading.Thread(target=worker, daemon=True).start()
@@ -2018,19 +2171,35 @@ def render_async(request: Dict[str, Any]):
 
 @app.post("/api/render/jobs/{job_id}/cancel")
 def render_job_cancel(job_id: str):
-    """Mark a queued job as cancelled. A job already rendering cannot be
-    cancelled mid-flight (the lock serializes; it will finish)."""
+    """Cancel a QUEUED job (Phase 1 §5.4).
+
+    - queued (waiting for the render lock): cancelled, worker will not render.
+    - rendering (already running): NOT supported in Phase 1 — no active
+      FFmpeg cancellation. Return 409 conflict so the caller knows the job
+      will finish.
+    - terminal: return current state unchanged.
+    """
     with _async_jobs_lock:
         job = _async_jobs.get(job_id)
-        if job and job["state"] == "running":
-            job["state"] = "cancelled"
-            _persist_job(job_id, "cancelled", error="cancelled by user")
-            return {"job_id": job_id, "state": "cancelled"}
-        if job and job["state"] != "running":
-            return {"job_id": job_id, "state": job["state"]}
+        if job:
+            state = canonical_status(job.get("state", ""))
+            if state == "queued" or state in ("downloading", "analysing", "quality_check"):
+                job["state"] = "cancelled"
+                _persist_job(job_id, "cancelled", error="cancelled by user")
+                return {"job_id": job_id, "state": "cancelled"}
+            if state == "rendering":
+                return JSONResponse(
+                    status_code=409,
+                    content={"job_id": job_id, "state": "rendering",
+                             "error": "active render cancellation not supported in Phase 1"},
+                )
+            return {"job_id": job_id, "state": state}
     stored = _load_job(job_id)
     if not stored:
         raise HTTPException(status_code=404, detail="job not found")
+    if is_active(stored["status"]):
+        _persist_job(job_id, "cancelled", error="cancelled by user")
+        return {"job_id": job_id, "state": "cancelled"}
     return {"job_id": job_id, "state": stored["status"]}
 
 
@@ -2057,28 +2226,47 @@ def render_job_retry(job_id: str):
     new_job_id = uuid.uuid4().hex[:10]
     mode = getattr(request, "mode", "final") or "final"
     episode_id = getattr(request, "episode_id", "") or ""
+    # Phase 1 §5.1/§5.2: retry creates ONE new job_id, records parent_job_id
+    # and attempt (parent.attempt + 1), and preserves the original history.
+    parent_attempt = int(stored.get("attempt") or 1)
+    attempt = parent_attempt + 1
     with _async_jobs_lock:
-        _async_jobs[new_job_id] = {"state": "running", "response": None, "error": None,
-                                   "request_id": getattr(request, "request_id", "") or ""}
+        _async_jobs[new_job_id] = {"state": "queued", "response": None, "error": None,
+                                   "request_id": getattr(request, "request_id", "") or "",
+                                   "parent_job_id": job_id, "attempt": attempt}
     _persist_job(new_job_id, "queued", mode=mode, episode_id=episode_id,
-                 request=request.model_dump_json() if hasattr(request, "model_dump_json") else "")
+                 request=request.model_dump_json() if hasattr(request, "model_dump_json") else "",
+                 parent_job_id=job_id, attempt=attempt)
 
     def worker():
         global _render_busy
+        cancelled_before_render = False
         try:
             _render_lock.acquire()
             _render_busy = True
             try:
-                resp = _render(request)
+                # Phase 1 §5.4: re-check cancellation after acquiring the lock.
+                with _async_jobs_lock:
+                    job = _async_jobs.get(new_job_id)
+                    if job and job.get("state") == "cancelled":
+                        cancelled_before_render = True
+                if not cancelled_before_render:
+                    resp = _render(request, new_job_id)
             finally:
                 _render_busy = False
                 _render_lock.release()
+            if cancelled_before_render:
+                return
             with _async_jobs_lock:
-                _async_jobs[new_job_id] = {"state": "done", "response": resp, "error": None}
+                _async_jobs[new_job_id] = {"state": "completed", "response": resp, "error": None}
+            _persist_job(new_job_id, "completed", mode=mode, episode_id=episode_id,
+                         response=resp.model_dump_json() if hasattr(resp, "model_dump_json") else "",
+                         parent_job_id=job_id, attempt=attempt)
         except Exception as e:  # noqa: BLE001
             with _async_jobs_lock:
-                _async_jobs[new_job_id] = {"state": "error", "response": None, "error": str(e)}
-            _persist_job(new_job_id, "failed", mode=mode, episode_id=episode_id, error=str(e))
+                _async_jobs[new_job_id] = {"state": "failed", "response": None, "error": str(e)}
+            _persist_job(new_job_id, "failed", mode=mode, episode_id=episode_id, error=str(e),
+                         parent_job_id=job_id, attempt=attempt)
 
     threading.Thread(target=worker, daemon=True).start()
     return {"job_id": new_job_id, "original_job_id": job_id, "state": "queued"}
@@ -2094,15 +2282,25 @@ def render(request: Union[RenderRequest, RenderRequestV2]):
     CPU/disk heavy; parallelism just slows everything down and crashes).
     """
     global _render_busy
+    # Phase 1 §5.1: synchronous rendering follows the same identity rule —
+    # the API creates job_id exactly once, _render never generates its own.
+    job_id = uuid.uuid4().hex[:10]
+    mode = getattr(request, "mode", "final") or "final"
+    episode_id = getattr(request, "episode_id", "") or ""
+    _persist_job(job_id, "queued", mode=mode, episode_id=episode_id,
+                 request=request.model_dump_json() if hasattr(request, "model_dump_json") else "")
     # Block until the current job finishes (true FIFO queue) — a 503 timeout
     # would just push the error back to the client, not serialize the work.
     _render_lock.acquire()
     _render_busy = True
     try:
-        return _render(request)
+        resp = _render(request, job_id)
     finally:
         _render_busy = False
         _render_lock.release()
+    _persist_job(job_id, "completed", mode=mode, episode_id=episode_id,
+                 response=resp.model_dump_json() if hasattr(resp, "model_dump_json") else "")
+    return resp
 
 
 if __name__ == "__main__":

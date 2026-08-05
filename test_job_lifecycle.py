@@ -105,7 +105,7 @@ class TestAsyncJobIdentity(JobLifecycleTestBase):
             self.assertIsNotNone(stored, "job not persisted under submitted id")
 
             # Worker must have run against the same id.
-            self.assertTrue(wait_until(lambda: rs._async_jobs[job_id]["state"] == "done"))
+            self.assertTrue(wait_until(lambda: rs._async_jobs[job_id]["state"] == "completed"))
             rnd.assert_called_once()
 
     def test_successful_job_is_persisted_as_completed(self):
@@ -116,7 +116,7 @@ class TestAsyncJobIdentity(JobLifecycleTestBase):
         with mock.patch.object(rs, "_render", return_value=dummy):
             resp = rs.render_async(dict(V2_BODY))
             self.assertTrue(
-                wait_until(lambda: rs._async_jobs[resp.job_id]["state"] == "done")
+                wait_until(lambda: rs._async_jobs[resp.job_id]["state"] == "completed")
             )
         stored = rs._load_job(resp.job_id)
         self.assertEqual(stored["status"], "completed")
@@ -158,34 +158,58 @@ class TestPersistedIdempotency(JobLifecycleTestBase):
 
 class TestQueuedCancellation(JobLifecycleTestBase):
     def test_cancelled_queued_job_never_calls_render(self):
-        """RED (pre-fix): the worker never checks cancellation, so a job
-        cancelled while queued still enters the render function."""
+        """A queued job (worker waiting on the render lock) cancelled before
+        it acquires the lock must never call the render function.
+
+        Setup: hold the render lock (simulates another job rendering), submit,
+        cancel, then release the lock. The worker wakes, sees the cancelled
+        state, and must NOT call _render."""
         calls = []
 
-        def fake_render(request):
-            calls.append(True)
+        def fake_render(request, job_id):
+            calls.append((request, job_id))
             time.sleep(0.1)
-            return rs.RenderResponse(job_id="ignored", source_video="", rendered=[])
+            return rs.RenderResponse(job_id=job_id, source_video="", rendered=[])
 
-        with mock.patch.object(rs, "_render", side_effect=fake_render):
-            resp = rs.render_async(dict(V2_BODY))
-            job_id = resp.job_id
-            # Cancel immediately — the worker may still be waiting on the lock.
-            cancel_resp = rs.render_job_cancel(job_id)
-            self.assertEqual(cancel_resp["state"], "cancelled")
-            # Give any stray worker a chance to run.
-            time.sleep(0.5)
+        # Hold the lock so the worker stays queued.
+        rs._render_lock.acquire()
+        try:
+            with mock.patch.object(rs, "_render", side_effect=fake_render):
+                resp = rs.render_async(dict(V2_BODY))
+                job_id = resp.job_id
+                # Give the worker a moment to block on the lock (queued).
+                time.sleep(0.2)
+                with rs._async_jobs_lock:
+                    self.assertEqual(rs._async_jobs[job_id]["state"], "queued")
+                # Cancel while queued.
+                cancel_resp = rs.render_job_cancel(job_id)
+                self.assertEqual(cancel_resp["state"], "cancelled")
+        finally:
+            # Release the lock; the worker wakes and must NOT render.
+            if rs._render_lock.locked():
+                rs._render_lock.release()
+        time.sleep(0.5)
         self.assertEqual(calls, [], "cancelled queued job must never render")
 
     def test_cancelled_job_persisted_terminal(self):
-        """A cancellation must land in the persisted store."""
-        with mock.patch.object(
-            rs, "_render",
-            side_effect=lambda r: (time.sleep(0.05), rs.RenderResponse(job_id="x", source_video="", rendered=[]))[1],
-        ):
-            resp = rs.render_async(dict(V2_BODY))
-            rs.render_job_cancel(resp.job_id)
-        stored = rs._load_job(resp.job_id)
+        """A queued cancellation must land in the persisted store as a
+        terminal state and stay cancelled (worker must not overwrite it)."""
+        rs._render_lock.acquire()
+        try:
+            with mock.patch.object(
+                rs, "_render",
+                side_effect=lambda req, jid: (time.sleep(0.05), rs.RenderResponse(job_id=jid, source_video="", rendered=[]))[1],
+            ):
+                resp = rs.render_async(dict(V2_BODY))
+                job_id = resp.job_id
+                time.sleep(0.2)
+                cancel_resp = rs.render_job_cancel(job_id)
+                self.assertEqual(cancel_resp["state"], "cancelled")
+        finally:
+            if rs._render_lock.locked():
+                rs._render_lock.release()
+        time.sleep(0.5)
+        stored = rs._load_job(job_id)
         self.assertEqual(stored["status"], "cancelled")
 
 
