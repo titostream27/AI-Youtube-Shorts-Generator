@@ -34,10 +34,14 @@ class TestRenderTimeline(unittest.TestCase):
         t = RenderTimeline()
         t.face_tracks = [{"frame": 1, "faces": []}]
         t.split_ranges = [(1.0, 2.0)]
+        t.frames = [{"frame_no": 1, "t_sec": 0.033, "speaker_track_id": 1, "split_alpha": 0.0, "face_count": 2}]
         d = t.to_dict()
         self.assertEqual(d["face_tracks"], [{"frame": 1, "faces": []}])
         self.assertEqual(d["split_ranges"], [(1.0, 2.0)])
         self.assertIn("stats", d)
+        # F20: time-indexed frames survive the roundtrip.
+        self.assertEqual(d["frames"][0]["frame_no"], 1)
+        self.assertEqual(d["frames"][0]["t_sec"], 0.033)
 
     def test_crop_clip_local_returns_tuple_when_requested(self):
         """return_timeline=True returns (path, RenderTimeline)."""

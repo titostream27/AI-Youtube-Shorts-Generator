@@ -39,6 +39,11 @@ _RENDER_STATS: Dict[str, object] = {
     "frames": 0,
     "switch_history": [],  # list of (track_id, frame_no)
 }
+# Phase-2 correctness (F20): per-frame time-indexed timeline published during
+# the reframe loop. Each entry: {frame_no, t_sec, speaker_track_id, split_alpha,
+# face_count}. Downstream can reconstruct face/speaker/camera over time
+# instead of reading a single end-of-render snapshot.
+_FRAME_TIMELINE: List[Dict[str, object]] = []
 
 
 def get_render_stats() -> Dict[str, object]:
@@ -88,6 +93,7 @@ class RenderTimeline:
         self.speaker_track_id: Optional[int] = None
         self.split_alpha: float = 0.0
         self.split_ranges: List[Tuple[float, float]] = []
+        self.frames: List[Dict[str, object]] = []
         self.stats: Dict[str, object] = {
             "focus_switch_count": 0,
             "focus_ping_pong_detected": False,
@@ -110,6 +116,7 @@ class RenderTimeline:
         t.split_alpha = _LAST_SPLIT_ALPHA
         t.split_ranges = list(_SPLIT_RANGES)
         t.stats = dict(_RENDER_STATS)
+        t.frames = list(_FRAME_TIMELINE)
         return t
 
     def to_dict(self) -> Dict[str, object]:
@@ -118,6 +125,7 @@ class RenderTimeline:
             "speaker_track_id": self.speaker_track_id,
             "split_alpha": self.split_alpha,
             "split_ranges": self.split_ranges,
+            "frames": self.frames,
             "stats": self.stats,
         }
 
@@ -336,6 +344,9 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         "frames": 0,
         "switch_history": [],
     }
+    # Phase-2 (F20): reset the per-frame timeline for this reframe pass.
+    global _FRAME_TIMELINE
+    _FRAME_TIMELINE = []
     _LAST_SPLIT_ALPHA = 0.0
     _SPLIT_RANGES = []
     switch_history: List[Tuple[Optional[int], int]] = []
@@ -796,6 +807,17 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         frame_no += 1
         # Phase 4 (brief §23): per-frame QC stats.
         _RENDER_STATS["frames"] = int(_RENDER_STATS["frames"]) + 1
+        # Phase-2 (F20): append a time-indexed frame entry.
+        try:
+            _FRAME_TIMELINE.append({
+                "frame_no": frame_no,
+                "t_sec": round(frame_no / fps, 3),
+                "speaker_track_id": speaker_track_id,
+                "split_alpha": round(float(split_alpha), 3),
+                "face_count": len(new_tracks) if new_tracks is not None else 0,
+            })
+        except Exception:  # noqa: BLE001
+            pass
         if focus_track is not None and src_h > 0:
             # Face cutoff: fraction of the face box outside the vertical crop.
             cut = max(0.0, (0 - focus_track["cy"] - focus_track["h"] / 2) / max(1, focus_track["h"]))

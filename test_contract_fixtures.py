@@ -21,8 +21,11 @@ INVALID_DIR = CONTRACTS_DIR / "fixtures" / "invalid"
 
 class TestSharedFixturesPython(unittest.TestCase):
     def test_valid_fixtures_parse(self):
-        if not VALID_DIR.exists():
-            self.skipTest("contracts/fixtures/valid not present")
+        # Phase-2 correctness: missing shared fixtures must FAIL CI, not skip.
+        self.assertTrue(
+            VALID_DIR.exists(),
+            "contracts/fixtures/valid not present — run the miner build first",
+        )
         v2_files = [p for p in VALID_DIR.glob("*.json") if "v2" in p.name]
         self.assertGreater(len(v2_files), 0, "expected at least one valid v2 fixture")
         for path in v2_files:
@@ -33,7 +36,7 @@ class TestSharedFixturesPython(unittest.TestCase):
 
     def test_invalid_fixtures_rejected(self):
         if not INVALID_DIR.exists():
-            self.skipTest("contracts/fixtures/invalid not present")
+            self.fail("contracts/fixtures/invalid not present — run the miner build first")
         invalid_files = sorted(INVALID_DIR.glob("*.json"))
         self.assertGreater(len(invalid_files), 0, "expected at least one invalid fixture")
         for path in invalid_files:
