@@ -205,7 +205,7 @@ def _persist_job(job_id: str, status: str, *, mode: str = "final",
                 status=excluded.status, mode=excluded.mode,
                 response=excluded.response, error=excluded.error,
                 parent_job_id=excluded.parent_job_id, attempt=excluded.attempt,
-                request_id=excluded.request_id,
+                request_id=COALESCE(request_id, excluded.request_id),
                 started_at=COALESCE(started_at, excluded.started_at),
                 finished_at=COALESCE(excluded.finished_at, finished_at),
                 last_error_stage=CASE WHEN excluded.error IS NOT NULL AND excluded.error != ''

@@ -137,6 +137,25 @@ class TestPersistedIdempotency(JobLifecycleTestBase):
         found = rs._find_job_by_request("req-idem-1")
         self.assertEqual(found, "job-idem-1")
 
+    def test_request_id_survives_later_status_updates(self):
+        """Regression: a later _persist_job call WITHOUT the request payload
+        (e.g. worker setting 'failed') must not wipe the stored request_id."""
+        body = dict(V2_BODY)
+        body["request_id"] = "req-survive-1"
+        rs._persist_job(
+            "job-survive-1", "queued", mode="final", episode_id="ep-1",
+            request=json.dumps(body),
+        )
+        # Worker updates status without re-sending the request payload.
+        rs._persist_job("job-survive-1", "failed", mode="final", episode_id="ep-1",
+                        error="boom")
+        # The request_id column must still hold the value (direct read).
+        conn = rs._job_db()
+        stored = conn.execute(
+            "SELECT request_id FROM render_jobs WHERE job_id = 'job-survive-1'"
+        ).fetchone()
+        self.assertEqual(stored[0], "req-survive-1")
+
     def test_duplicate_request_id_does_not_create_two_active_jobs(self):
         """RED (pre-fix): after a simulated restart the persisted idempotency
         lookup fails, so a resubmitted request starts a second job."""
