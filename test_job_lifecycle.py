@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -280,6 +281,166 @@ class TestPersistenceErrorsSurfaced(JobLifecycleTestBase):
         self.assertIn("queue", payload)
         self.assertIn("ffmpeg", payload)
         self.assertIn("last_persist_error", payload)
+
+
+class TestBrief2RendererCorrectness(JobLifecycleTestBase):
+    """Correctness-brief-2 findings F1-F9 (RED pre-fix)."""
+
+    # ── F1: terminal status ownership ───────────────────────────────────────
+    def test_partial_failure_is_never_overwritten_by_completed(self):
+        """RED (pre-fix): _render persists partial_failure internally, then the
+        async wrapper persists completed again — wiping the partial status."""
+        from shorts_generator.local import clipper as clipper_mod
+
+        # Make every clip fail so _render computes partial_failure internally.
+        with mock.patch.object(rs, "download_youtube_local", return_value="fake_src.mp4"), \
+             mock.patch.object(clipper_mod, "crop_clip_local", side_effect=RuntimeError("encode boom")):
+            resp = rs.render_async(dict(V2_BODY))
+            job_id = resp.job_id
+            self.assertTrue(
+                wait_until(lambda: rs._async_jobs[job_id]["state"] in ("completed", "failed"))
+            )
+        stored = rs._load_job(job_id)
+        # All clips failed -> partial_failure (or at least NOT completed).
+        self.assertNotEqual(stored["status"], "completed")
+
+    # ── F2: sync V2 parsing ─────────────────────────────────────────────────
+    def test_sync_v2_preview_remains_v2(self):
+        """RED (pre-fix): /api/render uses Union[RenderRequest, RenderRequestV2]
+        so FastAPI parses V2 as V1 and drops mode=preview."""
+        from fastapi.testclient import TestClient
+
+        seen = {}
+
+        def fake_render(request, job_id):
+            seen["mode"] = getattr(request, "mode", None)
+            return rs.RenderResponse(job_id=job_id, source_video="", rendered=[])
+
+        body = dict(V2_BODY)
+        body["mode"] = "preview"
+        with mock.patch.object(rs, "_render", side_effect=fake_render):
+            client = TestClient(rs.app)
+            resp = client.post("/api/render", json=body)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(seen.get("mode"), "preview", "V2 preview mode must survive sync parsing")
+
+    # ── F3: unsupported contract_version ────────────────────────────────────
+    def test_contract_version_2_1_is_rejected(self):
+        """RED (pre-fix): a present but unsupported contract_version falls
+        through to the V1 parser instead of failing explicitly."""
+        from fastapi.testclient import TestClient
+
+        body = dict(V2_BODY)
+        body["contract_version"] = "2.1"
+        with mock.patch.object(rs, "_render", return_value=rs.RenderResponse(job_id="x", source_video="", rendered=[])):
+            client = TestClient(rs.app)
+            resp = client.post("/api/render/async", json=body)
+        # Unsupported version must be rejected (400/422), never silently parsed.
+        self.assertGreaterEqual(resp.status_code, 400)
+
+    # ── F4: memory state mirrors DB transitions ─────────────────────────────
+    def test_active_render_is_never_reported_queued(self):
+        """RED (pre-fix): _async_jobs stays 'queued' while _render performs
+        downloading/analysing/rendering transitions in SQLite."""
+        entered = threading.Event()
+
+        def fake_render(request, job_id):
+            entered.set()
+            time.sleep(0.4)
+            return rs.RenderResponse(job_id=job_id, source_video="", rendered=[])
+
+        with mock.patch.object(rs, "_render", side_effect=fake_render):
+            resp = rs.render_async(dict(V2_BODY))
+            job_id = resp.job_id
+            self.assertTrue(entered.wait(2.0), "worker should have entered _render")
+            with rs._async_jobs_lock:
+                state = rs._async_jobs[job_id]["state"]
+            # Once _render is running the job is downloading/rendering, never queued.
+            self.assertNotEqual(state, "queued")
+
+    # ── F5: active cancellation returns 409 ─────────────────────────────────
+    def test_active_cancellation_returns_409(self):
+        """RED (pre-fix): because memory stays 'queued', cancel marks an active
+        render cancelled instead of returning 409."""
+        entered = threading.Event()
+
+        def fake_render(request, job_id):
+            entered.set()
+            time.sleep(0.5)
+            return rs.RenderResponse(job_id=job_id, source_video="", rendered=[])
+
+        with mock.patch.object(rs, "_render", side_effect=fake_render):
+            resp = rs.render_async(dict(V2_BODY))
+            job_id = resp.job_id
+            self.assertTrue(entered.wait(2.0))
+            cancel = rs.render_job_cancel(job_id)
+            # Wait for the worker to finish so it never leaks the lock.
+            wait_until(lambda: rs._async_jobs[job_id]["state"] in ("completed", "failed"), timeout=5)
+        # Active render cannot be cancelled in this phase -> 409 conflict.
+        self.assertEqual(cancel.status_code, 409)
+
+    # ── F6: idempotency uses canonical failed ───────────────────────────────
+    def test_failed_request_can_be_resubmitted(self):
+        """RED (pre-fix): memory idempotency checks state != 'error' although
+        canonical failure is 'failed', so a failed request is wrongly returned
+        as an idempotent hit."""
+        def fake_render(request, job_id):
+            raise RuntimeError("boom")
+
+        with mock.patch.object(rs, "_render", side_effect=fake_render):
+            first = rs.render_async(dict(V2_BODY))
+            self.assertTrue(
+                wait_until(lambda: rs._async_jobs[first.job_id]["state"] == "failed")
+            )
+            # Resubmit the SAME request_id after failure -> must create a NEW job.
+            second = rs.render_async(dict(V2_BODY))
+        self.assertNotEqual(first.job_id, second.job_id)
+
+    # ── F7: atomic idempotency / uniqueness ─────────────────────────────────
+    def test_concurrent_duplicate_submissions_produce_one_active_job(self):
+        """RED (pre-fix): idempotency is not atomic, so two concurrent
+        submissions of the same request_id create two active jobs."""
+        entered = threading.Event()
+        barrier = threading.Barrier(2)
+
+        def fake_render(request, job_id):
+            entered.set()
+            time.sleep(0.5)
+            return rs.RenderResponse(job_id=job_id, source_video="", rendered=[])
+
+        results = []
+
+        def submit():
+            barrier.wait()
+            with mock.patch.object(rs, "_render", side_effect=fake_render):
+                results.append(rs.render_async(dict(V2_BODY)))
+
+        with mock.patch.object(rs, "_render", side_effect=fake_render):
+            t1 = threading.Thread(target=submit)
+            t2 = threading.Thread(target=submit)
+            t1.start(); t2.start()
+            t1.join(5); t2.join(5)
+            self.assertTrue(entered.wait(2.0))
+            # Wait for both workers to finish so they never leak the lock
+            # into the next test.
+            job_ids = [r.job_id for r in results]
+            for jid in job_ids:
+                wait_until(lambda: rs._async_jobs[jid]["state"] in ("completed", "failed"), timeout=5)
+        self.assertEqual(len(results), 2)
+        # Both submissions carry the same request_id -> must be ONE job.
+        self.assertEqual(results[0].job_id, results[1].job_id)
+
+    # ── F9: read failures distinguishable from not-found ────────────────────
+    def test_sqlite_read_failure_distinguishable_from_not_found(self):
+        """RED (pre-fix): _load_job swallows DB errors and returns None —
+        identical to a genuine 'job not found'."""
+        rs._last_persist_error = None
+        rs._last_persist_error_at = None
+        with mock.patch.object(rs, "_job_db", side_effect=RuntimeError("db corrupt")):
+            stored = rs._load_job("job-any")
+        self.assertIsNone(stored)
+        # The read failure must be recorded in health diagnostics, not silent.
+        self.assertIsNotNone(rs._last_persist_error, "read failure must be recorded")
 
 
 if __name__ == "__main__":
