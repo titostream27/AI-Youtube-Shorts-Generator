@@ -262,6 +262,77 @@ Edit `shorts_generator/config.py` (or set env vars):
 ### Whisper transcription
 Audio is transcribed by MuAPI's `/openai-whisper` endpoint (server-side `whisper-1`). Pass `--language <code>` to lock the recognition to a specific language; otherwise it auto-detects.
 
+## Two-repository architecture (Phase 1)
+
+This repository is the **media execution worker**: it renders **approved
+boundaries** and decides **how to present them** (camera, layout, captions,
+audio, thumbnails, encoding, QC). The intelligence/control plane is
+[`youtube-content-miner`](https://github.com/titostream27/youtube-content-miner),
+which decides **what to clip and why** (discovery, transcript, candidates,
+boundaries, scoring, review, RenderRequest creation).
+
+The renderer must **not** independently discover highlights, change clip
+boundaries, or re-rank candidates in the integrated production path. The
+standalone highlight pipeline (`main.py` / MuAPI clipper) is **legacy mode**
+and remains only until the integrated path is proven — it must not silently
+become the production source of truth.
+
+### Shared contract
+
+The canonical contract is owned by `youtube-content-miner` in its
+[`contracts/`](https://github.com/titostream27/youtube-content-miner/tree/main/contracts)
+directory:
+
+- `render-request-v2.schema.json`, `render-result-v2.schema.json` — neutral
+  JSON Schema source of truth.
+- `fixtures/valid/`, `fixtures/invalid/` — shared fixtures both sides must
+  pass/reject identically.
+
+This repo implements the Python side (`render_contract.py`: `RenderRequestV2`,
+pydantic + `model_validator`). Contract tests load the shared fixtures from
+`../content-miner/contracts/fixtures` (`test_contract_fixtures.py`).
+`contract_version` must be exactly `"2.0"`; unsupported versions fail
+explicitly.
+
+### Job states
+
+One canonical vocabulary everywhere (memory, SQLite, API, logs):
+
+```
+queued ─► downloading ─► analysing ─► rendering ─► quality_check ─► completed
+```
+Terminal: `failed | partial_failure | cancelled | orphaned`. A job waiting
+for the render lock is `queued`. `_render(request, job_id)` receives its
+`job_id` from the job service and never generates a replacement — the same id
+appears in the API response, SQLite row, output directory, and artifact URLs.
+
+### Persistence, retry, cancellation
+
+- SQLite `render_jobs`: WAL mode + busy timeout; additive idempotent
+  migration (`request_id`, `parent_job_id`, `attempt`, `started_at`,
+  `finished_at`, `last_error_stage` + indexes). Existing records preserved.
+- Idempotency: a resubmitted `request_id` returns the existing job — survives
+  renderer restart.
+- Retry (`POST /api/render/jobs/{job_id}/retry`): one new `job_id`, records
+  `parent_job_id`, increments `attempt`.
+- Cancellation (`POST /api/render/jobs/{job_id}/cancel`): **queued** jobs are
+  cancelled and never enter rendering. Active (mid-FFmpeg) cancellation is
+  NOT supported in Phase 1 — cancelling a `rendering` job returns HTTP 409.
+
+### Health
+
+`GET /api/render/health` reports operational readiness without downloading a
+video or loading models: service status + build id (`RENDER_BUILD_ID`),
+SQLite read/write probe, queue depth + active job id, ffmpeg/ffprobe
+availability, output dir writability + free disk, contract version, last
+sanitized persistence error, and `rendering_available_when_persistence_degraded`.
+
+### Contract & lifecycle tests
+
+```bash
+.venv/Scripts/python.exe -m pytest test_render_contract.py test_contract_fixtures.py test_job_lifecycle.py -q
+```
+
 ## Project Structure
 
 ```
