@@ -233,21 +233,34 @@ class TestRetryHistory(JobLifecycleTestBase):
 
 class TestPersistenceErrorsSurfaced(JobLifecycleTestBase):
     def test_sqlite_write_error_is_not_silently_swallowed(self):
-        """RED (pre-fix): _persist_job swallows every exception; a broken DB
-        is invisible to ops. After the fix it must surface the error (raise
-        or record it in health diagnostics), never `pass`."""
+        """A broken DB must be visible: _persist_job records the error in
+        health state (_last_persist_error) instead of passing silently."""
+        rs._last_persist_error = None
+        rs._last_persist_error_at = None
         with mock.patch.object(rs, "_job_db", side_effect=RuntimeError("disk full")):
-            # We only assert this does NOT pass silently: the call must raise
-            # or set a visible health error. Pre-fix it silently returns None.
-            try:
-                rs._persist_job("job-x", "queued")
-            except RuntimeError:
-                return  # OK: error surfaced by raising.
-            # If it did not raise, there must be a recorded health error.
-            self.fail(
-                "_persist_job swallowed a persistence error (no raise, no log, "
-                "no health state) — persistence failures are invisible"
-            )
+            rs._persist_job("job-x", "queued")
+        self.assertIsNotNone(rs._last_persist_error, "persistence error must be recorded")
+        self.assertIn("disk full", rs._last_persist_error)
+        self.assertIsNotNone(rs._last_persist_error_at)
+
+    def test_health_reports_degraded_persistence(self):
+        """When the DB write probe fails, /api/render/health must say
+        degraded and expose the error (Phase 1 §5.6)."""
+        with mock.patch.object(rs, "_job_db", side_effect=RuntimeError("disk full")):
+            payload = rs.render_health()
+        self.assertEqual(payload["status"], "degraded")
+        self.assertFalse(payload["db"]["ok"])
+        self.assertIn("disk full", payload["db"]["error"])
+
+    def test_health_reports_ok_when_db_and_output_ok(self):
+        """Happy path: health is ok with db/queue/ffmpeg/output fields."""
+        payload = rs.render_health()
+        self.assertEqual(payload["status"], "ok")
+        self.assertTrue(payload["db"]["ok"])
+        self.assertEqual(payload["contract_version"], "2.0")
+        self.assertIn("queue", payload)
+        self.assertIn("ffmpeg", payload)
+        self.assertIn("last_persist_error", payload)
 
 
 if __name__ == "__main__":

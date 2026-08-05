@@ -93,6 +93,11 @@ def _estimate_upscale(source_path: str, out_w: int, out_h: int) -> float:
 JOB_DB_PATH = Path(os.getenv("RENDER_JOB_DB", str(RENDER_ROOT / "render_jobs.db"))).resolve()
 _job_db_conn = None
 
+# Last sanitized persistence error (Phase 1 §5.6). Exposed via health so a
+# degraded DB is visible to ops instead of failing silently.
+_last_persist_error = None
+_last_persist_error_at = None
+
 # ── Canonical job state machine (Phase 1 §5.2) ─────────────────────────────
 # One vocabulary in memory, SQLite, API responses, logs, and docs.
 # Active: queued -> downloading -> analysing -> rendering -> quality_check -> completed
@@ -215,8 +220,11 @@ def _persist_job(job_id: str, status: str, *, mode: str = "final",
         conn.commit()
     except Exception as e:  # noqa: BLE001
         # Phase 1 §5.6: persistence failure must not break rendering, but it
-        # must be visible through health diagnostics. Full logging wiring is
-        # part of the health commit; at minimum surface it on stderr now.
+        # must be visible through health diagnostics.
+        global _last_persist_error, _last_persist_error_at
+        import datetime
+        _last_persist_error = f"{type(e).__name__}: {e}"
+        _last_persist_error_at = datetime.datetime.utcnow().isoformat()
         try:
             print(f"[persist] ERROR saving job {job_id} status={status}: {e}", flush=True)
         except Exception:
@@ -2038,6 +2046,71 @@ _async_jobs_lock = threading.Lock()
 def render_status():
     """Report whether a render job is currently running (queue status)."""
     return {"busy": _render_busy}
+
+
+@app.get("/api/render/health")
+def render_health():
+    """Operational readiness without downloading a video or loading models
+    (Phase 1 §5.6)."""
+    import shutil
+    import sqlite3
+    # 1. SQLite read/write status (short transaction, no data mutation).
+    db_ok = False
+    db_error = None
+    try:
+        conn = _job_db()
+        conn.execute("SELECT COUNT(*) FROM render_jobs").fetchone()
+        # Write probe: insert into a temp table in a transaction we roll back.
+        conn.execute("CREATE TEMP TABLE IF NOT EXISTS _health_probe (v INTEGER)")
+        conn.execute("INSERT INTO _health_probe (v) VALUES (1)")
+        conn.execute("DELETE FROM _health_probe")
+        conn.commit()
+        db_ok = True
+    except Exception as e:  # noqa: BLE001
+        db_error = f"{type(e).__name__}: {e}"
+    # 2. Queue depth + active job.
+    with _async_jobs_lock:
+        active_jobs = [jid for jid, j in _async_jobs.items() if is_active(j.get("state", ""))]
+        active_job_id = active_jobs[0] if active_jobs else None
+        queue_depth = len(active_jobs)
+    # 3. FFmpeg / FFprobe availability.
+    ffmpeg = shutil.which("ffmpeg") is not None
+    ffprobe = shutil.which("ffprobe") is not None
+    # 4. Output dir writability + free disk.
+    out_ok = False
+    out_error = None
+    free_bytes = None
+    try:
+        RENDER_ROOT.mkdir(parents=True, exist_ok=True)
+        probe = RENDER_ROOT / f".health_{os.getpid()}"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        out_ok = True
+        import ctypes
+        free_bytes = ctypes.c_ulonglong(0)
+        ok = ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+            str(RENDER_ROOT.resolve()),
+            None, None, ctypes.byref(free_bytes),
+        )
+        free_bytes = int(free_bytes.value) if ok else None
+    except Exception as e:  # noqa: BLE001
+        out_error = f"{type(e).__name__}: {e}"
+    # 5. Contract version + build id.
+    from render_contract import CONTRACT_VERSION
+    build = os.getenv("RENDER_BUILD_ID", "0.1.0")
+    return {
+        "status": "ok" if (db_ok and out_ok) else "degraded",
+        "service": "shorts-render-service",
+        "build": build,
+        "db": {"ok": db_ok, "error": db_error},
+        "queue": {"depth": queue_depth, "active_job_id": active_job_id},
+        "ffmpeg": {"available": ffmpeg, "ffprobe": ffprobe},
+        "output": {"writable": out_ok, "error": out_error, "free_bytes": free_bytes},
+        "contract_version": CONTRACT_VERSION,
+        "last_persist_error": _last_persist_error,
+        "last_persist_error_at": _last_persist_error_at,
+        "rendering_available_when_persistence_degraded": not db_ok,
+    }
 
 
 @app.get("/api/render/status/{job_id}")
