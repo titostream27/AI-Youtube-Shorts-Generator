@@ -120,7 +120,7 @@ def transcribe_local(media_path: str, language: Optional[str] = None) -> Dict:
         from faster_whisper import WhisperModel  # type: ignore
     except ImportError as e:
         raise RuntimeError(
-            "faster-whisper is required for --mode local. Install it with:\n"
+            "faster-whisper is required for the render service. Install it with:\n"
             "    pip install -r requirements-local.txt"
         ) from e
 

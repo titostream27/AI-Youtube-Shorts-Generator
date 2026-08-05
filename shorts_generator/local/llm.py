@@ -12,12 +12,12 @@ from ..config import (
 
 
 def call_openai_llm(prompt: str) -> str:
-    """OpenAI Chat Completions backend used by --mode local."""
+    """OpenAI Chat Completions backend used by the render service."""
     try:
         from openai import OpenAI  # type: ignore
     except ImportError as e:
         raise RuntimeError(
-            "openai is required for --mode local. Install it with:\n"
+            "openai is required for the render service. Install it with:\n"
             "    pip install -r requirements-local.txt"
         ) from e
 
@@ -31,7 +31,7 @@ def call_openai_llm(prompt: str) -> str:
 
 
 def call_gemini_llm(prompt: str) -> str:
-    """Gemini backend used by --mode local when LLM_PROVIDER=gemini."""
+    """Gemini backend used by the render service when LLM_PROVIDER=gemini."""
     try:
         from google import genai  # type: ignore
     except ImportError as e:
@@ -54,7 +54,7 @@ def call_gemini_llm(prompt: str) -> str:
 
 
 def call_deepseek_llm(prompt: str) -> str:
-    """DeepSeek Chat Completions backend (OpenAI-compatible API) used by --mode local.
+    """DeepSeek Chat Completions backend (OpenAI-compatible API) used by the render service.
 
     DeepSeek exposes an OpenAI-compatible endpoint, so we reuse the `openai`
     SDK but point it at the DeepSeek base URL.
@@ -63,7 +63,7 @@ def call_deepseek_llm(prompt: str) -> str:
         from openai import OpenAI  # type: ignore
     except ImportError as e:
         raise RuntimeError(
-            "openai is required for --mode local with LLM_PROVIDER=deepseek. "
+            "openai is required for the render service with LLM_PROVIDER=deepseek. "
             "Install it with:\n    pip install -r requirements-local.txt"
         ) from e
 

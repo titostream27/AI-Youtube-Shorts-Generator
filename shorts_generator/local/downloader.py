@@ -24,7 +24,7 @@ def _import_ytdlp():
         import yt_dlp  # type: ignore
     except ImportError as e:
         raise RuntimeError(
-            "yt-dlp is required for --mode local. Install it with:\n"
+            "yt-dlp is required for the render service. Install it with:\n"
             "    pip install -r requirements-local.txt"
         ) from e
     return yt_dlp

@@ -173,8 +173,8 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         import cv2  # type: ignore
     except ImportError as e:
         raise RuntimeError(
-            "opencv-python is required for --mode local. Install it with:\n"
-            "    pip install -r requirements-local.txt"
+            "opencv-python is required for the render service. Install it with:\n"
+            "    pip install opencv-python opencv-contrib-python"
         ) from e
 
     target_ratio = _ratio(aspect_ratio)
