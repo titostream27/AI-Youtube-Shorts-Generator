@@ -17,6 +17,11 @@ from typing import Dict, List, Optional, Tuple
 # (caption compositor) can avoid covering the speaker's mouth.
 _LAST_FACE_TRACKS: List[Dict] = []
 _LAST_SPEAKER_TRACK_ID: Optional[int] = None
+# Latest split-screen blend weight (0..1) from the last reframe pass. Exposed
+# so the caption compositor (render_service) can move captions to the center
+# of the frame while the reaction split is active, instead of covering the
+# reactor's face in the bottom pane.
+_LAST_SPLIT_ALPHA: float = 0.0
 
 # Phase 4 (Master Task Brief §23): structured QC tracking stats collected
 # during reframing, exposed via get_render_stats() for the renderer's QC.
@@ -37,6 +42,16 @@ def get_render_stats() -> Dict[str, object]:
 
 def get_last_face_tracks() -> Tuple[List[Dict], Optional[int]]:
     return _LAST_FACE_TRACKS, _LAST_SPEAKER_TRACK_ID
+
+
+def get_last_split_alpha() -> float:
+    """Return the split-screen blend weight (0..1) of the last reframe pass.
+
+    0.0 = single view; >0 = reaction split fading/active. Used by the caption
+    compositor to move captions to the center of the frame during split so
+    the reactor's face in the bottom pane is not covered.
+    """
+    return _LAST_SPLIT_ALPHA
 
 import numpy as np
 
@@ -243,6 +258,7 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
     blur_split_pw: Optional[float] = None
     # Phase 4 (brief §23): per-reframe QC stats.
     global _RENDER_STATS
+    global _LAST_SPLIT_ALPHA
     _RENDER_STATS = {
         "focus_switch_count": 0,
         "focus_ping_pong_detected": False,
@@ -525,6 +541,7 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
 
             # Publish per-frame tracking snapshot for caption face avoidance.
             global _LAST_FACE_TRACKS, _LAST_SPEAKER_TRACK_ID
+            global _LAST_SPLIT_ALPHA
             _LAST_FACE_TRACKS = new_tracks
             _LAST_SPEAKER_TRACK_ID = speaker_track_id
 
@@ -585,6 +602,8 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
     # after the track disappears past its TTL.
     split_top_track_id: Optional[int] = None
     split_bottom_track_id: Optional[int] = None
+    split_top_last: Optional[Tuple[float, float]] = None  # last known speaker pos (hold on lock loss)
+    split_bot_last: Optional[Tuple[float, float]] = None  # last known reactor pos (hold on lock loss)
     split_lock_frames = 0       # frames the locks have been held
     split_alpha = 0.0           # 0..1 blend weight toward split layout
     split_hold = 0              # frames held in active state
@@ -1018,6 +1037,11 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                 split_bottom_track_id = None
                 split_lock_frames = 0
 
+        # Publish the current split blend weight so the caption compositor
+        # (render_service) can shift captions to the center of the frame while
+        # the reaction split is active, keeping the bottom pane's face clear.
+        _LAST_SPLIT_ALPHA = split_alpha if (split_enabled and split_alpha > 0.0) else 0.0
+
         # ------------------------------------------------------------------
         # Render the frame: single view (default) or split layout.
         # ------------------------------------------------------------------
@@ -1044,56 +1068,51 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
             single_crop = frame[y0_single:y0_single + crop_h, x0_single:x0_single + crop_w]
 
         if split_enabled and split_alpha > 0.0:
-            # Build both regions from the source frame.
             top_h = int(crop_h * SPLIT_TOP_RATIO)
             bot_h = crop_h - top_h
+
             # ── Phase 2: locked panes (brief §31) ──
-            # While split is active, the top pane follows the locked speaker
-            # track and the bottom pane the locked reactor track — even if the
-            # active speaker changes mid-split, the panes do NOT swap.
             top_cx, top_cy = cx, cy
             bot_cx, bot_cy = cx, cy + 80
-
             top_track = None
             if split_top_track_id is not None:
-                top_track = next(
-                    (t for t in face_tracks if t["track_id"] == split_top_track_id), None
-                )
+                top_track = next((t for t in face_tracks if t["track_id"] == split_top_track_id), None)
             if top_track is not None:
                 top_cx, top_cy = top_track["cx"], top_track["cy"]
-            elif split_reactor_id is not None:
-                # Speaker lock lost — fall back to the current speaker.
-                sp = next((t for t in face_tracks if t["track_id"] == speaker_track_id), None)
-                if sp is not None:
-                    top_cx, top_cy = sp["cx"], sp["cy"]
+                split_top_last = (top_cx, top_cy)
+            elif split_top_last is not None:
+                # Speaker lock lost — HOLD the last speaker position so the top
+                # pane never jumps to a different person mid-split (kills swap).
+                top_cx, top_cy = split_top_last
 
             bot_track = None
             if split_bottom_track_id is not None:
-                bot_track = next(
-                    (t for t in face_tracks if t["track_id"] == split_bottom_track_id), None
-                )
+                bot_track = next((t for t in face_tracks if t["track_id"] == split_bottom_track_id), None)
             if bot_track is not None:
                 bot_cx, bot_cy = bot_track["cx"], bot_track["cy"]
-            elif cur_faces and len(cur_faces) > 1:
-                # Reactor lock lost — fall back to the second-largest face.
-                second = sorted(cur_faces, key=lambda f: -f["w"] * f["h"])[1]
-                bot_cx, bot_cy = second["cx"], second["cy"]
+                split_bot_last = (bot_cx, bot_cy)
+            elif split_bot_last is not None:
+                # Reactor lock lost — HOLD the last reactor position so we never
+                # switch to a random face (could be the speaker -> pane swap).
+                bot_cx, bot_cy = split_bot_last
 
-            # Speaker crop (top region). Zoom OUT (<1.0) so the subject is not
-            # clipped at the seam/edges — a too-tight crop cuts head/shoulders.
-            top_region = _crop_region(frame, top_cx, top_cy, crop_w, top_h, zoom=0.75)
-            # Reactor crop (bottom region).
+            # Top pane: speaker, zoom OUT so the head stays fully inside the pane
+            # above the seam (a tight 9:16 crop cuts the chin/neck at the divider).
+            top_region = _crop_region(frame, top_cx, top_cy, crop_w, top_h, zoom=0.85)
             bot_region = _crop_region(frame, bot_cx, bot_cy, crop_w, bot_h, zoom=0.9)
-
             split_frame = np.vstack([top_region, bot_region])
-            # Thin divider line at the seam (dark, subtle).
             cv2.line(split_frame, (0, top_h - 1), (crop_w, top_h - 1), (20, 20, 20), 3)
 
-            # Fade between single view and split layout (alpha 0→1).
-            cropped = cv2.addWeighted(single_crop, 1.0 - split_alpha, split_frame, split_alpha, 0)
+            # Transition: vertical wipe of split_frame up from the bottom by
+            # split_alpha. Unlike a crossfade it never blends two differently
+            # framed crops, so the speaker does not ghost/stretch mid-transition;
+            # and the top pane is already zoomed out, so no head-cut at the seam.
+            reveal = int(crop_h * split_alpha)
+            cropped = single_crop.copy()
+            if reveal > 0:
+                cropped[crop_h - reveal:crop_h, :] = split_frame[crop_h - reveal:crop_h, :]
         else:
             cropped = single_crop
-
         # ── Phase 4 (brief §43): blur_background layout ──
         # For wide/soft sources, a fullscreen crop is a heavy upscale. Instead:
         # blurred full-frame background (fills 1080x1920) + sharp centered

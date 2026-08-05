@@ -851,11 +851,18 @@ def _burn_karaoke_captions(
     # frame's tracks via get_last_face_tracks() so the caption composer can
     # avoid covering the speaker's mouth.
     try:
-        from shorts_generator.local.clipper import get_last_face_tracks
+        from shorts_generator.local.clipper import get_last_face_tracks, get_last_split_alpha
         face_tracks_ref, speaker_track_id_ref = get_last_face_tracks()
+        split_alpha_ref = get_last_split_alpha()
     except Exception:  # noqa: BLE001
         face_tracks_ref = []
         speaker_track_id_ref = None
+        split_alpha_ref = 0.0
+    # True when the shot uses the reaction split layout. When split is active
+    # the speaker is in the TOP pane and the reactor in the BOTTOM pane, so a
+    # bottom-anchored caption would cover the reactor's face. We shift the
+    # caption block to the middle of the seam instead.
+    split_active = split_alpha_ref > 0.5
 
     # Pre-render sprites per word (active + idle) and lay words into wrapped
     # visual lines (max ~92% of frame width). Each visual line keeps the word
@@ -986,9 +993,14 @@ def _burn_karaoke_captions(
         # clear the source video's own lower-third text/watermarks).
         total_h = sum(l["items"][0]["sprite"].height for l in active_lines) + line_gap * (len(active_lines) - 1)
         y = height - total_h - int(height * CAPTION_BOTTOM_MARGIN)
+        # In split layout the reactor's face is in the BOTTOM pane, so a
+        # bottom-anchored caption would cover it. Move the caption block to the
+        # vertical CENTER of the frame (straddling the pane seam) instead.
+        if split_active:
+            y = max(int(height * 0.12), int((height - total_h) // 2))
         # If the speaker's face/mouth sits in the lower area where the caption
         # block would go, move the block ABOVE the face instead.
-        if mouth_zone is not None and y < mouth_zone[3] and mouth_zone[3] > height * 0.35:
+        elif mouth_zone is not None and y < mouth_zone[3] and mouth_zone[3] > height * 0.35:
             y = max(int(height * 0.12), mouth_zone[1] - total_h - line_gap)
             _CAPTION_COLLISION_HITS += 1
         # Overflow: caption block taller than 40% of the frame (bad wrapping).
