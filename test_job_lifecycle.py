@@ -352,6 +352,8 @@ class TestBrief2RendererCorrectness(JobLifecycleTestBase):
         entered = threading.Event()
 
         def fake_render(request, job_id):
+            # Mirror what the real _render does via transition_job (F4).
+            rs.transition_job(job_id, "rendering", mode="final", episode_id="ep-1")
             entered.set()
             time.sleep(0.4)
             return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
@@ -364,6 +366,7 @@ class TestBrief2RendererCorrectness(JobLifecycleTestBase):
                 state = rs._async_jobs[job_id]["state"]
             # Once _render is running the job is downloading/rendering, never queued.
             self.assertNotEqual(state, "queued")
+            wait_until(lambda: rs._async_jobs[job_id]["state"] in ("completed", "failed"), timeout=5)
 
     # ── F5: active cancellation returns 409 ─────────────────────────────────
     def test_active_cancellation_returns_409(self):
@@ -372,6 +375,7 @@ class TestBrief2RendererCorrectness(JobLifecycleTestBase):
         entered = threading.Event()
 
         def fake_render(request, job_id):
+            rs.transition_job(job_id, "rendering", mode="final", episode_id="ep-1")
             entered.set()
             time.sleep(0.5)
             return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
