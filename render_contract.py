@@ -30,6 +30,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 CONTRACT_VERSION = "2.0"
 
 VALID_MODES = ("preview", "final")
+
+
+def _is_finite(v: float) -> bool:
+    """Brief v5 C-01: reject NaN / +/-Infinity (parity with Zod Number.isFinite)."""
+    import math
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 VALID_LAYOUTS = ("auto", "face_crop", "dual_face", "blur_background",
                  "stacked_source", "screen_plus_face")
 VALID_EVENT_TYPES = ("emphasis", "punchline", "important_number", "topic_label")
@@ -39,6 +45,7 @@ CONTRACT_VERSION = "2.0"
 
 class CaptionWord(BaseModel):
     """A single word with precise timing (faster-whisper word timestamps)."""
+    model_config = ConfigDict(extra="forbid")
     start_sec: float
     end_sec: float
     text: str
@@ -65,17 +72,21 @@ class CaptionRequest(BaseModel):
 # ── v2 contract models ─────────────────────────────────────────────────────
 
 class SourcePreferences(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     max_height: int = 2160
     prefer_best_available: bool = True
 
 
 class RenderOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     width: int = 1080
     height: int = 1920
     fps: Optional[int] = None
 
 
 class Narrative(BaseModel):
+    # Brief v5 C-01: nested models forbid extras (parity with Zod strict).
+    model_config = ConfigDict(extra="forbid")
     main_topic: str = ""
     ending_type: str = ""
     hook_end_sec: Optional[float] = None
@@ -83,6 +94,7 @@ class Narrative(BaseModel):
 
 
 class LayoutPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     preferred_layout: str = "auto"  # auto|face_crop|dual_face|blur_background|stacked_source|screen_plus_face
     expected_speakers: Optional[int] = None
     allow_split: bool = True
@@ -90,6 +102,7 @@ class LayoutPlan(BaseModel):
 
 
 class CaptionCue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     start_sec: float
     end_sec: float
     text: str
@@ -112,6 +125,7 @@ class CaptionCue(BaseModel):
 
 
 class CaptionPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     language: str = "en"
     provider: str = "unknown"
     transcript_version: str = ""
@@ -121,12 +135,14 @@ class CaptionPlan(BaseModel):
 
 
 class EditingEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     time_sec: float
     type: str = "emphasis"  # emphasis|punchline|important_number|topic_label
     intensity: float = Field(default=0.5, ge=0, le=1)
 
 
 class V2Clip(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     clip_id: Union[str, int]
     start_sec: float
     end_sec: float
@@ -174,16 +190,26 @@ class RenderRequestV2(BaseModel):
             raise ValueError("output width and height must be positive")
         seen_ids = set()
         for clip in self.clips:
+            # Brief v5 C-01: normalize clip_id to a non-empty string before
+            # duplicate detection — numeric 1 and string "1" are the same id.
+            norm_id = str(clip.clip_id).strip()
+            if not norm_id:
+                raise ValueError(f"clip_id must normalize to a non-empty string, got {clip.clip_id!r}")
+            # Brief v5 C-01: reject NaN/Infinity in numeric fields.
+            for field_name in ("start_sec", "end_sec", "hook_end_sec", "payoff_start_sec"):
+                val = getattr(clip, field_name, None)
+                if val is not None and not _is_finite(val):
+                    raise ValueError(f"clip {norm_id}: {field_name} must be finite")
+            if norm_id in seen_ids:
+                raise ValueError(f"duplicate clip_id after normalization: {norm_id!r}")
+            seen_ids.add(norm_id)
             if clip.start_sec < 0:
-                raise ValueError(f"clip {clip.clip_id}: start_sec must be >= 0")
+                raise ValueError(f"clip {norm_id}: start_sec must be >= 0")
             if clip.end_sec <= clip.start_sec:
                 raise ValueError(
-                    f"clip {clip.clip_id}: end_sec ({clip.end_sec}) must be > "
+                    f"clip {norm_id}: end_sec ({clip.end_sec}) must be > "
                     f"start_sec ({clip.start_sec})"
                 )
-            if clip.clip_id in seen_ids:
-                raise ValueError(f"duplicate clip_id {clip.clip_id!r}")
-            seen_ids.add(clip.clip_id)
             if clip.layout_plan.preferred_layout not in VALID_LAYOUTS:
                 raise ValueError(
                     f"clip {clip.clip_id}: invalid preferred_layout "
@@ -276,6 +302,41 @@ class RenderJobStatus(BaseModel):
     source: SourceInfo = Field(default_factory=SourceInfo)
     artifacts: List[RenderArtifact] = Field(default_factory=list)
     error: Optional[str] = None
+
+
+class RenderArtifactResult(BaseModel):
+    """Brief v5 6.3 — strict artifact invariant:
+
+    - status=ok        -> video_url required, error absent
+    - status=error     -> error required, publishable=false
+    - qc_status!=passed in final mode -> publishable=false
+    """
+    model_config = ConfigDict(extra="forbid")
+    clip_id: str
+    status: str  # ok | error
+    video_url: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    publishable: bool
+    qc_status: str = "unavailable"  # passed | failed | unavailable
+    error: Optional[Dict] = None
+
+    @model_validator(mode="after")
+    def _validate_artifact_invariants(self) -> "RenderArtifactResult":
+        if self.status == "ok":
+            if not self.video_url:
+                raise ValueError("status=ok requires video_url")
+            if self.error is not None:
+                raise ValueError("status=ok must not carry error")
+        elif self.status == "error":
+            if self.error is None:
+                raise ValueError("status=error requires error detail")
+            if self.publishable:
+                raise ValueError("status=error must set publishable=false")
+        else:
+            raise ValueError(f"status must be 'ok' or 'error', got {self.status!r}")
+        if self.qc_status not in ("passed", "failed", "unavailable"):
+            raise ValueError(f"qc_status must be passed|failed|unavailable, got {self.qc_status!r}")
+        return self
 
 
 class RenderResponse(BaseModel):

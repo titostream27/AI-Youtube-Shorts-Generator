@@ -317,5 +317,65 @@ class TestCaptionTimingAfterTrim(V5Base):
         self.assertFalse((not True) and has_words and conf >= threshold)  # trimmed -> NOT trusted
 
 
+class TestStrictContract(V5Base):
+    """T-C01 — strict cross-language schemas + artifact invariants."""
+
+    def test_nested_unknown_field_rejected(self):
+        """Brief v5 C-01: unknown nested fields must be rejected (Pydantic
+        forbid parity with Zod strict)."""
+        from render_contract import RenderRequestV2, V2Clip
+        body = {
+            "request_id": "c1", "episode_id": "e", "video_url": "https://x/v.mp4",
+            "clips": [{
+                "clip_id": 1, "start_sec": 1, "end_sec": 3, "title": "a",
+                "narrative": {"main_topic": "m", "ending_type": "c",
+                              "hook_end_sec": None, "payoff_start_sec": None,
+                              "bogus_field": 1},  # unknown nested key
+                "layout_plan": {"preferred_layout": "auto", "expected_speakers": None,
+                                "allow_split": True, "allow_blur_background": True},
+                "caption_plan": {"language": "en", "cues": [], "highlight_terms": []},
+                "editing_events": [],
+            }],
+        }
+        with self.assertRaises(Exception):
+            RenderRequestV2(**body)
+
+    def test_clip_id_normalized_duplicate_detected(self):
+        """Brief v5 C-01: numeric 1 and string '1' are the same identity."""
+        from render_contract import RenderRequestV2
+        body = {
+            "request_id": "c2", "episode_id": "e", "video_url": "https://x/v.mp4",
+            "clips": [
+                {"clip_id": 1, "start_sec": 1, "end_sec": 3, "title": "a",
+                 "narrative": {"main_topic": "m", "ending_type": "c",
+                               "hook_end_sec": None, "payoff_start_sec": None},
+                 "layout_plan": {"preferred_layout": "auto", "expected_speakers": None,
+                                 "allow_split": True, "allow_blur_background": True},
+                 "caption_plan": {"language": "en", "cues": [], "highlight_terms": []},
+                 "editing_events": []},
+                {"clip_id": "1", "start_sec": 3, "end_sec": 5, "title": "b",
+                 "narrative": {"main_topic": "m", "ending_type": "c",
+                               "hook_end_sec": None, "payoff_start_sec": None},
+                 "layout_plan": {"preferred_layout": "auto", "expected_speakers": None,
+                                 "allow_split": True, "allow_blur_background": True},
+                 "caption_plan": {"language": "en", "cues": [], "highlight_terms": []},
+                 "editing_events": []},
+            ],
+        }
+        with self.assertRaises(Exception):
+            RenderRequestV2(**body)
+
+    def test_artifact_invariant_ok_requires_url(self):
+        """Brief v5 6.3: status=ok without video_url must be rejected."""
+        from render_contract import RenderArtifactResult
+        with self.assertRaises(Exception):
+            RenderArtifactResult(clip_id="c", status="ok", video_url=None, publishable=True)
+
+    def test_artifact_invariant_error_requires_error_and_not_publishable(self):
+        from render_contract import RenderArtifactResult
+        with self.assertRaises(Exception):
+            RenderArtifactResult(clip_id="c", status="error", publishable=True, error=None)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -130,7 +130,7 @@ class V2ModeRegression(unittest.TestCase):
             "video_url": "https://youtu.be/x",
             "mode": "preview",
             "clips": [
-                {"clip_id": 1, "start_sec": 1.0, "end_sec": 5.0, "speaker_id": None, "narrative": {}, "caption_plan": {"cues": []}}
+                {"clip_id": 1, "start_sec": 1.0, "end_sec": 5.0, "narrative": {}, "caption_plan": {"cues": []}}
             ],
         }
         parsed = RenderRequestV2(**v2_body)
