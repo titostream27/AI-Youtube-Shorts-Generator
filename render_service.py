@@ -478,6 +478,25 @@ def transition_job(job_id: str, expected: str, target: str, *, mode: str = "fina
         return True
 
 
+def require_transition(job_id: str, expected: str, target: str, *, mode: str = "final",
+                       episode_id: str = "", error: str = "", error_stage: str = "",
+                       response: str = "") -> None:
+    """Brief v6 4.1 — CHECKED active-stage transition.
+
+    A failed compare-and-swap is a correctness conflict, not a warning.
+    Raises JobTransitionConflict when the expected -> target transition did
+    not win; callers MUST NOT continue rendering after this raises.
+    """
+    ok = transition_job(job_id, expected, target, mode=mode, episode_id=episode_id,
+                        error=error, error_stage=error_stage, response=response)
+    if not ok:
+        current = _load_job(job_id)
+        raise JobTransitionConflict(
+            f"transition {expected} -> {target} for job {job_id} lost; "
+            f"current effective state: {current and current.get('status')}"
+        )
+
+
 def _load_job(job_id: str) -> Optional[Dict]:
     try:
         with _db_lock, _db_conn() as conn:
@@ -2018,6 +2037,29 @@ class JobTransitionConflict(RuntimeError):
     The caller must NOT start rendering; the state belongs to someone else."""
 
 
+class RenderTimelineMissingError(RuntimeError):
+    """Brief v6 4.6 — production cropper returned a bare path when an
+    explicit per-job RenderTimeline was required. Never fall back to module
+    globals."""
+
+
+def _require_explicit_timeline(crop_result, job_id: str = ""):
+    """Brief v6 4.6 — validate that crop_clip_local(return_timeline=True)
+    actually returned (path, RenderTimeline). Raises RenderTimelineMissingError
+    on a bare path so production never reads stale module-global stats."""
+    from shorts_generator.local.clipper import RenderTimeline
+    if (
+        isinstance(crop_result, tuple)
+        and len(crop_result) == 2
+        and isinstance(crop_result[1], RenderTimeline)
+    ):
+        return crop_result
+    raise RenderTimelineMissingError(
+        f"cropper did not return an explicit timeline for job {job_id or '(unknown)'} "
+        "(return_timeline=True must return (path, RenderTimeline))"
+    )
+
+
 class PersistenceError(RuntimeError):
     """Raised when a SQLite persistence write fails (brief v5 R-05). Callers
     must not update memory after a failed commit."""
@@ -2069,7 +2111,10 @@ def _render(request, job_id: str) -> RenderOutcome:
             fmt=FORMAT,
             out_dir=str(RENDER_ROOT / "source"),
         )
-        transition_job(job_id, "downloading", "analysing", mode=mode, episode_id=episode_id)
+        # Brief v6 R01: checked active transition — a lost CAS stops work.
+        require_transition(job_id, "downloading", "analysing", mode=mode, episode_id=episode_id)
+    except HTTPException:
+        raise
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"download failed: {e}") from e
 
@@ -2104,7 +2149,8 @@ def _render(request, job_id: str) -> RenderOutcome:
     start = time.time()
     rendered = []
     artifacts = []
-    transition_job(job_id, "analysing", "rendering", mode=mode, episode_id=episode_id)
+    # Brief v6 R01: checked active transition — a lost CAS stops work.
+    require_transition(job_id, "analysing", "rendering", mode=mode, episode_id=episode_id)
     for i, c in enumerate(clips, 1):
         out_path = os.path.join(job_dir, f"short_{i:02d}.mp4")
         item = {
@@ -2187,11 +2233,9 @@ def _render(request, job_id: str) -> RenderOutcome:
                 output_size=(output_w, output_h) if preview else None,
                 return_timeline=True,
             )
-            if isinstance(crop_result, tuple):
-                _, timeline = crop_result
-            else:
-                # Legacy callers (or mock) return a bare path.
-                timeline = None
+            # Brief v6 4.6/R06: production REQUIRES an explicit timeline.
+            # A bare path is a contract violation — never fall back to globals.
+            _, timeline = _require_explicit_timeline(crop_result, job_id)
             # The crop succeeded; final status may still flip to error later if
             # the quality gate fails.
             item["status"] = "ok"
@@ -2199,11 +2243,8 @@ def _render(request, job_id: str) -> RenderOutcome:
 
             # Phase 4 (brief §23): structured tracking QC from the clipper.
             try:
-                if timeline is None:
-                    from shorts_generator.local.clipper import get_render_stats
-                    stats = get_render_stats()
-                else:
-                    stats = timeline.stats
+                # Brief v6 R06: timeline is REQUIRED — never module globals.
+                stats = timeline.stats
                 artifact.qc.focus_switch_count = int(stats.get("focus_switch_count", 0) or 0)
                 artifact.qc.focus_ping_pong_detected = bool(stats.get("focus_ping_pong_detected", False))
                 artifact.qc.random_crop_detected = bool(stats.get("random_crop_detected", False))
@@ -2965,13 +3006,21 @@ def _queue_worker_loop() -> None:
             try:
                 # Brief v5 R-02: canonical transition to failed — never a raw
                 # _persist_job bypassing the state machine.
+                # Brief v6 R02: only overwrite memory when the transition WINS.
+                # If a terminal state (e.g. cancelled) already won, preserve it.
                 cur = _load_job(job_id)
                 src = canonical_status(cur["status"]) if cur else "queued"
-                transition_job(job_id, src, "failed", error=str(e), error_stage="worker")
+                won_failed = transition_job(job_id, src, "failed", error=str(e), error_stage="worker")
+                with _async_jobs_lock:
+                    if won_failed:
+                        _async_jobs[job_id] = {"state": "failed", "response": None, "error": str(e)}
+                    else:
+                        # Transition lost: keep the winning state visible; only
+                        # annotate the exception in diagnostics.
+                        if job_id in _async_jobs:
+                            _async_jobs[job_id].setdefault("error", str(e))
             except Exception:  # noqa: BLE001
                 pass
-            with _async_jobs_lock:
-                _async_jobs[job_id] = {"state": "failed", "response": None, "error": str(e)}
         finally:
             global _render_worker_heartbeat_at
             _render_worker_heartbeat_at = datetime.datetime.utcnow().isoformat()
@@ -3187,20 +3236,26 @@ def render(request: Dict[str, Any]):
     # Persist terminal THROUGH the state machine (rendering -> quality_check ->
     # completed/partial_failure); only then update memory (R-05 order).
     try:
-        _persist_terminal_via_transition(
+        # Brief v6 4.3/R03: a False terminal commit is a correctness conflict —
+        # no success response, no memory completed.
+        persisted = _persist_terminal_via_transition(
             job_id,
             outcome.final_status,
             mode=mode,
             episode_id=episode_id,
             response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "",
         )
+        if not persisted:
+            raise JobTransitionConflict(
+                f"sync job {job_id}: terminal transition to {outcome.final_status} was not committed"
+            )
     except Exception as e:  # noqa: BLE001
         # Brief v5 R-05: SQLite failed — memory must NOT claim completed.
         _record_db_error("sync_terminal_persist", e)
         with _async_jobs_lock:
             _async_jobs[job_id] = {"state": "failed", "response": None,
                                    "error": f"persist: {e}"}
-        return RenderResponse(job_id=job_id, source_video="", rendered=[])
+        raise
     with _async_jobs_lock:
         _async_jobs[job_id] = {"state": outcome.final_status, "response": outcome.response,
                                "error": None, "request_id": request_id, "mode": mode}

@@ -196,10 +196,13 @@ class TestTerminalDurabilityVsMemory(V5Base):
         def fake_render(req, job_id):
             return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
 
-        # Make the canonical terminal persistence raise.
+        # Make the canonical terminal persistence raise. Brief v6 4.3: the
+        # failure must PROPAGATE (no success response) and memory must not
+        # claim completed.
         with mock.patch.object(rs, "_persist_terminal_via_transition", side_effect=RuntimeError("disk full")), \
              mock.patch.object(rs, "_render", side_effect=fake_render):
-            rs.render(dict(V2_BODY))
+            with self.assertRaises(RuntimeError):
+                rs.render(dict(V2_BODY))
         with rs._async_jobs_lock:
             state = rs._async_jobs.get("", {})
         # The registry must NOT claim completed when persistence failed.

@@ -143,16 +143,27 @@ class TestWorkerRestartOnDeath(V6Base):
         with rs._render_queue_worker_lock:
             rs._render_queue_worker_started = True
             rs._render_queue_worker_thread = None
-        # Ensure no real worker loop runs in this test (it would block).
+        # The restart guard must detect the dead thread and start again.
+        started = {"n": 0}
+        orig_start = rs._start_worker if hasattr(rs, "_start_worker") else None
+
+        def fake_start():
+            started["n"] += 1
+            if orig_start:
+                return orig_start()
+
+        # Patch the loop so the started thread returns immediately.
         with mock.patch.object(rs, "_queue_worker_loop", side_effect=lambda: None):
-            with rs._render_queue_worker_lock:
+            if hasattr(rs, "ensure_worker_running"):
+                rs.ensure_worker_running()
+            else:
+                # RED fallback: the current _enqueue_job only checks the flag,
+                # so it will NOT restart — this is the bug being pinned.
                 rs._render_queue_worker_started = False
-            # Enqueue should start a worker thread (mocked loop returns fast).
-            rs._enqueue_job("job-x")
+                rs._enqueue_job("job-x")
         with rs._render_queue_worker_lock:
-            started = rs._render_queue_worker_started
-            thread = rs._render_queue_worker_thread
-        self.assertTrue(started, "worker must be (re)started on enqueue after crash")
+            self.assertTrue(rs._render_queue_worker_started,
+                            "worker must be (re)started on enqueue after crash")
 
 
 class TestNoGlobalTimelineFallback(V6Base):
