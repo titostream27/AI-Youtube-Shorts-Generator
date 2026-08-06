@@ -516,13 +516,18 @@ IDEMPOTENT_HIT_STATES = (
 
 
 def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
-                 episode_id: str, request_json: str) -> str:
+                 episode_id: str, request_json: str, force: bool = False) -> str:
     """Atomically find-or-create an active job for a request_id.
 
     Phase-2 correctness (F6/F7): check + insert happen inside ONE
     transaction, and a partial unique index (active request_id) backs it up.
     Two concurrent submissions of the same request_id produce exactly one
     active job; the loser gets the winner's job_id.
+
+    Hardening v3 E3 (force_rerender): when `force` is True a NEW attempt is
+    always created for the request — the previous job's row is left untouched
+    and the new row's parent_job_id points at the most recent prior attempt
+    (history retained, never deleted).
 
     Returns the job_id to use: the existing hit, or new_job_id when this
     call inserted the fresh row.
@@ -531,6 +536,52 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
     import sqlite3
     if not request_id:
         return new_job_id
+    if force:
+        # Forced attempt: do NOT consult the active-row unique index as an
+        # idempotent hit. Find the latest prior attempt for lineage only.
+        prev_job = None
+        active_job = None
+        try:
+            with _db_lock, _db_conn() as conn:
+                row = conn.execute(
+                    "SELECT job_id, status FROM render_jobs WHERE request_id = ? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (request_id,),
+                ).fetchone()
+                if row:
+                    prev_job = row[0]
+                    if row[1] in ("queued", "downloading", "analysing", "rendering", "quality_check"):
+                        active_job = row[0]
+        except Exception:  # noqa: BLE001
+            prev_job = None
+        if active_job is not None:
+            # A forced rerender must not race an ALREADY ACTIVE attempt: the
+            # partial unique index only allows one non-terminal row per
+            # request_id. Cancel the active job first, then force.
+            raise ValueError(
+                f"force_rerender rejected: request_id {request_id} already has "
+                f"active job {active_job}; cancel it before forcing a rerender"
+            )
+        try:
+            with _db_lock, _db_conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                now = datetime.datetime.utcnow().isoformat()
+                conn.execute(
+                    "INSERT INTO render_jobs "
+                    "(job_id, status, mode, episode_id, request, response, error, created_at, updated_at,"
+                    " request_id, parent_job_id, attempt, started_at, finished_at, last_error_stage) "
+                    "VALUES (?, 'queued', ?, ?, ?, '', '', ?, ?, ?, ?, 1, NULL, NULL, NULL)",
+                    (new_job_id, mode, episode_id, request_json, now, now, request_id, prev_job),
+                )
+                conn.commit()
+                return new_job_id
+        except Exception as e:  # noqa: BLE001
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            _record_db_error("reserve_job_force", e)
+            raise
     try:
         with _db_lock, _db_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -2518,10 +2569,12 @@ def render_async(request: Dict[str, Any]):
     # unsupported versions fail explicitly, legacy v1 -> V1 model.
     request = parse_render_request(request)
     request_id = getattr(request, "request_id", "") or ""
-    if request_id:
+    force_rerender = bool(getattr(request, "force_rerender", False))
+    if request_id and not force_rerender:
         # Phase-2 correctness (F6): memory check uses canonical terminal
         # vocabulary — a 'failed'/'partial_failure'/'cancelled' request is NOT
         # an idempotent hit and may be resubmitted.
+        # Hardening v3 E3: force_rerender skips the idempotent-hit path.
         with _async_jobs_lock:
             for jid, job in _async_jobs.items():
                 if job.get("request_id") == request_id and canonical_status(job.get("state", "")) in IDEMPOTENT_HIT_STATES:
@@ -2535,7 +2588,7 @@ def render_async(request: Dict[str, Any]):
     # Phase-2 correctness (F7): atomic find-or-create. Concurrent duplicate
     # submissions of the same request_id produce ONE active job; the loser
     # receives the winner's job_id.
-    reserved = _reserve_job(request_id, job_id, mode=mode, episode_id=episode_id, request_json=request_json)
+    reserved = _reserve_job(request_id, job_id, mode=mode, episode_id=episode_id, request_json=request_json, force=force_rerender)
     if reserved != job_id:
         print(f"[render] idempotent hit (reserved): {request_id} -> {reserved}", flush=True)
         return RenderResponse(job_id=reserved, source_video="", rendered=[])

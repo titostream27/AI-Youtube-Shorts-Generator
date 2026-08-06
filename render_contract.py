@@ -149,6 +149,8 @@ class RenderRequestV2(BaseModel):
     episode_id: str = ""
     video_url: str
     mode: str = "final"  # preview|final
+    # Hardening v3 E3: true forces a NEW attempt (history retained).
+    force_rerender: bool = False
     source_preferences: SourcePreferences = Field(default_factory=SourcePreferences)
     output: RenderOutput = Field(default_factory=RenderOutput)
     clips: List[V2Clip] = Field(min_length=1)

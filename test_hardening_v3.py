@@ -158,6 +158,93 @@ class TestCaptionCanonicalPolicy(unittest.TestCase):
         self.assertEqual(captured["kwargs"].get("language"), "id")
 
 
+class TestForceRerender(unittest.TestCase):
+    """Hardening v3 E3 — force_rerender creates a NEW attempt and retains
+    history; it never races an already-active attempt."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        rs.JOB_DB_PATH = self.tmp / "jobs.db"
+        rs.RENDER_ROOT = self.tmp / "out"
+        rs.RENDER_ROOT.mkdir()
+        rs._close_db_conns()
+        with rs._async_jobs_lock:
+            rs._async_jobs.clear()
+
+    def tearDown(self):
+        rs._close_db_conns()
+        self._tmp.cleanup()
+
+    def test_force_creates_new_attempt_without_deleting_history(self):
+        import sqlite3
+        # First attempt: completed.
+        rs._reserve_job("req-force-1", "job-old", mode="final", episode_id="ep", request_json="{}")
+        with rs._db_lock, rs._db_conn() as conn:
+            conn.execute("UPDATE render_jobs SET status='completed' WHERE job_id='job-old'")
+            conn.commit()
+        # Force a rerender: must create job-new, not return job-old.
+        new_id = rs._reserve_job("req-force-1", "job-new", mode="final", episode_id="ep",
+                                 request_json="{}", force=True)
+        self.assertEqual(new_id, "job-new")
+        # History retained: BOTH rows exist; job-new has parent_job_id=job-old.
+        with rs._db_lock, rs._db_conn() as conn:
+            rows = conn.execute(
+                "SELECT job_id, status, parent_job_id FROM render_jobs "
+                "WHERE request_id='req-force-1' ORDER BY created_at"
+            ).fetchall()
+        ids = [r[0] for r in rows]
+        self.assertIn("job-old", ids)
+        self.assertIn("job-new", ids)
+        parent = dict((r[0], r[2]) for r in rows)
+        self.assertEqual(parent["job-new"], "job-old")
+
+    def test_force_rejected_when_attempt_already_active(self):
+        rs._reserve_job("req-force-2", "job-active", mode="final", episode_id="ep", request_json="{}")
+        with self.assertRaises(ValueError):
+            rs._reserve_job("req-force-2", "job-x", mode="final", episode_id="ep",
+                            request_json="{}", force=True)
+
+    def test_async_force_bypasses_idempotent_hit(self):
+        from unittest.mock import patch
+        # A completed job in memory for request_id -> normal path returns it.
+        with rs._async_jobs_lock:
+            rs._async_jobs["job-hit"] = {"state": "completed", "request_id": "req-force-3",
+                                         "response": None, "error": None}
+        with rs._db_lock, rs._db_conn() as conn:
+            conn.execute(
+                "INSERT INTO render_jobs (job_id, status, mode, episode_id, request, response, error, "
+                "created_at, updated_at, request_id, parent_job_id, attempt) "
+                "VALUES ('job-hit','completed','final','ep','{}','','',"
+                "datetime('now'),datetime('now'),'req-force-3',NULL,1)"
+            )
+            conn.commit()
+        # Force: must NOT return the hit; a new job id is used.
+        from render_contract import RenderRequestV2
+        req = RenderRequestV2(request_id="req-force-3", episode_id="ep",
+                              video_url="https://y.example/a", force_rerender=True,
+                              clips=[{"clip_id": 1, "start_sec": 1, "end_sec": 3, "title": "t",
+                                      "narrative": {"main_topic": "m", "ending_type": "c"},
+                                      "layout_plan": {"preferred_layout": "auto"},
+                                      "caption_plan": {"language": "en", "cues": [], "highlight_terms": []},
+                                      "editing_events": []}])
+        with patch.object(rs, "_render", side_effect=lambda *a, **k: rs.RenderOutcome(
+            rs.RenderResponse(job_id=a[1], source_video="", rendered=[]), "completed")):
+            resp = rs.render_async(req)
+        self.assertNotEqual(resp.job_id, "job-hit")
+        self.assertTrue(resp.job_id.startswith("job-") is False)
+        # Let the worker thread finish so Windows releases the DB on teardown.
+        def _done():
+            st = rs._async_jobs.get(resp.job_id, {}).get("state")
+            return st in ("completed", "failed")
+        for _ in range(100):
+            if _done():
+                break
+            import time
+            time.sleep(0.02)
+
+
 class TestTimelineStateAt(unittest.TestCase):
     """B3 finding #11/#12 — time-indexed timeline + state_at(t)."""
 
