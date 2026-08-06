@@ -259,11 +259,13 @@ class TestRetryHistory(JobLifecycleTestBase):
 class TestPersistenceErrorsSurfaced(JobLifecycleTestBase):
     def test_sqlite_write_error_is_not_silently_swallowed(self):
         """A broken DB must be visible: _persist_job records the error in
-        health state (_last_persist_error) instead of passing silently."""
+        health state (_last_persist_error) AND raises PersistenceError so the
+        caller never updates memory after a failed commit (brief v5 R-05)."""
         rs._last_persist_error = None
         rs._last_persist_error_at = None
         with mock.patch.object(rs, "_job_db", side_effect=RuntimeError("disk full")):
-            rs._persist_job("job-x", "queued")
+            with self.assertRaises(rs.PersistenceError):
+                rs._persist_job("job-x", "queued")
         self.assertIsNotNone(rs._last_persist_error, "persistence error must be recorded")
         self.assertIn("disk full", rs._last_persist_error)
         self.assertIsNotNone(rs._last_persist_error_at)

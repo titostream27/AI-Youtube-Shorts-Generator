@@ -82,8 +82,9 @@ class V5Base(unittest.TestCase):
 
     def _db_row(self, job_id):
         with rs._db_lock, rs._db_conn() as conn:
-            row = conn.execute("SELECT * FROM render_jobs WHERE job_id=?", (job_id,)).fetchone()
-            cols = [d[0] for d in conn.description]
+            cur = conn.execute("SELECT * FROM render_jobs WHERE job_id=?", (job_id,))
+            row = cur.fetchone()
+            cols = [d[0] for d in cur.description]
             return dict(zip(cols, row)) if row else None
 
 
@@ -120,8 +121,9 @@ class TestSyncTransitionConflict(V5Base):
         # Simulate the transition losing the CAS: force queued->downloading to fail.
         with mock.patch.object(rs, "transition_job", side_effect=lambda *a, **k: False), \
              mock.patch.object(rs, "_render", side_effect=fake_render):
-            # Must not silently render when the CAS was lost.
-            rs.render(dict(V2_BODY))
+            # Must NOT silently render when the CAS was lost — explicit conflict.
+            with self.assertRaises(rs.JobTransitionConflict):
+                rs.render(dict(V2_BODY))
         self.assertEqual(calls["n"], 0, "render must not start when queued->downloading CAS fails")
 
 
@@ -166,22 +168,17 @@ class TestQueueFullCompensation(V5Base):
     """T-R05 — queue full fails the job; never a stranded queued row."""
 
     def test_queue_full_fails_job_explicitly(self):
-        # Force the queue put to raise Full.
-        class FakeFull(Exception):
-            pass
+        # Force the bounded queue's put to raise the REAL queue.Full.
+        from queue import Full as RealFull
 
         def full_put(job_id, **kw):
-            raise FakeFull("full")
+            raise RealFull("full")
 
-        with mock.patch.object(rs._render_queue, "put", side_effect=full_put), \
-             mock.patch.object(rs, "_queue_module", create=True):
-            from queue import Full as RealFull
-            rs._queue_module.Full = RealFull
+        with mock.patch.object(rs._render_queue, "put", side_effect=full_put):
             try:
                 rs.render_async(dict(V2_BODY))
                 self.fail("queue full should raise HTTP 503-equivalent error")
             except Exception as e:
-                # Must surface a queue-full failure (HTTP 503 detail equivalent).
                 self.assertIsInstance(e, Exception)
         # The durable row must NOT be left 'queued' (stranded workerless).
         with rs._db_lock, rs._db_conn() as conn:
@@ -199,8 +196,8 @@ class TestTerminalDurabilityVsMemory(V5Base):
         def fake_render(req, job_id):
             return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
 
-        # Make persistence raise.
-        with mock.patch.object(rs, "_persist_job", side_effect=RuntimeError("disk full")), \
+        # Make the canonical terminal persistence raise.
+        with mock.patch.object(rs, "_persist_terminal_via_transition", side_effect=RuntimeError("disk full")), \
              mock.patch.object(rs, "_render", side_effect=fake_render):
             rs.render(dict(V2_BODY))
         with rs._async_jobs_lock:
@@ -259,6 +256,9 @@ class TestForceRerenderIdentity(V5Base):
         with mock.patch.object(rs, "_render", side_effect=lambda req, job_id: rs.RenderOutcome(
                 rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")):
             first = rs.render(dict(body))
+            # Second submission with force_rerender -> NEW attempt (not hit).
+            second = rs.render(dict(body))
+        self.assertNotEqual(first.job_id, second.job_id, "force must create a NEW job_id")
         with rs._db_lock, rs._db_conn() as conn:
             rows = conn.execute(
                 "SELECT job_id, attempt FROM render_jobs WHERE request_id='v5-force' ORDER BY attempt"

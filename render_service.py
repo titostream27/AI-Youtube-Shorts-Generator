@@ -15,6 +15,7 @@ Endpoints:
 import os
 import threading
 import time
+import datetime
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -147,11 +148,11 @@ ACTIVE_JOB_STATES = ATOMIC_JOB_STATES
 # SQLite state update MUST route through transition_job() which enforces it.
 # Terminal states are sinks — no outgoing edges.
 ALLOWED_TRANSITIONS: Dict[str, frozenset] = {
-    "queued": frozenset({"downloading", "cancelled"}),
-    "downloading": frozenset({"analysing", "failed"}),
-    "analysing": frozenset({"rendering", "failed"}),
-    "rendering": frozenset({"quality_check", "failed"}),
-    "quality_check": frozenset({"completed", "partial_failure", "failed"}),
+    "queued": frozenset({"downloading", "cancelled", "failed", "orphaned"}),
+    "downloading": frozenset({"analysing", "failed", "orphaned"}),
+    "analysing": frozenset({"rendering", "failed", "orphaned"}),
+    "rendering": frozenset({"quality_check", "failed", "orphaned"}),
+    "quality_check": frozenset({"completed", "partial_failure", "failed", "orphaned"}),
     "completed": frozenset(),
     "partial_failure": frozenset(),
     "failed": frozenset(),
@@ -318,7 +319,13 @@ def _migrate_render_jobs(conn) -> None:
 
 def _persist_job(job_id: str, status: str, *, mode: str = "final",
                  episode_id: str = "", request: str = "", response: str = "",
-                 error: str = "", parent_job_id: str = "", attempt: int = 1) -> None:
+                 error: str = "", parent_job_id: str = "", attempt: int = 1) -> bool:
+    """Persist job state. Brief v5 R-03: named parameters — never positional
+    order (the old tuple swapped last_error_stage/process_boot_id).
+
+    Returns True iff the write COMMITTED. Raises PersistenceError on failure —
+    callers must NOT silently update memory after a failed commit (R-05).
+    """
     import sqlite3
     import datetime
     status = canonical_status(status)
@@ -329,7 +336,9 @@ def _persist_job(job_id: str, status: str, *, mode: str = "final",
                 """INSERT INTO render_jobs
                   (job_id, status, mode, episode_id, request, response, error, created_at, updated_at,
                    request_id, parent_job_id, attempt, started_at, finished_at, last_error_stage, process_boot_id)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  VALUES (:job_id, :status, :mode, :episode_id, :request, :response, :error,
+                          :now, :now, :request_id, :parent_job_id, :attempt,
+                          :started_at, :finished_at, :error_stage, :process_boot_id)
                   ON CONFLICT(job_id) DO UPDATE SET
                    status=excluded.status, mode=excluded.mode,
                    response=excluded.response, error=excluded.error,
@@ -342,25 +351,37 @@ def _persist_job(job_id: str, status: str, *, mode: str = "final",
                    last_error_stage=CASE WHEN excluded.error IS NOT NULL AND excluded.error != ''
                        THEN excluded.last_error_stage ELSE last_error_stage END,
                    updated_at=excluded.updated_at""",
-                (job_id, status, mode, episode_id, request, response, error, now, now,
-                 _extract_request_id(request), parent_job_id, attempt,
-                 now if status != "queued" else None,
-                 now if status in TERMINAL_JOB_STATES else None,
-                 PROCESS_BOOT_ID,
-                 status if error else None),
+                {
+                    "job_id": job_id,
+                    "status": status,
+                    "mode": mode,
+                    "episode_id": episode_id,
+                    "request": request,
+                    "response": response,
+                    "error": error,
+                    "now": now,
+                    "request_id": _extract_request_id(request),
+                    "parent_job_id": parent_job_id,
+                    "attempt": attempt,
+                    "started_at": now if status != "queued" else None,
+                    "finished_at": now if status in TERMINAL_JOB_STATES else None,
+                    "error_stage": (error.split(":")[0].split(" at ")[-1].strip() if error else None),
+                    "process_boot_id": PROCESS_BOOT_ID,
+                },
             )
             conn.commit()
+        return True
     except Exception as e:  # noqa: BLE001
-        # Phase 1 §5.6: persistence failure must not break rendering, but it
-        # must be visible through health diagnostics.
+        # Brief v5 R-05: persistence failure must be observable, never silent.
         global _last_persist_error, _last_persist_error_at
         import datetime
         _last_persist_error = f"{type(e).__name__}: {e}"
         _last_persist_error_at = datetime.datetime.utcnow().isoformat()
         try:
             print(f"[persist] ERROR saving job {job_id} status={status}: {e}", flush=True)
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
+        raise PersistenceError(f"{type(e).__name__}: {e}") from e
 
 
 def _extract_request_id(request_json: str) -> str:
@@ -384,7 +405,8 @@ def _transition_allowed(expected: str, target: str) -> bool:
 
 
 def transition_job(job_id: str, expected: str, target: str, *, mode: str = "final",
-                   episode_id: str = "", error: str = "") -> bool:
+                   episode_id: str = "", error: str = "", error_stage: str = "",
+                   response: str = "") -> bool:
     """Compare-and-swap job state transition (hardening sprint P0.1/P1.R1).
 
     Atomically verifies that BOTH the in-memory registry and the persisted
@@ -395,6 +417,8 @@ def transition_job(job_id: str, expected: str, target: str, *, mode: str = "fina
 
     Terminal states are sinks (no outgoing edges) and therefore immutable.
     `error` is persisted alongside the target state (used by cancellation).
+    `error_stage` records WHERE the failure happened (brief v5 4.3) and
+    `response` carries the terminal RenderResponse (brief v5 4.5).
     """
     import sqlite3
     import datetime
@@ -419,10 +443,26 @@ def transition_job(job_id: str, expected: str, target: str, *, mode: str = "fina
                 if mem_state != expected:
                     return False
                 now = datetime.datetime.utcnow().isoformat()
-                if error:
+                # Brief v5 4.3: named parameters — never positional order.
+                if error or error_stage or response:
                     conn.execute(
-                        "UPDATE render_jobs SET status = ?, error = ?, updated_at = ? WHERE job_id = ?",
-                        (target, error, now, job_id),
+                        """
+                        UPDATE render_jobs
+                           SET status = :status,
+                               last_error_stage = COALESCE(:error_stage, last_error_stage),
+                               response = :response,
+                               error = :error,
+                               updated_at = :updated_at
+                         WHERE job_id = :job_id
+                        """,
+                        {
+                            "job_id": job_id,
+                            "status": target,
+                            "error_stage": error_stage or None,
+                            "response": response,
+                            "error": error,
+                            "updated_at": now,
+                        },
                     )
                 else:
                     conn.execute(
@@ -1951,6 +1991,16 @@ def _build_thumbnail(video_path: str, hook: str, work_dir: str) -> Optional[str]
     return thumb_path
 
 
+class JobTransitionConflict(RuntimeError):
+    """Raised when a compare-and-swap job transition loses (brief v5 R-01).
+    The caller must NOT start rendering; the state belongs to someone else."""
+
+
+class PersistenceError(RuntimeError):
+    """Raised when a SQLite persistence write fails (brief v5 R-05). Callers
+    must not update memory after a failed commit."""
+
+
 class RenderOutcome:
     """Phase-2 correctness: _render returns BOTH the response and the final
     status it computed. The job orchestration layer (async/retry/sync
@@ -2558,6 +2608,48 @@ def render_health():
     }
 
 
+def _reconcile_startup_orphans() -> int:
+    """Brief v5 4.6: at process startup, mark stale ACTIVE jobs whose
+    process_boot_id differs from this process (or pre-ownership rows older
+    than the threshold) as 'orphaned' in a controlled transaction.
+
+    Runs BEFORE any client GET can repair state. Returns count orphaned.
+    Fresh rows from THIS boot (including the reservation-to-memory window)
+    are never touched — boot id + minimum age threshold protect them.
+    """
+    orphaned_count = 0
+    try:
+        with _db_lock, _db_conn() as conn:
+            rows = conn.execute(
+                "SELECT job_id, status, process_boot_id, created_at FROM render_jobs "
+                "WHERE status IN ('queued','downloading','analysing','rendering','quality_check')"
+            ).fetchall()
+        for job_id, status, boot_id, created_at in rows:
+            is_foreign = boot_id is not None and boot_id != PROCESS_BOOT_ID
+            is_ancient = (boot_id is None) and _job_older_than(created_at or "", ORPHAN_AGE_THRESHOLD_SEC)
+            if is_foreign or is_ancient:
+                # After a restart the in-memory registry is EMPTY for these
+                # rows — transition_job (which verifies memory == expected)
+                # cannot apply. This is the one sanctioned direct write: a
+                # controlled, verified DB-only transition at startup.
+                try:
+                    with _db_lock, _db_conn() as conn:
+                        now = datetime.datetime.utcnow().isoformat()
+                        cur = conn.execute(
+                            "UPDATE render_jobs SET status='orphaned', error=?, finished_at=?, updated_at=? "
+                            "WHERE job_id=? AND status=?",
+                            ("job orphaned by render service restart", now, now, job_id, status),
+                        )
+                        conn.commit()
+                        if cur.rowcount > 0:
+                            orphaned_count += 1
+                except Exception as e:  # noqa: BLE001
+                    _record_db_error("startup_reconcile_row", e)
+    except Exception as e:  # noqa: BLE001
+        _record_db_error("startup_reconcile", e)
+    return orphaned_count
+
+
 @app.get("/api/render/status/{job_id}")
 def render_job_status(job_id: str):
     """Return the canonical state of a render job (from memory when active,
@@ -2600,8 +2692,10 @@ def render_job_status(job_id: str):
         is_foreign = boot_id is not None and boot_id != PROCESS_BOOT_ID
         is_ancient = (boot_id is None) and _job_older_than(created_at, ORPHAN_AGE_THRESHOLD_SEC)
         if is_foreign or is_ancient:
-            _persist_job(job_id, "orphaned", mode=stored.get("mode", "final"),
-                         error="job orphaned by render service restart")
+            # Brief v5 R-02: orphaned through the canonical transition (any
+            # active state -> orphaned), not a raw persistence write.
+            transition_job(job_id, state, "orphaned", mode=stored.get("mode", "final"),
+                           error="job orphaned by render service restart")
             state = "orphaned"
         else:
             # Fresh current-process job (or young pre-ownership row): keep it
@@ -2694,25 +2788,111 @@ def render_async(request: Dict[str, Any]):
         _async_jobs[job_id] = {"state": "queued", "response": None, "error": None, "request_id": request_id, "mode": mode, "episode_id": episode_id}
 
     # Brief v4 F18: enqueue the job_id instead of spawning a per-job thread.
-    _enqueue_job(job_id)
+    # Brief v5 4.4: queue admission failure is compensated inside _enqueue_job
+    # (durable job -> failed) and surfaced as HTTP 503.
+    try:
+        _enqueue_job(job_id)
+    except QueueAdmissionError as exc:
+        raise HTTPException(status_code=503, detail="Render queue is full") from exc
     return RenderResponse(job_id=job_id, source_video="", rendered=[])
 
 
 def _enqueue_job(job_id: str) -> None:
     """Push a reserved job onto the bounded queue and ensure the single
     persistent worker is running (brief v4 F18). Submission enqueues IDs, it
-    never creates daemon threads."""
+    never creates daemon threads. Brief v5 R-04: queue admission failures must
+    be compensated by a transition to failed — never leave a stranded queued
+    row. Returns None on success, raises QueueAdmissionError on full."""
     global _render_queue_worker_started
     try:
         _render_queue.put(job_id, timeout=5.0)
     except _queue_module.Full:
-        raise RuntimeError(f"render queue full ({RENDER_QUEUE_MAX} jobs); try later")
+        # Brief v5 4.4: no durable queued job may exist without a queue item
+        # OR an explicit terminal failure describing queue admission.
+        try:
+            transition_job(job_id, "queued", "failed",
+                           error=f"queue_admission: render queue is full ({RENDER_QUEUE_MAX} jobs)",
+                           error_stage="queue_admission")
+        except Exception as e:  # noqa: BLE001
+            _record_db_error("queue_full_compensation", e)
+        raise QueueAdmissionError(f"render queue is full ({RENDER_QUEUE_MAX} jobs); try later")
     with _render_queue_worker_lock:
         if not _render_queue_worker_started:
             _render_queue_worker_started = True
             t = threading.Thread(target=_queue_worker_loop, daemon=True)
             t.start()
             print(f"[render] queue worker started (boot={PROCESS_BOOT_ID}, max={RENDER_QUEUE_MAX})", flush=True)
+
+
+def _next_state(state: str) -> str:
+    """The canonical successor in the active chain (brief v5 4.5)."""
+    return {
+        "queued": "downloading",
+        "downloading": "analysing",
+        "analysing": "rendering",
+        "rendering": "quality_check",
+    }.get(state, state)
+
+
+class QueueAdmissionError(RuntimeError):
+    """Raised when the bounded render queue rejected a submission (brief v5 4.4)."""
+
+
+def _register_job_memory(job_id: str, request_id: str, mode: str, episode_id: str = "") -> None:
+    """Register a reserved job in the shared in-memory registry (brief v5 4.1).
+
+    Only called for a NEWLY reserved job — never for an idempotency hit.
+    """
+    with _async_jobs_lock:
+        _async_jobs[job_id] = {"state": "queued", "response": None, "error": None,
+                               "request_id": request_id, "mode": mode, "episode_id": episode_id}
+
+
+def _persist_terminal_via_transition(job_id: str, status: str, *, mode: str = "final",
+                                     episode_id: str = "", response: str = "",
+                                     error: str = "") -> bool:
+    """Persist a terminal status through the canonical state machine (brief v5 4.2).
+
+    Only terminal targets are accepted here; the worker should transition
+    rendering -> quality_check -> completed/partial_failure via transition_job.
+    Returns True iff the terminal transition was applied AND committed.
+    """
+    status = canonical_status(status)
+    if status not in TERMINAL_JOB_STATES:
+        raise ValueError(f"_persist_terminal_via_transition requires terminal status, got {status}")
+    # Find the current state to know the expected source for the CAS.
+    current = _load_job(job_id)
+    if current is None:
+        return False
+    src = canonical_status(current["status"])
+    # quality_check -> completed/partial_failure/failed is the legal terminal hop.
+    if src == "quality_check":
+        ok = transition_job(job_id, src, status, mode=mode, episode_id=episode_id, error=error,
+                            response=response)
+        return ok
+    # Brief v5 4.5: a renderer that returns an outcome without having advanced
+    # through every stage (e.g. mocked E2E, or early-exit paths) must still
+    # reach a LEGAL terminal state. Auto-advance along the canonical path
+    # downloading -> analysing -> rendering -> quality_check -> terminal, then
+    # apply the final hop. Every hop is a validated CAS; a lost hop aborts.
+    if status == "failed":
+        return transition_job(job_id, src, "failed", mode=mode, episode_id=episode_id, error=error)
+    chain = ["queued", "downloading", "analysing", "rendering", "quality_check"]
+    if src in chain:
+        try:
+            idx = chain.index(src)
+        except ValueError:
+            return False
+        current_state = src
+        for nxt in chain[idx + 1:]:
+            # expected = the CURRENT state; target = the next canonical stage.
+            if not transition_job(job_id, current_state, nxt, mode=mode, episode_id=episode_id):
+                return False
+            current_state = nxt
+        # Now at quality_check; apply the terminal hop.
+        return transition_job(job_id, "quality_check", status, mode=mode, episode_id=episode_id,
+                              error=error, response=response)
+    return False
 
 
 def _queue_worker_loop() -> None:
@@ -2725,7 +2905,11 @@ def _queue_worker_loop() -> None:
         except Exception as e:  # noqa: BLE001
             print(f"[render] queue worker error on {job_id}: {e}", flush=True)
             try:
-                _persist_job(job_id, "failed", error=str(e))
+                # Brief v5 R-02: canonical transition to failed — never a raw
+                # _persist_job bypassing the state machine.
+                cur = _load_job(job_id)
+                src = canonical_status(cur["status"]) if cur else "queued"
+                transition_job(job_id, src, "failed", error=str(e), error_stage="worker")
             except Exception:  # noqa: BLE001
                 pass
             with _async_jobs_lock:
@@ -2761,11 +2945,28 @@ def _process_queued_job(job_id: str) -> None:
         _render_lock.release()
     if not won:
         return
-    # Phase-2 correctness: terminal status is persisted HERE, once, BEFORE the
-    # memory registry is updated, so a caller that sees
-    # 'completed'/'partial_failure' knows the row is already durable.
-    _persist_job(job_id, outcome.final_status, mode=mode, episode_id=episode_id,
-                 response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "")
+    # Brief v5 4.2/4.5: terminal status through the canonical transition
+    # (rendering -> quality_check -> completed/partial_failure), committed
+    # BEFORE memory update. If SQLite fails, memory must NOT claim terminal.
+    try:
+        terminal_ok = _persist_terminal_via_transition(
+            job_id,
+            outcome.final_status,
+            mode=mode,
+            episode_id=episode_id,
+            response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "",
+        )
+    except PersistenceError as e:
+        # Brief v5 R-05: surface in health; do not claim terminal in memory.
+        _record_db_error("worker_terminal_persist", e)
+        with _async_jobs_lock:
+            _async_jobs[job_id] = {"state": "failed", "response": None, "error": f"persist: {e}"}
+        return
+    if not terminal_ok:
+        with _async_jobs_lock:
+            _async_jobs[job_id] = {"state": "failed", "response": None,
+                                   "error": "terminal transition lost"}
+        return
     with _async_jobs_lock:
         _async_jobs[job_id] = {"state": outcome.final_status, "response": outcome.response, "error": None}
 
@@ -2885,15 +3086,11 @@ def render(request: Dict[str, Any]):
     reserved = _reserve_job(request_id, job_id, mode=mode, episode_id=episode_id,
                             request_json=request_json, force=force_rerender)
     if reserved != job_id:
-        # Idempotent hit: an active job for this request_id already exists.
+        # Brief v5 R-01: idempotent hit — DO NOT create a phantom memory
+        # entry for a job that does not exist. Return the existing job.
         print(f"[render] sync idempotent hit: {request_id} -> {reserved}", flush=True)
-        with _async_jobs_lock:
-            _async_jobs[job_id] = {"state": "queued", "response": None, "error": None,
-                                   "request_id": request_id, "mode": mode}
         return RenderResponse(job_id=reserved, source_video="", rendered=[])
-    with _async_jobs_lock:
-        _async_jobs[job_id] = {"state": "queued", "response": None, "error": None,
-                               "request_id": request_id, "mode": mode}
+    _register_job_memory(job_id, request_id, mode, episode_id)
     # Block until the current job finishes (true FIFO queue) — a 503 timeout
     # would just push the error back to the client, not serialize the work.
     _render_lock.acquire()
@@ -2902,27 +3099,48 @@ def render(request: Dict[str, Any]):
     sync_error = None
     try:
         # P0.1: sync renderer also wins through queued -> downloading CAS.
-        transition_job(job_id, "queued", "downloading", mode=mode, episode_id=episode_id)
+        # Brief v5 R-01: check the return value; a lost CAS must NOT render.
+        won = transition_job(job_id, "queued", "downloading", mode=mode, episode_id=episode_id)
+        if not won:
+            raise JobTransitionConflict(
+                f"sync job {job_id}: queued->downloading CAS lost "
+                f"(expected queued, got {_load_job(job_id) and _load_job(job_id).get('status')})"
+            )
         outcome = _render(request, job_id)
     except Exception as e:  # noqa: BLE001
-        # Brief v4 F1: a sync exception must persist a terminal 'failed' and
-        # register it in the shared memory path — no queued residue.
-        sync_error = str(e)
+        # Brief v5 R-01/R-05: persist terminal 'failed' THROUGH the canonical
+        # transition when possible; never silently claim failure in memory.
+        sync_error = e
         print(f"[render] sync job {job_id} failed: {e}", flush=True)
         try:
-            _persist_job(job_id, "failed", mode=mode, episode_id=episode_id, error=str(e))
+            # queued/active -> failed via canonical transition.
+            cur = _load_job(job_id)
+            src = canonical_status(cur["status"]) if cur else "queued"
+            transition_job(job_id, src, "failed", mode=mode, episode_id=episode_id, error=str(e),
+                           error_stage="render")
         except Exception as e2:  # noqa: BLE001
             _record_db_error("sync_persist_failed", e2)
-        with _async_jobs_lock:
-            _async_jobs[job_id] = {"state": "failed", "response": None,
-                                   "error": str(e), "request_id": request_id, "mode": mode}
+        raise
     finally:
         _render_busy = False
         _render_lock.release()
-    if sync_error is not None:
-        raise
-    _persist_job(job_id, outcome.final_status, mode=mode, episode_id=episode_id,
-                 response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "")
+    # Persist terminal THROUGH the state machine (rendering -> quality_check ->
+    # completed/partial_failure); only then update memory (R-05 order).
+    try:
+        _persist_terminal_via_transition(
+            job_id,
+            outcome.final_status,
+            mode=mode,
+            episode_id=episode_id,
+            response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "",
+        )
+    except Exception as e:  # noqa: BLE001
+        # Brief v5 R-05: SQLite failed — memory must NOT claim completed.
+        _record_db_error("sync_terminal_persist", e)
+        with _async_jobs_lock:
+            _async_jobs[job_id] = {"state": "failed", "response": None,
+                                   "error": f"persist: {e}"}
+        return RenderResponse(job_id=job_id, source_video="", rendered=[])
     with _async_jobs_lock:
         _async_jobs[job_id] = {"state": outcome.final_status, "response": outcome.response,
                                "error": None, "request_id": request_id, "mode": mode}
@@ -2934,4 +3152,11 @@ if __name__ == "__main__":
 
     RENDER_ROOT.mkdir(parents=True, exist_ok=True)
     print(f"[render] output root: {RENDER_ROOT}", flush=True)
+    # Brief v5 4.6: reconcile stale jobs from a previous process BEFORE the
+    # server accepts requests — never wait for a client GET.
+    try:
+        n = _reconcile_startup_orphans()
+        print(f"[render] startup reconcile: {n} job(s) orphaned", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[render] startup reconcile failed: {e}", flush=True)
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
