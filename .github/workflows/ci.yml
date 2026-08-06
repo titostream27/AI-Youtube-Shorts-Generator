@@ -20,7 +20,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: titostream27/youtube-content-miner
-          ref: 8ffe282
+          ref: cd96695
           path: content-miner
 
       - uses: actions/setup-python@v5
@@ -34,7 +34,7 @@ jobs:
 
       - name: Lifecycle + contract + cache + timeline + visual + hardening tests
         working-directory: AI-Youtube-Shorts-Generator
-        run: python -m pytest test_render_contract.py test_contract_fixtures.py test_job_lifecycle.py test_render_timeline.py test_hardening_sprint.py test_cache_timeline.py test_hardening_v3.py test_hardening_v4.py test_hardening_v5.py test_visual_behavior.py -q
+        run: python -m pytest test_render_contract.py test_contract_fixtures.py test_job_lifecycle.py test_render_timeline.py test_hardening_sprint.py test_cache_timeline.py test_hardening_v3.py test_hardening_v4.py test_hardening_v5.py test_hardening_v6.py test_visual_behavior.py -q
 
       - name: Shared contract fixtures must be present (fail, not skip)
         working-directory: AI-Youtube-Shorts-Generator
