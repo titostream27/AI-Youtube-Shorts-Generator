@@ -215,6 +215,28 @@ class TestPartialFailureParity(HardeningTestBase):
         self.assertEqual(len(ok_artifacts_db), 1)
         self.assertEqual(ok_artifacts_db[0]["clip_url"], "/out/short_01.mp4")
 
+    def test_status_endpoint_exposes_partial_failure_artifacts_from_memory(self):
+        """P1.R3 — /api/render/status/{job_id} must expose successful artifacts
+        for a partial_failure kept in memory, identically to the persisted path."""
+        job_id = "pf-http"
+        rendered = [
+            {"clip_id": 1, "status": "ok", "clip_url": "/out/short_01.mp4"},
+            {"clip_id": 2, "status": "error", "error": "encode failed"},
+        ]
+        response = rs.RenderResponse(job_id=job_id, source_video="src.mp4", rendered=rendered)
+        with rs._async_jobs_lock:
+            rs._async_jobs[job_id] = {
+                "state": "partial_failure", "response": response, "error": None,
+                "request_id": f"req-{job_id}", "mode": "final",
+            }
+        payload = rs.render_job_status(job_id)
+        self.assertEqual(payload["state"], "partial_failure")
+        self.assertIn("rendered", payload)
+        self.assertEqual(len(payload["rendered"]), 2)
+        ok = [r for r in payload["rendered"] if r.get("status") == "ok"]
+        self.assertEqual(len(ok), 1)
+        self.assertEqual(ok[0]["clip_url"], "/out/short_01.mp4")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

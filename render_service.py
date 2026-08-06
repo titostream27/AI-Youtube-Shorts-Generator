@@ -2389,7 +2389,10 @@ def render_job_status(job_id: str):
             "mode": job.get("mode", "final"),
         }
         resp = job.get("response")
-        if state == "completed" and resp:
+        # P1.R3 partial-failure parity: expose successful artifacts from
+        # memory identically to the persisted path (completed AND
+        # partial_failure), not only completed.
+        if state in ("completed", "partial_failure") and resp:
             payload["rendered"] = resp.rendered
             payload["source_video"] = resp.source_video
             payload["mode"] = getattr(resp, "mode", "final")
