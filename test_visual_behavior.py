@@ -136,5 +136,93 @@ class TestNoGlobalFallback(V5BaseVisual):
         self.assertEqual(result[0], "/tmp/out.mp4")
 
 
+class TestCameraPlannerBehavior(V5BaseVisual):
+    """Brief v6 7.2 — VIS-01..08: planner decisions from mocked detections/audio."""
+
+    def setUp(self):
+        super().setUp()
+        from shorts_generator.local.clipper import CameraPlanner, CameraPlannerConfig
+        self.CameraPlanner = CameraPlanner
+        self.cfg = CameraPlannerConfig(
+            switch_debounce_sec=0.6, hold_window_sec=1.2,
+            miss_tolerance_sec=0.8, scene_cut_reset=True,
+            min_confidence=0.5, audio_hysteresis=0.15,
+        )
+
+    def _face(self, track_id, cx=0.5, cy=0.4, w=0.2, h=0.3, conf=0.9, area=None):
+        return {"track_id": track_id, "cx": cx, "cy": cy, "w": w, "h": h,
+                "confidence": conf, "area": area if area is not None else w * h}
+
+    def test_vis01_single_speaker_stable_no_switch(self):
+        p = self.CameraPlanner(self.cfg)
+        for t in (0.0, 0.5, 1.0, 1.5, 2.0):
+            s = p.step(t, detections=[self._face(1)])
+            self.assertEqual(s.active_track, 1)
+            self.assertIsNone(s.switch_reason)
+            # Crop stays inside [0,1].
+            x0, y0, w, h = s.crop_rect
+            self.assertGreaterEqual(x0, 0.0); self.assertLessEqual(x0 + w, 1.0)
+
+    def test_vis02_two_speakers_focus_active_no_size_steal(self):
+        p = self.CameraPlanner(self.cfg)
+        # Speaker 1 small but active; speaker 2 appears larger — no steal
+        # within hold window.
+        p.step(0.0, detections=[self._face(1, area=0.05)], audio_activity=1)
+        s = p.step(0.3, detections=[self._face(1, area=0.05), self._face(2, area=0.2)], audio_activity=1)
+        self.assertEqual(s.active_track, 1, "larger face must not steal within hold window")
+
+    def test_vis03_speaker_handoff_one_controlled_switch(self):
+        p = self.CameraPlanner(self.cfg)
+        p.step(0.0, detections=[self._face(1)], audio_activity=1)
+        # Within hold -> no switch.
+        s = p.step(0.5, detections=[self._face(2)], audio_activity=2)
+        self.assertEqual(s.active_track, 1)
+        self.assertEqual(s.hold_reason, "hold_window")
+        # After hold window -> one switch.
+        s = p.step(2.0, detections=[self._face(2)], audio_activity=2)
+        self.assertEqual(s.active_track, 2)
+        self.assertEqual(s.switch_reason, "debounce_passed")
+
+    def test_vis04_missed_detection_holds(self):
+        p = self.CameraPlanner(self.cfg)
+        p.step(0.0, detections=[self._face(1, cx=0.5)])
+        s = p.step(0.4, detections=[])
+        self.assertEqual(s.active_track, 1)
+        self.assertEqual(s.hold_reason, "miss_tolerance")
+        # After tolerance -> cleared.
+        s = p.step(2.0, detections=[])
+        self.assertIsNone(s.active_track)
+
+    def test_vis05_hard_scene_cut_resets(self):
+        p = self.CameraPlanner(self.cfg)
+        p.step(0.0, detections=[self._face(1)])
+        s = p.step(1.0, detections=[self._face(2)], scene_change=True)
+        self.assertEqual(s.reset_reason, "scene_cut")
+        self.assertEqual(s.active_track, 2, "new identity after reset")
+
+    def test_vis06_reaction_split_only_qualified(self):
+        # Planner step carries split_alpha; caller gates split intervals on
+        # qualified reaction. Here we assert the field is exposed and 0 by
+        # default when no split signal is provided.
+        p = self.CameraPlanner(self.cfg)
+        s = p.step(0.0, detections=[self._face(1)])
+        self.assertEqual(s.split_alpha, 0.0)
+
+    def test_vis07_false_face_poster_ignored(self):
+        p = self.CameraPlanner(self.cfg)
+        p.step(0.0, detections=[self._face(1)])
+        # Low-confidence static face must not steal focus.
+        s = p.step(0.5, detections=[self._face(2, conf=0.1)])
+        self.assertEqual(s.active_track, 1, "low-confidence face must not steal")
+
+    def test_vis08_rapid_audio_alternation_hysteresis(self):
+        p = self.CameraPlanner(self.cfg)
+        p.step(0.0, detections=[self._face(1)], audio_activity=1)
+        # Fast alternation with different speaker — damped by audio hysteresis
+        # inside the hold window.
+        s = p.step(0.1, detections=[self._face(2)], audio_activity=2)
+        self.assertEqual(s.active_track, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

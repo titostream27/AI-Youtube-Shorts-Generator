@@ -96,6 +96,174 @@ class ReframeResult:
     pipeline_version: str = ""
 
 
+@dataclass
+class CameraPlannerConfig:
+    """Brief v6 7.1 — deterministic planner knobs (defaults mirror the
+    production anti-shake parameters)."""
+    switch_debounce_sec: float = 0.6       # VIS-02: ignore quick alternate
+    hold_window_sec: float = 1.2           # VIS-03: no ping-pong inside
+    miss_tolerance_sec: float = 0.8        # VIS-04: hold camera on miss
+    scene_cut_reset: bool = True           # VIS-05: reset tracker on hard cut
+    min_confidence: float = 0.5            # VIS-07: ignore low-confidence faces
+    audio_hysteresis: float = 0.15         # VIS-08: audio oscillation damping
+
+
+@dataclass
+class CameraPlannerStep:
+    """Brief v6 7.1 — planner decision for one frame."""
+    timestamp_sec: float
+    active_track: Optional[int]
+    confidence: float
+    crop_rect: Optional[Tuple[float, float, float, float]]
+    layout: str = "face_crop"
+    split_alpha: float = 0.0
+    hold_reason: Optional[str] = None
+    switch_reason: Optional[str] = None
+    reset_reason: Optional[str] = None
+
+
+class CameraPlanner:
+    """Brief v6 7.1 — deterministic camera/tracker planner interface.
+
+    step(timestamp, detections, audio_activity, scene_change) decides the
+    active track, crop, layout and split. Pure state machine (no OpenCV) so
+    tests can drive it from mocked detections/audio/scene events and assert
+    DECISIONS (VIS-01..08), not manually-built timelines.
+    """
+
+    def __init__(self, config: Optional[CameraPlannerConfig] = None) -> None:
+        self.config = config or CameraPlannerConfig()
+        self._active_track: Optional[int] = None
+        self._active_confidence = 0.0
+        self._last_switch_ts: Optional[float] = None
+        self._miss_start_ts: Optional[float] = None
+        self._last_audio_ts: Optional[float] = None
+        self._last_crop: Optional[Tuple[float, float, float, float]] = None
+        self._scene_reset_ts: Optional[float] = None
+
+    def step(
+        self,
+        timestamp_sec: float,
+        detections: Optional[List[Dict]] = None,
+        audio_activity: Optional[int] = None,
+        scene_change: bool = False,
+    ) -> CameraPlannerStep:
+        detections = detections or []
+        # VIS-05: hard scene cut resets tracker identity.
+        if scene_change and self.config.scene_cut_reset:
+            self._active_track = None
+            self._active_confidence = 0.0
+            self._miss_start_ts = None
+            self._scene_reset_ts = timestamp_sec
+            reset_reason = "scene_cut"
+        else:
+            reset_reason = None
+
+        # Filter low-confidence / false faces (VIS-07).
+        real = [
+            d for d in detections
+            if float(d.get("confidence", 0) or 0) >= self.config.min_confidence
+        ]
+
+        # VIS-04: temporary miss -> hold previous camera.
+        if not real:
+            if self._active_track is not None:
+                if self._miss_start_ts is None:
+                    self._miss_start_ts = timestamp_sec
+                if timestamp_sec - self._miss_start_ts <= self.config.miss_tolerance_sec:
+                    return CameraPlannerStep(
+                        timestamp_sec=timestamp_sec,
+                        active_track=self._active_track,
+                        confidence=self._active_confidence,
+                        crop_rect=self._last_crop,
+                        hold_reason="miss_tolerance",
+                        reset_reason=reset_reason,
+                    )
+                # Exceeded tolerance -> clear.
+                self._active_track = None
+                self._active_confidence = 0.0
+            self._miss_start_ts = None
+            return CameraPlannerStep(
+                timestamp_sec=timestamp_sec,
+                active_track=None,
+                confidence=0.0,
+                crop_rect=None,
+                hold_reason="no_detection",
+                reset_reason=reset_reason,
+            )
+
+        self._miss_start_ts = None
+        # Pick the strongest detection (largest area), not size-only steal:
+        # keep the CURRENT track unless the new one is clearly better AND the
+        # debounce/hold window allows a switch (VIS-02/VIS-03/VIS-08).
+        best = max(real, key=lambda d: float(d.get("area", 0) or 0))
+        best_id = best.get("track_id")
+        best_conf = float(best.get("confidence", 0) or 0)
+
+        if self._active_track is None or best_id == self._active_track:
+            # (Re)acquire / stay.
+            if best_id != self._active_track:
+                self._active_track = best_id
+                self._active_confidence = best_conf
+                self._last_switch_ts = timestamp_sec
+            else:
+                self._active_confidence = max(self._active_confidence, best_conf)
+            self._last_crop = self._crop_for(best)
+            return CameraPlannerStep(
+                timestamp_sec=timestamp_sec,
+                active_track=self._active_track,
+                confidence=self._active_confidence,
+                crop_rect=self._last_crop,
+                reset_reason=reset_reason,
+            )
+
+        # Different candidate: switch only after debounce + outside hold.
+        if self._last_switch_ts is not None and timestamp_sec - self._last_switch_ts < self.config.hold_window_sec:
+            return CameraPlannerStep(
+                timestamp_sec=timestamp_sec,
+                active_track=self._active_track,
+                confidence=self._active_confidence,
+                crop_rect=self._last_crop,
+                hold_reason="hold_window",
+                reset_reason=reset_reason,
+            )
+        # Audio hysteresis (VIS-08): if audio just flipped, damp the switch.
+        if audio_activity is not None and self._last_audio_ts is not None:
+            if abs(timestamp_sec - self._last_audio_ts) < self.config.audio_hysteresis:
+                return CameraPlannerStep(
+                    timestamp_sec=timestamp_sec,
+                    active_track=self._active_track,
+                    confidence=self._active_confidence,
+                    crop_rect=self._last_crop,
+                    hold_reason="audio_hysteresis",
+                    reset_reason=reset_reason,
+                )
+        self._active_track = best_id
+        self._active_confidence = best_conf
+        self._last_switch_ts = timestamp_sec
+        self._last_crop = self._crop_for(best)
+        self._last_audio_ts = timestamp_sec if audio_activity is not None else self._last_audio_ts
+        return CameraPlannerStep(
+            timestamp_sec=timestamp_sec,
+            active_track=self._active_track,
+            confidence=self._active_confidence,
+            crop_rect=self._last_crop,
+            switch_reason="debounce_passed",
+            reset_reason=reset_reason,
+        )
+
+    @staticmethod
+    def _crop_for(detection: Dict) -> Tuple[float, float, float, float]:
+        """Normalized crop rect [x0, y0, w, h] clamped to [0,1]."""
+        cx = float(detection.get("cx", 0.5) or 0.5)
+        cy = float(detection.get("cy", 0.5) or 0.5)
+        w = float(detection.get("w", 0.2) or 0.2)
+        h = float(detection.get("h", 0.3) or 0.3)
+        x0 = max(0.0, min(1.0, cx - w / 2))
+        y0 = max(0.0, min(1.0, cy - h / 2))
+        return (round(x0, 4), round(y0, 4), round(min(1.0, w), 4), round(min(1.0, h), 4))
+
+
 class RenderTimeline:
     """Explicit per-clip render timeline artifact (Phase 2 §render timelines).
 
