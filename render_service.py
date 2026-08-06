@@ -2565,8 +2565,9 @@ def _render(request, job_id: str) -> RenderOutcome:
     # rendered — never inside the per-clip loop. Observers always see the
     # true current stage (rendering while clips render, quality_check only
     # after the last clip).
-    if transition_job(job_id, "rendering", "quality_check", mode=mode, episode_id=episode_id):
-        print(f"[render] job {job_id}: quality_check (all clips rendered)", flush=True)
+    # Brief v6 4.4 Option A (job-level phases) + R01: checked transition.
+    require_transition(job_id, "rendering", "quality_check", mode=mode, episode_id=episode_id)
+    print(f"[render] job {job_id}: quality_check (all clips rendered)", flush=True)
     # Phase-2 correctness: compute the terminal status but DO NOT persist it.
     # The orchestration layer persists it exactly once (RenderOutcome).
     import json
@@ -2627,6 +2628,24 @@ ORPHAN_AGE_THRESHOLD_SEC = float(os.getenv("RENDER_ORPHAN_AGE_THRESHOLD", "300")
 def render_status():
     """Report whether a render job is currently running (queue status)."""
     return {"busy": _render_busy}
+
+
+def _oldest_queued_age_sec() -> float:
+    """Brief v6 10.3 — age of the oldest job still in an active stage, from
+    the SQLite created_at. Returns 0 when nothing is active."""
+    try:
+        with _db_lock, _db_conn() as conn:
+            row = conn.execute(
+                "SELECT created_at FROM render_jobs "
+                "WHERE status IN ('queued','downloading','analysing','rendering','quality_check') "
+                "ORDER BY created_at ASC LIMIT 1"
+            ).fetchone()
+        if not row or not row[0]:
+            return 0.0
+        created = datetime.datetime.fromisoformat(row[0])
+        return max(0.0, (datetime.datetime.utcnow() - created).total_seconds())
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 @app.get("/api/render/health")
@@ -2694,6 +2713,8 @@ def render_health():
                   "worker_alive": bool(_render_queue_worker_thread and _render_queue_worker_thread.is_alive()),
                   "worker_heartbeat": _render_worker_heartbeat_at,
                   "worker_last_exception": _render_worker_last_exception,
+                  # Brief v6 10.3: oldest queued job age.
+                  "oldest_queued_age_sec": _oldest_queued_age_sec(),
                   "process_boot_id": PROCESS_BOOT_ID},
         "ffmpeg": {"available": ffmpeg, "ffprobe": ffprobe},
         "output": {"writable": out_ok, "error": out_error, "free_bytes": free_bytes},
@@ -2912,13 +2933,8 @@ def _enqueue_job(job_id: str) -> None:
         except Exception as e:  # noqa: BLE001
             _record_db_error("queue_full_compensation", e)
         raise QueueAdmissionError(f"render queue is full ({RENDER_QUEUE_MAX} jobs); try later")
-    with _render_queue_worker_lock:
-        if not _render_queue_worker_started:
-            _render_queue_worker_started = True
-            t = threading.Thread(target=_queue_worker_loop, daemon=True)
-            t.start()
-            _render_queue_worker_thread = t
-            print(f"[render] queue worker started (boot={PROCESS_BOOT_ID}, max={RENDER_QUEUE_MAX})", flush=True)
+    # Brief v6 4.5/R05: ensure the worker is ALIVE (restart if crashed).
+    ensure_worker_running()
 
 
 def _next_state(state: str) -> str:
@@ -2992,39 +3008,71 @@ def _persist_terminal_via_transition(job_id: str, status: str, *, mode: str = "f
     return False
 
 
+def ensure_worker_running() -> None:
+    """Brief v6 4.5/R05 — start the queue worker if it is not ALIVE.
+
+    The boolean flag alone is insufficient: a crashed thread leaves the flag
+    True. Restart exactly when the thread reference is missing or dead.
+    Guarded by _render_queue_worker_lock so two workers never start.
+    """
+    global _render_queue_worker_started, _render_queue_worker_thread
+    with _render_queue_worker_lock:
+        if (
+            not _render_queue_worker_started
+            or _render_queue_worker_thread is None
+            or not _render_queue_worker_thread.is_alive()
+        ):
+            _render_queue_worker_started = True
+            t = threading.Thread(target=_queue_worker_loop, daemon=True)
+            t.start()
+            _render_queue_worker_thread = t
+            print(f"[render] queue worker started (boot={PROCESS_BOOT_ID}, max={RENDER_QUEUE_MAX})", flush=True)
+
+
 def _queue_worker_loop() -> None:
     """Persistent FIFO worker: dequeues one job_id at a time and processes it
-    under the serial render lock. One thread for the whole process."""
-    while True:
-        job_id = _render_queue.get()
-        try:
-            _process_queued_job(job_id)
-        except Exception as e:  # noqa: BLE001
-            global _render_worker_last_exception
-            _render_worker_last_exception = f"{type(e).__name__}: {e}"
-            print(f"[render] queue worker error on {job_id}: {e}", flush=True)
+    under the serial render lock. One thread for the whole process.
+
+    Brief v6 R05: the OUTERMOST handler resets the started flag before exit so
+    a crashed worker (even on queue.get()) is restarted on the next enqueue.
+    """
+    try:
+        while True:
+            job_id = _render_queue.get()
             try:
-                # Brief v5 R-02: canonical transition to failed — never a raw
-                # _persist_job bypassing the state machine.
-                # Brief v6 R02: only overwrite memory when the transition WINS.
-                # If a terminal state (e.g. cancelled) already won, preserve it.
-                cur = _load_job(job_id)
-                src = canonical_status(cur["status"]) if cur else "queued"
-                won_failed = transition_job(job_id, src, "failed", error=str(e), error_stage="worker")
-                with _async_jobs_lock:
-                    if won_failed:
-                        _async_jobs[job_id] = {"state": "failed", "response": None, "error": str(e)}
-                    else:
-                        # Transition lost: keep the winning state visible; only
-                        # annotate the exception in diagnostics.
-                        if job_id in _async_jobs:
-                            _async_jobs[job_id].setdefault("error", str(e))
-            except Exception:  # noqa: BLE001
-                pass
-        finally:
-            global _render_worker_heartbeat_at
-            _render_worker_heartbeat_at = datetime.datetime.utcnow().isoformat()
-            _render_queue.task_done()
+                _process_queued_job(job_id)
+            except Exception as e:  # noqa: BLE001
+                global _render_worker_last_exception
+                _render_worker_last_exception = f"{type(e).__name__}: {e}"
+                print(f"[render] queue worker error on {job_id}: {e}", flush=True)
+                try:
+                    # Brief v5 R-02: canonical transition to failed — never a raw
+                    # _persist_job bypassing the state machine.
+                    # Brief v6 R02: only overwrite memory when the transition WINS.
+                    # If a terminal state (e.g. cancelled) already won, preserve it.
+                    cur = _load_job(job_id)
+                    src = canonical_status(cur["status"]) if cur else "queued"
+                    won_failed = transition_job(job_id, src, "failed", error=str(e), error_stage="worker")
+                    with _async_jobs_lock:
+                        if won_failed:
+                            _async_jobs[job_id] = {"state": "failed", "response": None, "error": str(e)}
+                        else:
+                            # Transition lost: keep the winning state visible; only
+                            # annotate the exception in diagnostics.
+                            if job_id in _async_jobs:
+                                _async_jobs[job_id].setdefault("error", str(e))
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                global _render_worker_heartbeat_at
+                _render_worker_heartbeat_at = datetime.datetime.utcnow().isoformat()
+                _render_queue.task_done()
+    finally:
+        # Brief v6 R05: reset the flag so the NEXT enqueue restarts the worker.
+        global _render_queue_worker_started
+        with _render_queue_worker_lock:
+            _render_queue_worker_started = False
+            _render_queue_worker_thread = None
 
 
 def _process_queued_job(job_id: str) -> None:

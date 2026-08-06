@@ -143,27 +143,30 @@ class TestWorkerRestartOnDeath(V6Base):
         with rs._render_queue_worker_lock:
             rs._render_queue_worker_started = True
             rs._render_queue_worker_thread = None
-        # The restart guard must detect the dead thread and start again.
-        started = {"n": 0}
-        orig_start = rs._start_worker if hasattr(rs, "_start_worker") else None
-
-        def fake_start():
-            started["n"] += 1
-            if orig_start:
-                return orig_start()
-
         # Patch the loop so the started thread returns immediately.
         with mock.patch.object(rs, "_queue_worker_loop", side_effect=lambda: None):
-            if hasattr(rs, "ensure_worker_running"):
-                rs.ensure_worker_running()
-            else:
-                # RED fallback: the current _enqueue_job only checks the flag,
-                # so it will NOT restart — this is the bug being pinned.
-                rs._render_queue_worker_started = False
-                rs._enqueue_job("job-x")
+            rs.ensure_worker_running()
         with rs._render_queue_worker_lock:
             self.assertTrue(rs._render_queue_worker_started,
-                            "worker must be (re)started on enqueue after crash")
+                            "worker must be (re)started when thread is dead/None")
+            self.assertIsNotNone(rs._render_queue_worker_thread)
+
+    def test_worker_flag_reset_on_loop_exit(self):
+        """After the loop exits (crash), the started flag must reset so the
+        next enqueue restarts the worker."""
+        with rs._render_queue_worker_lock:
+            rs._render_queue_worker_started = True
+            rs._render_queue_worker_thread = None
+        # Simulate loop exit by running the loop with an immediate exception
+        # on get() — the outermost finally must reset the flag.
+        with mock.patch.object(rs._render_queue, "get", side_effect=RuntimeError("get died")):
+            try:
+                rs._queue_worker_loop()
+            except Exception:
+                pass
+        with rs._render_queue_worker_lock:
+            self.assertFalse(rs._render_queue_worker_started,
+                             "flag must reset after worker loop exits")
 
 
 class TestNoGlobalTimelineFallback(V6Base):
