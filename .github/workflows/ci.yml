@@ -10,34 +10,41 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      # Renderer contract fixtures live in the MINER repo (shared source of
-      # truth). Check both out in the workspace layout the tests expect:
-      # <parent>/content-miner/contracts + AI-Youtube-Shorts-Generator.
+      # Renderer contract fixtures live in the MINER repo. Brief v5 6.4/9.1:
+      # PIN the miner contract revision (never unpinned main).
       - uses: actions/checkout@v4
         with:
           path: AI-Youtube-Shorts-Generator
 
-      - name: Checkout miner (shared contract fixtures)
+      - name: Checkout miner (pinned contract revision)
         uses: actions/checkout@v4
         with:
           repository: titostream27/youtube-content-miner
+          ref: 8ffe282
           path: content-miner
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install production requirements FAIL-FAST (brief v5 9.1)
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt 2>/dev/null || pip install pydantic fastapi pytest opencv-python-headless numpy
+          pip install -r requirements.txt
 
-      - name: Lifecycle + contract + cache + timeline tests
+      - name: Lifecycle + contract + cache + timeline + visual + hardening tests
         working-directory: AI-Youtube-Shorts-Generator
-        run: python -m pytest test_render_contract.py test_contract_fixtures.py test_job_lifecycle.py test_render_timeline.py test_hardening_sprint.py test_cache_timeline.py test_hardening_v3.py test_hardening_v4.py -q
+        run: python -m pytest test_render_contract.py test_contract_fixtures.py test_job_lifecycle.py test_render_timeline.py test_hardening_sprint.py test_cache_timeline.py test_hardening_v3.py test_hardening_v4.py test_hardening_v5.py test_visual_behavior.py -q
 
       - name: Shared contract fixtures must be present (fail, not skip)
         working-directory: AI-Youtube-Shorts-Generator
         run: |
           test -f ../content-miner/contracts/fixtures/manifest.json
           test -f ../content-miner/contracts/render-result-v2.schema.json
+
+      - name: Publish test summary
+        if: always()
+        working-directory: AI-Youtube-Shorts-Generator
+        run: |
+          echo "## Test results" >> $GITHUB_STEP_SUMMARY
+          echo "- pytest: lifecycle/contract/cache/timeline/visual/hardening suites" >> $GITHUB_STEP_SUMMARY
