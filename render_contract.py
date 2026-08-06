@@ -94,10 +94,17 @@ class CaptionCue(BaseModel):
     end_sec: float
     text: str
     speaker_id: Optional[str] = None
+    # Hardening sprint P0.4: canonical word-level timing (when available).
+    # If present, the compositor uses these timestamps directly and skips
+    # full re-transcription; if absent it falls back to forced alignment.
+    words: List[CaptionWord] = Field(default_factory=list)
 
 
 class CaptionPlan(BaseModel):
     language: str = "en"
+    provider: str = "unknown"
+    transcript_version: str = ""
+    alignment_confidence: float = Field(default=0.0, ge=0, le=1)
     cues: List[CaptionCue] = Field(default_factory=list)
     highlight_terms: List[str] = Field(default_factory=list)
 
