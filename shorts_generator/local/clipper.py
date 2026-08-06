@@ -161,6 +161,48 @@ class RenderTimeline:
         with open(sidecar_path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f)
 
+    def state_at(self, timestamp_sec: float) -> Dict[str, object]:
+        """Return the time-indexed timeline state nearest to `timestamp_sec`
+        (hardening v3 B3). Faces, active speaker, camera center, crop, layout
+        and split are read from the frames timeline, never from module globals.
+
+        When the timeline is empty (e.g. a cache hit with an absent sidecar),
+        returns an explicit empty state so callers never fall back to stale
+        previous-render global state.
+        """
+        if not self.frames:
+            return {
+                "timestamp_sec": round(timestamp_sec, 3),
+                "faces": [],
+                "active_speaker_id": None,
+                "speaker_confidence": None,
+                "crop_rect": None,
+                "camera_center": None,
+                "layout": None,
+                "split_alpha": 0.0,
+                "safe_caption_zones": [],
+                "reason": "no_timeline",
+            }
+        best = self.frames[0]
+        best_delta = abs(float(best["t_sec"]) - timestamp_sec)
+        for f in self.frames[1:]:
+            delta = abs(float(f["t_sec"]) - timestamp_sec)
+            if delta < best_delta:
+                best = f
+                best_delta = delta
+        return {
+            "timestamp_sec": round(timestamp_sec, 3),
+            "faces": best.get("faces", []),
+            "active_speaker_id": best.get("active_speaker_id") or best.get("speaker_track_id"),
+            "speaker_confidence": None,
+            "crop_rect": best.get("crop_rect"),
+            "camera_center": best.get("camera_center"),
+            "layout": best.get("layout"),
+            "split_alpha": float(best.get("split_alpha", 0.0) or 0.0),
+            "safe_caption_zones": best.get("safe_caption_zones", []),
+            "reason": "frame",
+        }
+
 
 import numpy as np
 
@@ -848,6 +890,26 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                 "speaker_track_id": speaker_track_id,
                 "split_alpha": round(float(split_alpha), 3),
                 "face_count": len(new_tracks) if new_tracks is not None else 0,
+                # Hardening v3 B3: time-indexed camera/speaker/face state so
+                # downstream (caption compositor, QC) can query state_at(t)
+                # instead of a final snapshot. Safe data only — no shared refs.
+                "faces": [
+                    {
+                        "track_id": int(ft["track_id"]),
+                        "box": [float(ft.get("cx", 0)), float(ft.get("cy", 0)),
+                                float(ft.get("w", 0)), float(ft.get("h", 0))],
+                        "confidence": float(ft.get("score", 0) or 0),
+                    }
+                    for ft in (new_tracks or [])
+                ],
+                "active_speaker_id": speaker_track_id,
+                "camera_center": (
+                    [float(focus_track["cx"]), float(focus_track["cy"])]
+                    if focus_track is not None else None
+                ),
+                "crop_rect": None,  # filled by _capture_reframe() with source dims
+                "layout": layout_mode,
+                "safe_caption_zones": [],  # set by caption compositor via state_at
             })
         except Exception:  # noqa: BLE001
             pass
@@ -1540,21 +1602,54 @@ def _default_profile_version() -> str:
         f"-caption-v{os.getenv('RENDER_CAPTION_SAFE_VERSION', '2')}"
         f"-tracker-v{os.getenv('RENDER_TRACKER_VERSION', '4')}"
         f"-encoder-{os.getenv('RENDER_ENCODER_VERSION', 'h264')}"
+        f"-pipeline-{os.getenv('RENDER_PIPELINE_VERSION', 'v3-1')}"
     )
 
 
-def _cache_key_with_profile(source_path: str, start_time: float, end_time: float, aspect_ratio: str, output_size: Optional[Tuple[int, int]] = None, profile_version: str = "") -> str:
-    """Cache identity including the render profile version (T08).
+def _event_hash(emphasis_events: Optional[List[Dict]]) -> str:
+    """Deterministic hash of editing/emphasis events (hardening v3 B2)."""
+    if not emphasis_events:
+        return "noev"
+    import hashlib
+    import json
+    try:
+        canonical = json.dumps(emphasis_events, sort_keys=True, separators=(",", ":"))
+    except Exception:  # noqa: BLE001
+        return "push"
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:10]
 
-    profile_version is appended to the key so ANY camera / caption-safe /
-    tracker / encoder change creates a new cache entry; stale entries from an
-    older profile are simply never hit again (orphaned media is cleaned up by
-    the orphan cleanup rules).
-    """
+
+def _source_fingerprint(source_path: str) -> str:
+    """Short fingerprint of the source identity (path + size + mtime)."""
+    import hashlib
+    try:
+        st = os.stat(source_path)
+        token = f"{os.path.basename(source_path)}:{st.st_size}:{int(st.st_mtime)}"
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()[:10]
+    except OSError:
+        return hashlib.sha256(source_path.encode("utf-8")).hexdigest()[:10]
+
+
+def _cache_key_with_profile(
+    source_path: str,
+    start_time: float,
+    end_time: float,
+    aspect_ratio: str,
+    output_size: Optional[Tuple[int, int]] = None,
+    profile_version: str = "",
+    layout_mode: str = "face_crop",
+    emphasis_events: Optional[List[Dict]] = None,
+) -> str:
+    """Cache identity including profile + layout + editing events + source
+    fingerprint (hardening v3 B2). Any camera / caption-safe / tracker /
+    encoder / pipeline / layout / event change creates a new cache entry."""
     base = _cache_key(source_path, start_time, end_time, aspect_ratio, output_size)
     base = base[: -len(".mp4")]  # strip extension
     profile = profile_version or _default_profile_version()
-    return f"{base}__{profile}.mp4"
+    return (
+        f"{base}__{profile}__{layout_mode}__{_event_hash(emphasis_events)}"
+        f"__src{_source_fingerprint(source_path)}.mp4"
+    )
 
 
 def crop_clip_local(
@@ -1603,6 +1698,7 @@ def crop_clip_local(
         os.makedirs(cache_dir, exist_ok=True)
         cache_path = os.path.join(cache_dir, _cache_key_with_profile(
             source_path, start_time, end_time, aspect_ratio, output_size, profile_version,
+            layout_mode=layout_mode, emphasis_events=emphasis_events,
         ))
         sidecar_path = cache_path[:-len(".mp4")] + ".timeline.json"
         if os.path.exists(cache_path):

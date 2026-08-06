@@ -85,5 +85,49 @@ class TestReservationErrors(V3Base):
         self.assertEqual(winner, "job-a")
 
 
+class TestTimelineStateAt(unittest.TestCase):
+    """B3 finding #11/#12 — time-indexed timeline + state_at(t)."""
+
+    def test_state_at_finds_nearest_frame(self):
+        from shorts_generator.local.clipper import RenderTimeline
+        t = RenderTimeline()
+        t.frames = [
+            {"frame_no": 1, "t_sec": 0.033, "speaker_track_id": 1, "split_alpha": 0.0,
+             "face_count": 1, "faces": [{"track_id": 1, "box": [0, 0, 100, 100], "confidence": 0.9}],
+             "active_speaker_id": 1, "camera_center": [50, 50], "crop_rect": [0, 0, 200, 360],
+             "layout": "face_crop", "safe_caption_zones": []},
+            {"t": 2, "t_sec": 1.033, "speaker_track_id": 2, "split_alpha": 1.0,
+             "face_count": 2, "faces": [], "active_speaker_id": 2, "camera_center": [80, 90],
+             "crop_rect": [0, 0, 200, 360], "layout": "split", "safe_caption_zones": []},
+        ]
+        s = t.state_at(0.9)
+        self.assertEqual(s["faces"], t.frames[1]["faces"])
+        self.assertEqual(s["active_speaker_id"], 2)
+        self.assertEqual(s["layout"], "split")
+        # Empty timeline returns explicit no-timeline, never stale global.
+        empty = RenderTimeline()
+        self.assertEqual(empty.state_at(1.0)["reason"], "no_timeline")
+
+    def test_cache_key_includes_layout_and_editing_events(self):
+        from shorts_generator.local import clipper
+        src = "video.mp4"
+        base = clipper._cache_key_with_profile(src, 1.0, 5.0, "9:16", profile_version="a1")
+        layout_changed = clipper._cache_key_with_profile(src, 1.0, 5.0, "9:16", profile_version="a1", layout_mode="blur_background")
+        event_changed = clipper._cache_key_with_profile(src, 1.0, 5.0, "9:16", profile_version="a1", emphasis_events=[{"type": "punchline", "time_sec": 2.0}])
+        self.assertNotEqual(base, layout_changed, "B2: layout mode must salt the cache key")
+        self.assertNotEqual(base, event_changed, "B2: editing/emphasis events must salt the cache key")
+
+    def test_missing_sidecar_state_is_explicit_not_stale_global(self):
+        from shorts_generator.local import clipper
+        tl = clipper.RenderTimeline()
+        # Even if module globals were polluted, timeline state_at must NOT read them.
+        clipper._FRAME_TIMELINE.append({"t_sec": 99.0, "frames": ["stale"]})
+        try:
+            s = tl.state_at(1.0)
+            self.assertEqual(s["reason"], "no_timeline")
+        finally:
+            clipper._FRAME_TIMELINE.clear()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
