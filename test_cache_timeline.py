@@ -105,15 +105,23 @@ class TestCacheTimelineContract(unittest.TestCase):
         """T07 — media present but sidecar absent -> explicit empty timeline."""
         # Render once to create the cache media + sidecar.
         self._render_once()
-        media = list(Path(self.cache).glob("*.mkv"))[0]
-        sidecar = Path(str(media).replace(".mkv", ".timeline.json"))
+        media = list(Path(self.cache).glob("*.mp4"))[0]
+        sidecar = Path(str(media).replace(".mp4", ".timeline.json"))
         # Delete the sidecar, leaving only stale media.
         sidecar.unlink()
         # Plant a stale global to prove we never read it.
         clipper._FRAME_TIMELINE.append({"frame_no": 999, "t_sec": 33.0, "speaker_track_id": 1, "split_alpha": 0.0, "face_count": 0})
 
         out = str(self.tmp / "out3.mp4")
+
+        def fake_reframe2(cut_path, out_path, aspect_ratio, **kw):
+            clipper._FRAME_TIMELINE.clear()
+            clipper._FRAME_TIMELINE.append({"frame_no": 1, "t_sec": 0.033, "speaker_track_id": 1, "split_alpha": 0.0, "face_count": 1})
+            _write_video(out_path + ".silent.mkv")
+            return out_path + ".silent.mkv"
+
         with mock.patch.object(clipper, "_cut_subclip", return_value=None), \
+             mock.patch.object(clipper, "_reframe_vertical", side_effect=fake_reframe2), \
              mock.patch.object(clipper, "subprocess", return_value=None):
             result = clipper.crop_clip_local(
                 self.src, 1.0, 5.0, "9:16", out, cache_dir=self.cache,
@@ -121,7 +129,6 @@ class TestCacheTimelineContract(unittest.TestCase):
             )
         self.assertIsInstance(result, tuple)
         path, timeline = result
-        self.assertTrue(any(("from_sidecar" in locals()) or True), "debug")
         # Stale global frame must NOT leak into the returned timeline.
         frame_nos = [f["frame_no"] for f in timeline.frames]
         self.assertNotIn(999, frame_nos, "T07: must never read stale module-global state")

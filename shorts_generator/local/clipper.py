@@ -129,6 +129,39 @@ class RenderTimeline:
             "stats": self.stats,
         }
 
+    # ── Hardening sprint P0.2: versioned sidecar serialization ─────────────
+    @classmethod
+    def from_json(cls, sidecar_path: str) -> "RenderTimeline":
+        """Load a RenderTimeline from a sidecar file.
+
+        Returns an EMPTY timeline (explicit, not stale-global) when the
+        sidecar is missing or unreadable — the caller must treat that as
+        'no timeline available' and never fall back to module globals.
+        """
+        t = cls()
+        try:
+            import json
+            with open(sidecar_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            t.face_tracks = list(data.get("face_tracks", []))
+            t.speaker_track_id = data.get("speaker_track_id")
+            t.split_alpha = float(data.get("split_alpha", 0.0))
+            t.split_ranges = [tuple(r) for r in data.get("split_ranges", [])]
+            t.frames = list(data.get("frames", []))
+            t.stats = dict(data.get("stats", t.stats))
+        except Exception:  # noqa: BLE001 — explicit empty timeline on any failure
+            pass
+        return t
+
+    def to_json(self, sidecar_path: str) -> None:
+        """Persist this timeline to a sidecar next to the cached media."""
+        import json
+        import os
+        os.makedirs(os.path.dirname(sidecar_path) or ".", exist_ok=True)
+        with open(sidecar_path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f)
+
+
 import numpy as np
 
 from ..config import LOCAL_OUTPUT_DIR
@@ -1468,6 +1501,35 @@ def _cache_key(source_path: str, start_time: float, end_time: float, aspect_rati
     return f"{src}_{start_time:.2f}_{end_time:.2f}_{ratio}_{out_w}x{out_h}.mp4"
 
 
+def _default_profile_version() -> str:
+    """Semantic render-profile version (hardening sprint P1.R4).
+
+    Salted by camera planner, caption-safe-zone, face tracker, and encoder
+    behavior so a completed render never stays a permanent cache hit after
+    any of those changes. Bump any component when its behavior changes.
+    """
+    return (
+        f"camera-v{os.getenv('RENDER_CAMERA_VERSION', '3')}"
+        f"-caption-v{os.getenv('RENDER_CAPTION_SAFE_VERSION', '2')}"
+        f"-tracker-v{os.getenv('RENDER_TRACKER_VERSION', '4')}"
+        f"-encoder-{os.getenv('RENDER_ENCODER_VERSION', 'h264')}"
+    )
+
+
+def _cache_key_with_profile(source_path: str, start_time: float, end_time: float, aspect_ratio: str, output_size: Optional[Tuple[int, int]] = None, profile_version: str = "") -> str:
+    """Cache identity including the render profile version (T08).
+
+    profile_version is appended to the key so ANY camera / caption-safe /
+    tracker / encoder change creates a new cache entry; stale entries from an
+    older profile are simply never hit again (orphaned media is cleaned up by
+    the orphan cleanup rules).
+    """
+    base = _cache_key(source_path, start_time, end_time, aspect_ratio, output_size)
+    base = base[: -len(".mp4")]  # strip extension
+    profile = profile_version or _default_profile_version()
+    return f"{base}__{profile}.mp4"
+
+
 def crop_clip_local(
     source_path: str,
     start_time: float,
@@ -1480,13 +1542,21 @@ def crop_clip_local(
     layout_mode: str = "face_crop",
     output_size: Optional[Tuple[int, int]] = None,
     return_timeline: bool = False,
+    profile_version: str = "",
 ) -> str | Tuple[str, RenderTimeline]:
     """Cut + reframe one highlight, returning the local mp4 path.
 
     When `cache_dir` is given, the reframed (vertical, caption-free) result is
-    cached per (source, start, end, aspect). Re-rendering a clip — e.g. to
-    change caption style — then skips the expensive cut-from-source and
-    OpenCV reframe entirely.
+    cached per (source, start, end, aspect, profile_version). Re-rendering a
+    clip — e.g. to change caption style — then skips the expensive
+    cut-from-source and OpenCV reframe entirely.
+
+    Hardening sprint P0.2/T06/T07: a cache HIT returns the SAME typed result
+    as a miss — (out_path, RenderTimeline) when return_timeline=True — loaded
+    from a versioned .timeline.json sidecar written on miss. When the media
+    exists but the valid sidecar is absent, the entry is invalidated (the
+    media is discarded) so module-global state from another render is NEVER
+    read (T07).
 
     Phase 3 (brief §39): `final_encode=False` leaves the output as the LOSSLESS
     FFV1 intermediate so the caller (render_service) can composite captions /
@@ -1500,14 +1570,29 @@ def crop_clip_local(
     active speaker, split windows and QC stats. Callers should prefer this
     over the module-global getters.
     """
+    cache_path = None
+    sidecar_path = None
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
-        cache_path = os.path.join(cache_dir, _cache_key(source_path, start_time, end_time, aspect_ratio, output_size))
+        cache_path = os.path.join(cache_dir, _cache_key_with_profile(
+            source_path, start_time, end_time, aspect_ratio, output_size, profile_version,
+        ))
+        sidecar_path = cache_path[:-len(".mp4")] + ".timeline.json"
         if os.path.exists(cache_path):
-            print(f"[clip/local] cache hit: {os.path.basename(cache_path)}", flush=True)
-            import shutil
-            shutil.copyfile(cache_path, out_path)
-            return out_path
+            if os.path.exists(sidecar_path):
+                # T06: cache hit returns the SAME typed result as a miss.
+                print(f"[clip/local] cache hit: {os.path.basename(cache_path)}", flush=True)
+                timeline = RenderTimeline.from_json(sidecar_path)
+                import shutil
+                shutil.copyfile(cache_path, out_path)
+                return (out_path, timeline) if return_timeline else out_path
+            # T07: stale media with no valid sidecar — invalidate, never read
+            # module globals. Delete the orphaned media and re-render.
+            print(f"[clip/local] cache entry without sidecar: invalidating", flush=True)
+            try:
+                os.remove(cache_path)
+            except OSError:
+                pass
 
     cut_path = out_path + ".cut.mp4"
     try:
@@ -1560,6 +1645,10 @@ def crop_clip_local(
     if cache_dir and os.path.exists(out_path):
         import shutil
         shutil.copyfile(out_path, cache_path)
+        # P0.2: persist a versioned timeline sidecar beside the cached media so
+        # a later cache HIT returns the same typed timeline (T06).
+        if return_timeline:
+            RenderTimeline.capture().to_json(sidecar_path)
         print(f"[clip/local] cached: {os.path.basename(cache_path)}", flush=True)
 
     if return_timeline:
