@@ -105,8 +105,18 @@ class TestSyncOrchestration(V4Base):
             raise RuntimeError("sync boom")
 
         with mock.patch.object(rs, "_render", side_effect=boom):
-            resp = rs.render(dict(V2_BODY))
-        self.assertEqual(self._db_status(resp.job_id), "failed")
+            with self.assertRaises(RuntimeError):
+                rs.render(dict(V2_BODY))
+        # Terminal failed must be persisted + registered despite the raise.
+        with rs._db_lock, rs._db_conn() as conn:
+            rows = conn.execute(
+                "SELECT job_id, status, error FROM render_jobs WHERE status='failed'"
+            ).fetchall()
+        self.assertGreaterEqual(len(rows), 1, "sync exception must persist a failed row")
+        with rs._async_jobs_lock:
+            self.assertTrue(any(
+                j.get("state") == "failed" for j in rs._async_jobs.values()
+            ), "sync exception must register failed in memory")
 
 
 class TestV1AsyncNoRequestId(V4Base):
@@ -118,14 +128,18 @@ class TestV1AsyncNoRequestId(V4Base):
             video_url="https://example.com/v.mp4",
             clips=[{"clip_id": 1, "title": "a", "start_sec": 1, "end_sec": 3, "aspect_ratio": "9:16"}],
         )
-        with mock.patch.object(rs, "_render", side_effect=lambda r, j: rs.RenderOutcome(
-            rs.RenderResponse(job_id=j, source_video="", rendered=[]), "completed")):
+        patcher = mock.patch.object(rs, "_render", side_effect=lambda r, j: rs.RenderOutcome(
+            rs.RenderResponse(job_id=j, source_video="", rendered=[]), "completed"))
+        patcher.start()
+        try:
             resp = rs.render_async(req)
-        # Durable row must exist BEFORE the worker advances it.
-        self.assertIsNotNone(self._db_status(resp.job_id))
-        self.assertTrue(wait_until(lambda: self._db_status(resp.job_id) == "completed"))
-        with rs._async_jobs_lock:
-            self.assertEqual(rs._async_jobs.get(resp.job_id, {}).get("state"), "completed")
+            # Durable row must exist BEFORE the worker advances it.
+            self.assertIsNotNone(self._db_status(resp.job_id))
+            self.assertTrue(wait_until(lambda: self._db_status(resp.job_id) == "completed"))
+            with rs._async_jobs_lock:
+                self.assertEqual(rs._async_jobs.get(resp.job_id, {}).get("state"), "completed")
+        finally:
+            patcher.stop()
 
 
 class TestMultiClipSequencing(V4Base):
@@ -144,9 +158,13 @@ class TestMultiClipSequencing(V4Base):
             states.append(("clip2-render", rs._async_jobs.get(job_id, {}).get("state")))
             return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
 
-        with mock.patch.object(rs, "_render", side_effect=fake_render):
+        patcher = mock.patch.object(rs, "_render", side_effect=fake_render)
+        patcher.start()
+        try:
             resp = rs.render_async(dict(V2_BODY))
-        self.assertTrue(wait_until(lambda: rs._async_jobs.get(resp.job_id, {}).get("state") in ("completed", "failed")))
+            self.assertTrue(wait_until(lambda: rs._async_jobs.get(resp.job_id, {}).get("state") in ("completed", "failed")))
+        finally:
+            patcher.stop()
         # The trace must prove the SECOND clip cannot render after job already
         # said quality_check. (RED: current code enters QC per clip.)
         clip2_stage = [s for label, s in states if label == "clip2-render"]

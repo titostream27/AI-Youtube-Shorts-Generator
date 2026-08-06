@@ -535,7 +535,29 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
     import datetime
     import sqlite3
     if not request_id:
-        return new_job_id
+        # Brief v4 F2: V1 async WITHOUT request_id must still be durable —
+        # insert a queued row (no duplicate lookup possible) so the worker
+        # only starts after the reservation is persisted.
+        try:
+            with _db_lock, _db_conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                now = datetime.datetime.utcnow().isoformat()
+                conn.execute(
+                    "INSERT INTO render_jobs "
+                    "(job_id, status, mode, episode_id, request, response, error, created_at, updated_at,"
+                    " request_id, parent_job_id, attempt, started_at, finished_at, last_error_stage) "
+                    "VALUES (?, 'queued', ?, ?, ?, '', '', ?, ?, ?, NULL, 1, NULL, NULL, NULL)",
+                    (new_job_id, mode, episode_id, request_json, now, now, ""),
+                )
+                conn.commit()
+                return new_job_id
+        except Exception as e:  # noqa: BLE001
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            _record_db_error("reserve_job_no_request_id", e)
+            raise
     if force:
         # Forced attempt: do NOT consult the active-row unique index as an
         # idempotent hit. Find the latest prior attempt for lineage only.
@@ -2760,21 +2782,56 @@ def render(request: Dict[str, Any]):
     job_id = uuid.uuid4().hex[:10]
     mode = getattr(request, "mode", "final") or "final"
     episode_id = getattr(request, "episode_id", "") or ""
-    _persist_job(job_id, "queued", mode=mode, episode_id=episode_id,
-                 request=request.model_dump_json() if hasattr(request, "model_dump_json") else "")
+    request_json = request.model_dump_json() if hasattr(request, "model_dump_json") else ""
+    request_id = getattr(request, "request_id", "") or ""
+    force_rerender = bool(getattr(request, "force_rerender", False))
+    # Brief v4 F1: sync jobs go through the SAME durable reservation +
+    # in-memory registration as async/retry, so transition_job() sees a
+    # registered memory state and the job can actually advance.
+    reserved = _reserve_job(request_id, job_id, mode=mode, episode_id=episode_id,
+                            request_json=request_json, force=force_rerender)
+    if reserved != job_id:
+        # Idempotent hit: an active job for this request_id already exists.
+        print(f"[render] sync idempotent hit: {request_id} -> {reserved}", flush=True)
+        with _async_jobs_lock:
+            _async_jobs[job_id] = {"state": "queued", "response": None, "error": None,
+                                   "request_id": request_id, "mode": mode}
+        return RenderResponse(job_id=reserved, source_video="", rendered=[])
+    with _async_jobs_lock:
+        _async_jobs[job_id] = {"state": "queued", "response": None, "error": None,
+                               "request_id": request_id, "mode": mode}
     # Block until the current job finishes (true FIFO queue) — a 503 timeout
     # would just push the error back to the client, not serialize the work.
     _render_lock.acquire()
     _render_busy = True
+    outcome = None
+    sync_error = None
     try:
         # P0.1: sync renderer also wins through queued -> downloading CAS.
         transition_job(job_id, "queued", "downloading", mode=mode, episode_id=episode_id)
         outcome = _render(request, job_id)
+    except Exception as e:  # noqa: BLE001
+        # Brief v4 F1: a sync exception must persist a terminal 'failed' and
+        # register it in the shared memory path — no queued residue.
+        sync_error = str(e)
+        print(f"[render] sync job {job_id} failed: {e}", flush=True)
+        try:
+            _persist_job(job_id, "failed", mode=mode, episode_id=episode_id, error=str(e))
+        except Exception as e2:  # noqa: BLE001
+            _record_db_error("sync_persist_failed", e2)
+        with _async_jobs_lock:
+            _async_jobs[job_id] = {"state": "failed", "response": None,
+                                   "error": str(e), "request_id": request_id, "mode": mode}
     finally:
         _render_busy = False
         _render_lock.release()
+    if sync_error is not None:
+        raise
     _persist_job(job_id, outcome.final_status, mode=mode, episode_id=episode_id,
                  response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "")
+    with _async_jobs_lock:
+        _async_jobs[job_id] = {"state": outcome.final_status, "response": outcome.response,
+                               "error": None, "request_id": request_id, "mode": mode}
     return outcome.response
 
 
