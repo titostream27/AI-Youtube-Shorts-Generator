@@ -99,6 +99,17 @@ class CaptionCue(BaseModel):
     # full re-transcription; if absent it falls back to forced alignment.
     words: List[CaptionWord] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _validate_word_bounds(self) -> "CaptionCue":
+        # Hardening sprint P0.4 (parity with Zod cross-field invariant): each
+        # word's timing must sit inside its own cue.
+        for w in self.words:
+            if w.start_sec < self.start_sec or w.end_sec > self.end_sec or w.end_sec <= w.start_sec:
+                raise ValueError(
+                    f"word [{w.start_sec},{w.end_sec}] invalid for cue [{self.start_sec},{self.end_sec}]"
+                )
+        return self
+
 
 class CaptionPlan(BaseModel):
     language: str = "en"
