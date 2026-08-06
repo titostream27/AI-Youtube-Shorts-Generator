@@ -1,8 +1,43 @@
 # Hardening Sprint 2026 — Architecture & Operations Guide
 
 Scope: Podcast Opportunity Miner (content-miner) + AI-Youtube-Shorts-Generator
-hardening sprint. Fixes correctness, contract, evaluation, cache, timeline,
-and boundary gaps before feature expansion.
+hardening sprint (v1/v2/v3). Fixes correctness, contract, evaluation, cache,
+timeline, and boundary gaps before feature expansion.
+
+## Revision v3 (this sprint) — what changed
+
+- **Phase A: reservations.** `_reserve_job` now treats ONLY
+  `sqlite3.IntegrityError` as a duplicate-active-request race; any other DB
+  failure raises, is recorded in health diagnostics, and never starts a
+  worker on an unreserved row.
+- **Phase B: cache & timeline.** Cache key salts the render profile
+  (camera/caption-safe/tracker/encoder/pipeline), layout mode, editing-event
+  hash, and source fingerprint. Timeline frames carry time-indexed state
+  (faces, active speaker, camera center, layout, crop); `RenderTimeline`.
+  `state_at(t)` returns the nearest-frame state or an explicit
+  `no_timeline` — never module globals from a previous render.
+- **Phase C: miner finalization.** Candidate id is a content/window sha256
+  fingerprint (`c=<fp>`), stable across rough-index shifts. Salience, word
+  count and density are recomputed from the FINAL slice
+  (`rescoreSegmentFromSlice`), never inherited from the rough candidate.
+  Transcript slices expose `timingPrecision`/`sliceApproximate`. Pronoun and
+  referential openers resolve against PRECEDING entity context.
+- **Phase D: canonical captions.** `_normalize_clips` preserves `words`,
+  language, provider, `transcript_version`, `alignment_confidence`; trusted
+  canonical word timing (confidence ≥ threshold) skips full Whisper; the STT
+  fallback uses the contract language (never hard-codes English); words are
+  clamped to the clip; untimed words are marked `timing_source=
+  synthetic_hint`.
+- **Phase E: shared result contract.** `contracts/render-result-v2.schema.
+  json` + valid/invalid fixtures + manifest are a single source of truth for
+  the renderer RESULT payload, validated identically by JSON Schema, Zod, and
+  Pydantic `RenderResult`. `clip_id` is normalized before duplicate checks;
+  `request_id` is salted by `renderProfileVersion`; an end-to-end
+  miner→renderer handshake test parses a miner contract with the renderer.
+  Pydantic and proves no field loss.
+- **Phase F: evaluation.** All boundary-sensitive golden metrics come from ONE
+  common temporal assignment (`matchByTemporalIoU`); a 4th golden fixture
+  (contamination hard-negative) was added.
 
 ## 1. Repository ownership (non-negotiable)
 
