@@ -607,12 +607,23 @@ def _normalize_clips(request) -> List:
     for c in request.clips:
         if hasattr(c, "caption_plan") and c.caption_plan is not None:
             # v2: use caption_plan.cues as captions; layout from layout_plan.
+            # Hardening v3 D1/D3 (#21/#24): preserve canonical words, language,
+            # provenance and clamp each word/cue to the clip — never drop them.
             cues = [
                 CaptionRequest(
                     start_sec=cc.start_sec,
                     end_sec=cc.end_sec,
                     text=cc.text,
                     speaker=cc.speaker_id or "",
+                    words=[
+                        CaptionWord(
+                            start_sec=max(float(w.start_sec), float(c.start_sec)),
+                            end_sec=min(float(w.end_sec), float(c.end_sec)),
+                            text=w.text,
+                        )
+                        for w in (cc.words or [])
+                        if w.end_sec > c.start_sec and w.start_sec < c.end_sec
+                    ],
                 )
                 for cc in c.caption_plan.cues
             ]
@@ -629,6 +640,13 @@ def _normalize_clips(request) -> List:
                 "allow_blur_background": c.layout_plan.allow_blur_background if c.layout_plan else True,
                 "editing_events": [e.model_dump() for e in (c.editing_events or [])],
                 "highlight_terms": list(c.caption_plan.highlight_terms) if c.caption_plan else [],
+                # Hardening v3 D1 (#21): propagate language + provenance so the
+                # STT fallback never hard-codes English.
+                "language": c.caption_plan.language or "",
+                "provider": c.caption_plan.provider or "unknown",
+                "alignment_confidence": float(getattr(c.caption_plan, "alignment_confidence", 0) or 0),
+                "transcript_version": c.caption_plan.transcript_version or "",
+                "has_word_timing": any(len(cc.words or []) > 0 for cc in c.caption_plan.cues),
             })
         else:
             # v1 legacy
@@ -918,9 +936,13 @@ def _normalize_cues(captions: List[CaptionRequest], clip_start: float) -> List[D
                         "word": word,
                         "start": max(0.0, ws - clip_start),
                         "end": max(0.0, we - clip_start),
+                        "timing_source": "canonical",
                     })
                 else:
-                    word_items.append({"word": word})
+                    # Hardening v3 D3 (#25): a word without real timing is a
+                    # SYNTHETIC HINT, not real timing — mark it explicitly so
+                    # downstream never mistakes it for canonical timing.
+                    word_items.append({"word": word, "timing_source": "synthetic_hint"})
 
         if not word_items:
             continue
@@ -966,6 +988,7 @@ def _transcribe_with_whisper(
     clip_start: float,
     clip_end: float,
     work_dir: str,
+    language: str = "",
 ) -> List[CaptionRequest]:
     """Transcribe the clip window with faster-whisper word timestamps.
 
@@ -974,9 +997,9 @@ def _transcribe_with_whisper(
     Each word carries its precise start/end (absolute video coords) so the
     karaoke reveal matches the actual speech rhythm — not an even estimate.
 
-    Whisper segments are natural utterance boundaries, so a second speaker
-    becomes its own segment -> its own caption line, instead of being merged
-    into the first speaker's line.
+    Hardening v3 D2 (#23): `language` comes from the contract caption_plan —
+    the fallback NEVER hard-codes English when a language is available.
+    Pass "" to let whisper auto-detect (only used when language is absent).
     """
     import subprocess as sp
 
@@ -992,13 +1015,14 @@ def _transcribe_with_whisper(
     sp.run(cmd, check=True)
 
     model = _get_whisper_model()
-    segments, _info = model.transcribe(
-        audio_path,
-        language="en",
-        word_timestamps=True,
-        vad_filter=True,
-        beam_size=5,
-    )
+    transcribe_kwargs: Dict[str, object] = {
+        "word_timestamps": True,
+        "vad_filter": True,
+        "beam_size": 5,
+    }
+    if language:
+        transcribe_kwargs["language"] = language
+    segments, _info = model.transcribe(audio_path, **transcribe_kwargs)
 
     captions: List[CaptionRequest] = []
     for seg in segments:
@@ -2034,29 +2058,36 @@ def _render(request, job_id: str) -> RenderOutcome:
                     print(f"[render] clip {i}: pause trim failed ({e}), continuing", flush=True)
 
             if c["captions"]:
-                # Phase 4: transcribe the clip with faster-whisper for precise
-                # word-level timing (karaoke reveal syncs to real speech) and
-                # natural segment boundaries (each speaker = own line). Fall
-                # back to the miner's ASR cues if transcription fails.
-                try:
-                    # If long pauses were trimmed, the out_path timeline is
-                    # shorter than [start_sec, end_sec] of the source — transcribe
-                    # from the trimmed file itself so caption timing matches.
-                    if os.getenv("RENDER_TRIM_REMOVE_LONG_PAUSES", "0") == "1" and os.path.exists(out_path):
-                        transcript_captions = _transcribe_with_whisper(
-                            out_path, 0.0, float(c["end_sec"]) - float(c["start_sec"]), job_dir,
-                        )
-                    else:
-                        transcript_captions = _transcribe_with_whisper(
-                            source,
-                            float(c["start_sec"]),
-                            float(c["end_sec"]),
-                            job_dir,
-                        )
-                    print(f"[render] clip {i}: whisper -> {len(transcript_captions)} segments", flush=True)
-                except Exception as e:  # noqa: BLE001
-                    print(f"[render] clip {i}: whisper failed ({e}), using ASR cues", flush=True)
+                # Hardening v3 D2 (#22/#25): use TRUSTED canonical word timing
+                # directly — skip full Whisper. Cue-only captions stay as the
+                # canonical cues (forced-alignment/Whisper is only a fallback
+                # when there is no trusted transcript at all).
+                trusted_word_timing = bool(c.get("has_word_timing")) and float(c.get("alignment_confidence") or 0) >= float(os.getenv("RENDER_CAPTION_CONFIDENCE_THRESHOLD", "0.5"))
+                if trusted_word_timing:
                     transcript_captions = c["captions"]
+                    print(f"[render] clip {i}: using canonical word timing ({c.get('provider', 'unknown')} v{c.get('transcript_version', '')})", flush=True)
+                else:
+                    try:
+                        # Phase 4: transcribe the clip with faster-whisper for
+                        # precise word-level timing. Fall back to the miner's
+                        # ASR cues if transcription fails.
+                        if os.getenv("RENDER_TRIM_REMOVE_LONG_PAUSES", "0") == "1" and os.path.exists(out_path):
+                            transcript_captions = _transcribe_with_whisper(
+                                out_path, 0.0, float(c["end_sec"]) - float(c["start_sec"]), job_dir,
+                                language=c.get("language") or "",
+                            )
+                        else:
+                            transcript_captions = _transcribe_with_whisper(
+                                source,
+                                float(c["start_sec"]),
+                                float(c["end_sec"]),
+                                job_dir,
+                                language=c.get("language") or "",
+                            )
+                        print(f"[render] clip {i}: whisper -> {len(transcript_captions)} segments", flush=True)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[render] clip {i}: whisper failed ({e}), using ASR cues", flush=True)
+                        transcript_captions = c["captions"]
 
                 # Phase 6: speaker diarization — tag each caption line with a
                 # speaker so colors differ per speaker. Optional; on failure

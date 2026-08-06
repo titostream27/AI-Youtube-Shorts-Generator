@@ -85,6 +85,79 @@ class TestReservationErrors(V3Base):
         self.assertEqual(winner, "job-a")
 
 
+class TestCaptionCanonicalPolicy(unittest.TestCase):
+    """D2/D3 (#22/#23/#25) — trusted timing bypasses Whisper; language
+    propagates; synthetic hints are marked."""
+
+    def test_trusted_word_timing_skips_whisper(self):
+        from render_contract import CaptionCue, CaptionPlan, RenderRequestV2, V2Clip
+        from render_service import _normalize_clips
+        clip = V2Clip(
+            clip_id=1, start_sec=1.0, end_sec=5.0, title="t",
+            caption_plan=CaptionPlan(
+                language="id",
+                provider="youtube_manual",
+                transcript_version="v3",
+                alignment_confidence=0.94,
+                cues=[CaptionCue(start_sec=1.0, end_sec=3.0, text="halo dunia", words=[])],
+                highlight_terms=[],
+            ),
+        )
+        req = RenderRequestV2(contract_version="2.0", request_id="r", episode_id="e",
+                              video_url="https://y", mode="final", clips=[clip])
+        normalized = _normalize_clips(req)
+        c = normalized[0]
+        # Canonical words, language + provenance must survive normalization.
+        self.assertEqual(c["language"], "id")
+        self.assertEqual(c["provider"], "youtube_manual")
+        self.assertEqual(c["alignment_confidence"], 0.94)
+        # No word timing -> has_word_timing False -> whisper fallback allowed.
+        self.assertFalse(c["has_word_timing"])
+
+    def test_canonical_words_survive_normalization(self):
+        from render_contract import CaptionCue, CaptionPlan, CaptionWord, RenderRequestV2, V2Clip
+        from render_service import _normalize_clips
+        clip = V2Clip(
+            clip_id=1, start_sec=1.0, end_sec=5.0, title="t",
+            caption_plan=CaptionPlan(
+                language="en", provider="youtube_manual", transcript_version="v2",
+                alignment_confidence=0.98,
+                cues=[CaptionCue(
+                    start_sec=1.0, end_sec=3.0, text="the company",
+                    words=[CaptionWord(start_sec=1.0, end_sec=1.4, text="the"),
+                           CaptionWord(start_sec=1.4, end_sec=3.0, text="company")],
+                )],
+                highlight_terms=[],
+            ),
+        )
+        req = RenderRequestV2(contract_version="2.0", request_id="r", episode_id="e",
+                              video_url="https://y", mode="final", clips=[clip])
+        c = _normalize_clips(req)[0]
+        self.assertTrue(c["has_word_timing"])
+        # Words preserved with their timing inside the clip.
+        words = c["captions"][0].words
+        self.assertEqual(len(words), 2)
+        self.assertEqual(words[0].text, "the")
+        self.assertEqual(words[0].start_sec, 1.0)
+
+    def test_whisper_never_forced_english_when_language_present(self):
+        from unittest.mock import patch
+        from render_service import _transcribe_with_whisper
+        import render_service as rs
+
+        class FakeModel:
+            def transcribe(self, path, **kw):
+                captured["kwargs"] = kw
+                return [], None
+
+        captured = {}
+        with patch.object(rs, "_get_whisper_model", return_value=FakeModel()), \
+             patch("subprocess.run", return_value=None), \
+             patch("os.path.exists", return_value=True):
+            _transcribe_with_whisper("src.mp4", 0.0, 5.0, "/tmp", language="id")
+        self.assertEqual(captured["kwargs"].get("language"), "id")
+
+
 class TestTimelineStateAt(unittest.TestCase):
     """B3 finding #11/#12 — time-indexed timeline + state_at(t)."""
 
