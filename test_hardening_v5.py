@@ -249,6 +249,14 @@ class TestRetryLineage(V5Base):
 class TestForceRerenderIdentity(V5Base):
     """T-R12 — force rerender same request_id, new attempt, no idempotency hit."""
 
+    def test_force_lookup_db_failure_fails_request(self):
+        """Brief v5 4.7: a DB failure while loading the previous attempt must
+        FAIL the request, never be treated as previous-not-found."""
+        with mock.patch.object(rs, "_db_conn", side_effect=RuntimeError("db gone")):
+            with self.assertRaises(rs.PersistenceError):
+                rs._reserve_job("v5-dbfail", "jf", mode="final", episode_id="e",
+                                request_json="{}", force=True)
+
     def test_force_new_attempt_same_request(self):
         body = dict(V2_BODY)
         body["request_id"] = "v5-force"

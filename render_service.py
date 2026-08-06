@@ -645,9 +645,13 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
                     prev_attempt = row[2] if row[2] is not None else 0
                     if row[1] in ("queued", "downloading", "analysing", "rendering", "quality_check"):
                         active_job = row[0]
-        except Exception:  # noqa: BLE001
-            prev_job = None
-            prev_attempt = 0
+        except Exception as e:  # noqa: BLE001
+            # Brief v5 4.7: a database failure while loading the previous
+            # attempt must FAIL the request — it is NOT 'previous job not
+            # found'. Treating it as prev_attempt=0 would silently reset the
+            # lineage and could produce attempt collisions.
+            _record_db_error("reserve_job_force_lookup", e)
+            raise PersistenceError(f"failed to load previous attempt for {request_id}: {e}") from e
         if active_job is not None:
             # A forced rerender must not race an ALREADY ACTIVE attempt: the
             # partial unique index only allows one non-terminal row per
