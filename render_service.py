@@ -559,23 +559,27 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
             _record_db_error("reserve_job_no_request_id", e)
             raise
     if force:
-        # Forced attempt: do NOT consult the active-row unique index as an
-        # idempotent hit. Find the latest prior attempt for lineage only.
+        # Forced attempt (brief v4 F5): do NOT consult the active-row unique
+        # index as an idempotent hit. Find the latest prior attempt for
+        # lineage AND monotonic attempt numbering (1,2,3,...).
         prev_job = None
+        prev_attempt = 0
         active_job = None
         try:
             with _db_lock, _db_conn() as conn:
                 row = conn.execute(
-                    "SELECT job_id, status FROM render_jobs WHERE request_id = ? "
+                    "SELECT job_id, status, attempt FROM render_jobs WHERE request_id = ? "
                     "ORDER BY created_at DESC LIMIT 1",
                     (request_id,),
                 ).fetchone()
                 if row:
                     prev_job = row[0]
+                    prev_attempt = row[2] if row[2] is not None else 0
                     if row[1] in ("queued", "downloading", "analysing", "rendering", "quality_check"):
                         active_job = row[0]
         except Exception:  # noqa: BLE001
             prev_job = None
+            prev_attempt = 0
         if active_job is not None:
             # A forced rerender must not race an ALREADY ACTIVE attempt: the
             # partial unique index only allows one non-terminal row per
@@ -584,6 +588,7 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
                 f"force_rerender rejected: request_id {request_id} already has "
                 f"active job {active_job}; cancel it before forcing a rerender"
             )
+        new_attempt = prev_attempt + 1
         try:
             with _db_lock, _db_conn() as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -592,8 +597,8 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
                     "INSERT INTO render_jobs "
                     "(job_id, status, mode, episode_id, request, response, error, created_at, updated_at,"
                     " request_id, parent_job_id, attempt, started_at, finished_at, last_error_stage) "
-                    "VALUES (?, 'queued', ?, ?, ?, '', '', ?, ?, ?, ?, 1, NULL, NULL, NULL)",
-                    (new_job_id, mode, episode_id, request_json, now, now, request_id, prev_job),
+                    "VALUES (?, 'queued', ?, ?, ?, '', '', ?, ?, ?, ?, ?, NULL, NULL, NULL)",
+                    (new_job_id, mode, episode_id, request_json, now, now, request_id, prev_job, new_attempt),
                 )
                 conn.commit()
                 return new_job_id
