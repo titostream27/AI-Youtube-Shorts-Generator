@@ -528,6 +528,7 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
     call inserted the fresh row.
     """
     import datetime
+    import sqlite3
     if not request_id:
         return new_job_id
     try:
@@ -552,7 +553,9 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
             )
             conn.commit()
             return new_job_id
-    except Exception:  # noqa: BLE001  (unique violation = another thread won)
+    except sqlite3.IntegrityError:
+        # DUPLICATE-ACTIVE-REQUEST race: exactly this exception is the
+        # 'another thread won the reservation' signal. Re-read the winner.
         try:
             conn.rollback()
         except Exception:  # noqa: BLE001
@@ -566,8 +569,18 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
                     (request_id,),
                 ).fetchone()
                 return row[0] if row else new_job_id
+        except Exception as e2:  # noqa: BLE001
+            _record_db_error("reserve_job_refind", e2)
+            raise
+    except Exception as e:  # noqa: BLE001
+        # ANY other database failure (lock, I/O, schema) must NOT be mistaken
+        # for a duplicate race. Fail reservation and make it visible.
+        try:
+            conn.rollback()
         except Exception:  # noqa: BLE001
-            return new_job_id
+            pass
+        _record_db_error("reserve_job", e)
+        raise
 
 
 def _load_job_request(job_id: str) -> Optional[Dict]:
