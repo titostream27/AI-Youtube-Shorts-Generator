@@ -350,11 +350,12 @@ class TestBrief2RendererCorrectness(JobLifecycleTestBase):
         entered = threading.Event()
 
         def fake_render(request, job_id):
-            # Mirror what the real _render does via transition_job (F4).
-            rs.transition_job(job_id, "rendering", mode="final", episode_id="ep-1")
-            entered.set()
-            time.sleep(0.4)
-            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
+                    # Worker already won queued -> downloading; mirror the internal
+                    # transition that the real _render performs next (F4).
+                    rs.transition_job(job_id, "downloading", "rendering", mode="final", episode_id="ep-1")
+                    entered.set()
+                    time.sleep(0.4)
+                    return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
 
         with mock.patch.object(rs, "_render", side_effect=fake_render):
             resp = rs.render_async(dict(V2_BODY))
@@ -373,10 +374,10 @@ class TestBrief2RendererCorrectness(JobLifecycleTestBase):
         entered = threading.Event()
 
         def fake_render(request, job_id):
-            rs.transition_job(job_id, "rendering", mode="final", episode_id="ep-1")
-            entered.set()
-            time.sleep(0.5)
-            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
+                    rs.transition_job(job_id, "downloading", "rendering", mode="final", episode_id="ep-1")
+                    entered.set()
+                    time.sleep(0.5)
+                    return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
 
         with mock.patch.object(rs, "_render", side_effect=fake_render):
             resp = rs.render_async(dict(V2_BODY))

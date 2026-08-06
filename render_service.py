@@ -131,13 +131,33 @@ def _record_db_error(stage: str, error: Exception) -> None:
 # lock serializes every read/write so _reserve_job's BEGIN IMMEDIATE can
 # never interleave with another thread's statements.
 _db_lock = threading.Lock()
-ACTIVE_JOB_STATES = frozenset(
+ATOMIC_JOB_STATES = frozenset(
     {"queued", "downloading", "analysing", "rendering", "quality_check"}
 )
 TERMINAL_JOB_STATES = frozenset(
     {"completed", "failed", "partial_failure", "cancelled", "orphaned"}
 )
-ALL_JOB_STATES = ACTIVE_JOB_STATES | TERMINAL_JOB_STATES
+ALL_JOB_STATES = ATOMIC_JOB_STATES | TERMINAL_JOB_STATES
+
+# Re-export the historical name for API compatibility; both refer to the same
+# active set. Code should prefer the ATOMIC_* name.
+ACTIVE_JOB_STATES = ATOMIC_JOB_STATES
+
+# Hardening sprint P1.R1: canonical allowed-transition map. Every memory and
+# SQLite state update MUST route through transition_job() which enforces it.
+# Terminal states are sinks — no outgoing edges.
+ALLOWED_TRANSITIONS: Dict[str, frozenset] = {
+    "queued": frozenset({"downloading", "cancelled"}),
+    "downloading": frozenset({"analysing", "failed"}),
+    "analysing": frozenset({"rendering", "failed"}),
+    "rendering": frozenset({"quality_check", "failed"}),
+    "quality_check": frozenset({"completed", "partial_failure", "failed"}),
+    "completed": frozenset(),
+    "partial_failure": frozenset(),
+    "failed": frozenset(),
+    "cancelled": frozenset(),
+    "orphaned": frozenset(),
+}
 
 # Legacy status values -> canonical (Phase 1 §5.2). Existing DB rows and old
 # clients may use the old names; we normalize at read/write boundaries.
@@ -332,25 +352,65 @@ def _extract_request_id(request_json: str) -> str:
     return ""
 
 
-def transition_job(job_id: str, status: str, *, mode: str = "final",
-                   episode_id: str = "") -> None:
-    """Atomically move a job to a NON-terminal state in memory + SQLite.
+def _transition_allowed(expected: str, target: str) -> bool:
+    expected = canonical_status(expected)
+    target = canonical_status(target)
+    return target in ALLOWED_TRANSITIONS.get(expected, frozenset())
 
-    Phase-2 correctness (F4): _render performs downloading/analysing/
-    rendering/quality_check transitions in SQLite, but the in-memory
-    registry stayed 'queued' — making /status lie and cancellation hit
-    active renders. This helper keeps the two views in lockstep.
 
-    Only active states are allowed here; terminal persistence belongs
-    exclusively to the orchestration layer (RenderOutcome).
+def transition_job(job_id: str, expected: str, target: str, *, mode: str = "final",
+                   episode_id: str = "", error: str = "") -> bool:
+    """Compare-and-swap job state transition (hardening sprint P0.1/P1.R1).
+
+    Atomically verifies that BOTH the in-memory registry and the persisted
+    SQLite row are in `expected` and that `expected -> target` is allowed by
+    the canonical map; only then updates both stores. Returns True iff the
+    swap won. A losing caller observes the state change through the next
+    read — no code path checks state and changes it outside this operation.
+
+    Terminal states are sinks (no outgoing edges) and therefore immutable.
+    `error` is persisted alongside the target state (used by cancellation).
     """
-    status = canonical_status(status)
-    assert status in ACTIVE_JOB_STATES, f"transition_job only for active states, got {status!r}"
+    import sqlite3
+    import datetime
+    expected = canonical_status(expected)
+    target = canonical_status(target)
+    if not _transition_allowed(expected, target):
+        return False
+
     with _async_jobs_lock:
         job = _async_jobs.get(job_id)
-        if job is not None and job.get("state") != "cancelled":
-            job["state"] = status
-    _persist_job(job_id, status, mode=mode, episode_id=episode_id)
+        mem_state = canonical_status(job.get("state", "")) if job else None
+        # Verify persisted state under the same orchestration lock so no
+        # interleaved transition can slip between the two reads.
+        try:
+            with _db_lock, _db_conn() as conn:
+                row = conn.execute(
+                    "SELECT status FROM render_jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                db_state = canonical_status(row[0]) if row else None
+                if db_state != expected:
+                    return False
+                if mem_state != expected:
+                    return False
+                now = datetime.datetime.utcnow().isoformat()
+                if error:
+                    conn.execute(
+                        "UPDATE render_jobs SET status = ?, error = ?, updated_at = ? WHERE job_id = ?",
+                        (target, error, now, job_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE render_jobs SET status = ?, updated_at = ? WHERE job_id = ?",
+                        (target, now, job_id),
+                    )
+                conn.commit()
+        except Exception as e:  # noqa: BLE001
+            _record_db_error("transition_job", e)
+            return False
+        if job is not None:
+            job["state"] = target
+        return True
 
 
 def _load_job(job_id: str) -> Optional[Dict]:
@@ -1786,16 +1846,15 @@ def _render(request, job_id: str) -> RenderOutcome:
         output_w = min(output_w, int(os.getenv("RENDER_PREVIEW_WIDTH", "540")))
         output_h = min(output_h, int(os.getenv("RENDER_PREVIEW_HEIGHT", "960")))
 
-    transition_job(job_id, "downloading", mode=mode, episode_id=episode_id)
-
-    # 1. Download once (cached by video id).
+    # The caller (async worker / sync / retry worker) owns the queued ->
+    # downloading CAS. _render assumes it already won and proceeds.
     try:
         source = download_youtube_local(
             request.video_url,
             fmt=FORMAT,
             out_dir=str(RENDER_ROOT / "source"),
         )
-        transition_job(job_id, "analysing", mode=mode, episode_id=episode_id)
+        transition_job(job_id, "downloading", "analysing", mode=mode, episode_id=episode_id)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"download failed: {e}") from e
 
@@ -1830,7 +1889,7 @@ def _render(request, job_id: str) -> RenderOutcome:
     start = time.time()
     rendered = []
     artifacts = []
-    transition_job(job_id, "rendering", mode=mode, episode_id=episode_id)
+    transition_job(job_id, "analysing", "rendering", mode=mode, episode_id=episode_id)
     for i, c in enumerate(clips, 1):
         out_path = os.path.join(job_dir, f"short_{i:02d}.mp4")
         item = {
@@ -2142,7 +2201,7 @@ def _render(request, job_id: str) -> RenderOutcome:
             # Run QC on the FINAL file (after hook + final encode + mastering).
             # When QC_BLOCK_UPLOAD=1 and the video fails, mark the clip failed
             # so the publisher refuses to upload.
-            transition_job(job_id, "quality_check", mode=mode, episode_id=episode_id)
+            transition_job(job_id, "rendering", "quality_check", mode=mode, episode_id=episode_id)
             try:
                 from quality_gate import quality_gate
                 qc = quality_gate(out_path)
@@ -2438,22 +2497,20 @@ def render_async(request: Dict[str, Any]):
 
     def worker():
         global _render_busy
-        cancelled_before_render = False
         try:
             _render_lock.acquire()
             _render_busy = True
             try:
-                # Phase 1 §5.4: re-check cancellation AFTER acquiring the lock.
-                with _async_jobs_lock:
-                    job = _async_jobs.get(job_id)
-                    if job and job.get("state") == "cancelled":
-                        cancelled_before_render = True
-                if not cancelled_before_render:
+                # P0.1: the worker wins ONLY through queued -> downloading CAS.
+                # If a cancel already won (queued -> cancelled), this fails and
+                # the worker exits without rendering. No check-then-act.
+                won = transition_job(job_id, "queued", "downloading", mode=mode, episode_id=episode_id)
+                if won:
                     outcome = _render(request, job_id)
             finally:
                 _render_busy = False
                 _render_lock.release()
-            if cancelled_before_render:
+            if not won:
                 return
             # Phase-2 correctness: terminal status is persisted HERE, once,
             # BEFORE the memory registry is updated, so a caller that sees
@@ -2473,55 +2530,55 @@ def render_async(request: Dict[str, Any]):
 
 @app.post("/api/render/jobs/{job_id}/cancel")
 def render_job_cancel(job_id: str):
-    """Cancel a QUEUED job (Phase 1 §5.4).
+    """Cancel a QUEUED job (Phase 1 §5.4, hardening sprint P0.1).
 
-    - queued (waiting for the render lock): cancelled, worker will not render.
+    - queued (waiting for the render lock): cancelled IF the queued ->
+      cancelled CAS wins. A worker that already won queued -> downloading
+      makes this cancel return 409 (first transition wins).
     - rendering (already running): NOT supported in Phase 1 — no active
       FFmpeg cancellation. Return 409 conflict so the caller knows the job
       will finish.
     - terminal: return current state unchanged.
     """
+    won = transition_job(job_id, "queued", "cancelled", error="cancelled by user")
+    if won:
+        return {"job_id": job_id, "state": "cancelled"}
+
+    state = None
     with _async_jobs_lock:
         job = _async_jobs.get(job_id)
         if job:
             state = canonical_status(job.get("state", ""))
-            # Phase-2 correctness (F5): only QUEUED jobs may be cancelled in
-            # this phase. Any active job (downloading/analysing/rendering/
-            # quality_check) returns 409 — memory state now mirrors SQLite
-            # via transition_job, so an active render is never cancelled.
-            if state == "queued":
-                job["state"] = "cancelled"
-                _persist_job(job_id, "cancelled", error="cancelled by user")
-                return {"job_id": job_id, "state": "cancelled"}
-            if state in ACTIVE_JOB_STATES:
-                return JSONResponse(
-                    status_code=409,
-                    content={"job_id": job_id, "state": state,
-                             "error": "active render cancellation not supported in Phase 1"},
-                )
-            return {"job_id": job_id, "state": state}
-    stored = _load_job(job_id)
-    if not stored:
-        raise HTTPException(status_code=404, detail="job not found")
-    if stored["status"] == "queued":
-        _persist_job(job_id, "cancelled", error="cancelled by user")
-        return {"job_id": job_id, "state": "cancelled"}
-    if is_active(stored["status"]):
+    if not state:
+        stored = _load_job(job_id)
+        if not stored:
+            raise HTTPException(status_code=404, detail="job not found")
+        state = stored["status"]
+    if is_active(state):
         return JSONResponse(
             status_code=409,
-            content={"job_id": job_id, "state": stored["status"],
+            content={"job_id": job_id, "state": state,
                      "error": "active render cancellation not supported in Phase 1"},
         )
-    return {"job_id": job_id, "state": stored["status"]}
+    return {"job_id": job_id, "state": state}
 
 
 @app.post("/api/render/jobs/{job_id}/retry")
 def render_job_retry(job_id: str):
     """Re-queue a FAILED or PARTIAL_FAILURE job using its original request.
-    Returns the NEW job id (the old one is kept for history)."""
+    Returns the NEW job id (the old one is kept for history).
+
+    Hardening sprint P1.R2: only failed and partial_failure may be retried.
+    Completed, queued, rendering and cancelled require a different action and
+    are rejected with 409 / 400.
+    """
     stored = _load_job(job_id)
     if not stored:
         raise HTTPException(status_code=404, detail="job not found")
+    src_status = canonical_status(stored["status"])
+    if src_status not in ("failed", "partial_failure"):
+        # Not retryable. Report the actual state for the caller.
+        raise HTTPException(status_code=409, detail=f"job is {src_status}; retry only allowed from failed or partial_failure")
     original = _load_job_request(job_id)
     if not original:
         raise HTTPException(status_code=400, detail="original request not available for retry")
@@ -2553,22 +2610,18 @@ def render_job_retry(job_id: str):
 
     def worker():
         global _render_busy
-        cancelled_before_render = False
         try:
             _render_lock.acquire()
             _render_busy = True
             try:
-                # Phase 1 §5.4: re-check cancellation after acquiring the lock.
-                with _async_jobs_lock:
-                    job = _async_jobs.get(new_job_id)
-                    if job and job.get("state") == "cancelled":
-                        cancelled_before_render = True
-                if not cancelled_before_render:
+                # P0.1: retry worker also wins only through queued -> downloading CAS.
+                won = transition_job(new_job_id, "queued", "downloading", mode=mode, episode_id=episode_id)
+                if won:
                     outcome = _render(request, new_job_id)
             finally:
                 _render_busy = False
                 _render_lock.release()
-            if cancelled_before_render:
+            if not won:
                 return
             # Phase-2 correctness: persist BEFORE updating memory (durable
             # state is the source of truth for terminal status).
@@ -2614,6 +2667,8 @@ def render(request: Dict[str, Any]):
     _render_lock.acquire()
     _render_busy = True
     try:
+        # P0.1: sync renderer also wins through queued -> downloading CAS.
+        transition_job(job_id, "queued", "downloading", mode=mode, episode_id=episode_id)
         outcome = _render(request, job_id)
     finally:
         _render_busy = False
