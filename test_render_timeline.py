@@ -43,6 +43,26 @@ class TestRenderTimeline(unittest.TestCase):
         self.assertEqual(d["frames"][0]["frame_no"], 1)
         self.assertEqual(d["frames"][0]["t_sec"], 0.033)
 
+    def test_focus_switch_count_and_ping_pong(self):
+        """T16: behavioral focus outcomes — switch count matches, ping-pong
+        detected only for A->B->A alternation, no false positive for a stable
+        hold or a monotonic sequence."""
+        from shorts_generator.local.clipper import detect_ping_pong, count_focus_switches
+
+        # Stable single speaker: 0 switches.
+        self.assertEqual(count_focus_switches([(1, 10), (1, 20), (1, 30)]), 0)
+        # One clean switch A->B: 1 switch, no ping-pong.
+        history = [(1, 10), (1, 20), (2, 30), (2, 40)]
+        self.assertEqual(count_focus_switches(history), 1)
+        self.assertFalse(detect_ping_pong(history))
+        # A->B->A within the last 3 entries: ping-pong.
+        self.assertTrue(detect_ping_pong([(1, 10), (2, 20), (1, 30)]))
+        # Monotonic A->B->C is NOT ping-pong.
+        self.assertFalse(detect_ping_pong([(1, 10), (2, 20), (3, 30)]))
+        # Empty history is safe.
+        self.assertEqual(count_focus_switches([]), 0)
+        self.assertFalse(detect_ping_pong([]))
+
     def test_crop_clip_local_returns_tuple_when_requested(self):
         """return_timeline=True returns (path, RenderTimeline)."""
         from shorts_generator.local import clipper

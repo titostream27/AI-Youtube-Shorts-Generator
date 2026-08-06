@@ -858,11 +858,8 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                 cut = max(cut, (-(focus_track["cy"] - focus_track["h"] / 2)) / max(1, focus_track["h"]))
             _RENDER_STATS["face_cutoff_ratio"] = max(float(_RENDER_STATS["face_cutoff_ratio"]), min(1.0, cut))
         # Ping-pong: 3+ switches between the same two tracks within 1s.
-        if len(switch_history) >= 3:
-            recent = switch_history[-3:]
-            ids = [s[0] for s in recent]
-            if ids[0] is not None and ids[0] == ids[2] and ids[1] is not None and ids[1] != ids[0]:
-                _RENDER_STATS["focus_ping_pong_detected"] = True
+        if detect_ping_pong(switch_history):
+            _RENDER_STATS["focus_ping_pong_detected"] = True
 
         if det is not None:
             # Anti-shake stage 1: median of recent detections (kills outliers).
@@ -1499,6 +1496,36 @@ def _cache_key(source_path: str, start_time: float, end_time: float, aspect_rati
         out_w = os.getenv("RENDER_OUTPUT_WIDTH", "1080")
         out_h = os.getenv("RENDER_OUTPUT_HEIGHT", "1920")
     return f"{src}_{start_time:.2f}_{end_time:.2f}_{ratio}_{out_w}x{out_h}.mp4"
+
+
+def detect_ping_pong(switch_history) -> bool:
+    """True when the last 3 focus switches alternate A->B->A (camera swinging
+    between the same two speakers)."""
+    if not switch_history or len(switch_history) < 3:
+        return False
+    recent = switch_history[-3:]
+    ids = [s[0] for s in recent]
+    return (
+        ids[0] is not None
+        and ids[0] == ids[2]
+        and ids[1] is not None
+        and ids[1] != ids[0]
+    )
+
+
+def count_focus_switches(switch_history) -> int:
+    """Number of focus-track switches (consecutive track changes)."""
+    n = 0
+    prev = None
+    for track_id, _frame in switch_history:
+        if track_id is not None and track_id != prev:
+            n += 1
+            prev = track_id
+    # count_focus_switches treats the FIRST track as the initial focus, so a
+    # single stable track yields 0 switches; each change to a different track +1.
+    if n > 0:
+        return n - 1
+    return 0
 
 
 def _default_profile_version() -> str:
