@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Renderer contract fixtures live in the MINER repo (shared source of
+      # truth). Check both out in the workspace layout the tests expect:
+      # <parent>/content-miner/contracts + AI-Youtube-Shorts-Generator.
+      - uses: actions/checkout@v4
+        with:
+          path: AI-Youtube-Shorts-Generator
+
+      - name: Checkout miner (shared contract fixtures)
+        uses: actions/checkout@v4
+        with:
+          repository: titostream27/youtube-content-miner
+          path: content-miner
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt 2>/dev/null || pip install pydantic fastapi pytest opencv-python-headless numpy
+
+      - name: Lifecycle + contract + cache + timeline tests
+        working-directory: AI-Youtube-Shorts-Generator
+        run: python -m pytest test_render_contract.py test_contract_fixtures.py test_job_lifecycle.py test_render_timeline.py test_hardening_sprint.py test_cache_timeline.py test_hardening_v3.py test_hardening_v4.py -q
+
+      - name: Shared contract fixtures must be present (fail, not skip)
+        working-directory: AI-Youtube-Shorts-Generator
+        run: |
+          test -f ../content-miner/contracts/fixtures/manifest.json
+          test -f ../content-miner/contracts/render-result-v2.schema.json
