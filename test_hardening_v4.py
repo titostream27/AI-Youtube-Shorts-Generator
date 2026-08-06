@@ -201,6 +201,62 @@ class TestForceAttemptIncrement(V4Base):
         self.assertEqual(rows[3][2], rows[2][0])
 
 
+class TestQueueAndOrphan(V4Base):
+    """F18/F19 — bounded queue worker + process-ownership orphan detection."""
+
+    def test_submission_enqueues_instead_of_spawning_threads(self):
+        """F18: N async submissions must not create N worker threads — a
+        single persistent worker consumes the queue."""
+        before = threading.active_count()
+        patcher = mock.patch.object(rs, "_render", side_effect=lambda r, j: rs.RenderOutcome(
+            rs.RenderResponse(job_id=j, source_video="", rendered=[]), "completed"))
+        patcher.start()
+        try:
+            jobs = []
+            for i in range(5):
+                body = dict(V2_BODY)
+                body["request_id"] = f"v4-q-{i}"
+                resp = rs.render_async(body)
+                jobs.append(resp.job_id)
+            # All enqueued (queue depth grows; no immediate thread explosion).
+            self.assertLessEqual(threading.active_count(), before + 2)
+            for jid in jobs:
+                self.assertTrue(wait_until(lambda jid=jid: rs._async_jobs.get(jid, {}).get("state") in ("completed", "failed")))
+        finally:
+            patcher.stop()
+
+    def test_fresh_current_process_job_never_orphaned(self):
+        """F19: a newly reserved job from THIS process boot must stay active —
+        orphan detection must not mark it."""
+        rs._reserve_job("req-orph-1", "job-fresh", mode="final", episode_id="ep", request_json="{}")
+        # Remove from memory to simulate a DB-only read (e.g. queue worker not
+        # yet registered), then query status: must NOT become orphaned.
+        with rs._async_jobs_lock:
+            rs._async_jobs.pop("job-fresh", None)
+        with rs._db_lock, rs._db_conn() as conn:
+            conn.execute("UPDATE render_jobs SET process_boot_id=? WHERE job_id='job-fresh'", (rs.PROCESS_BOOT_ID,))
+            conn.commit()
+        # Direct status logic via stored row: is_active + same boot -> active.
+        stored = rs._load_job("job-fresh")
+        self.assertEqual(stored["process_boot_id"], rs.PROCESS_BOOT_ID)
+        self.assertTrue(rs.is_active(stored["status"]))
+        # _job_older_than helper sanity.
+        self.assertTrue(rs._job_older_than("2020-01-01T00:00:00", 300))
+        self.assertFalse(rs._job_older_than("2099-01-01T00:00:00", 300))
+
+    def test_foreign_boot_active_job_is_orphanable(self):
+        """F19: a stale ACTIVE row owned by a DIFFERENT boot id must be
+        orphanable via the status path."""
+        rs._reserve_job("req-orph-2", "job-stale", mode="final", episode_id="ep", request_json="{}")
+        with rs._db_lock, rs._db_conn() as conn:
+            conn.execute("UPDATE render_jobs SET process_boot_id='deadboot' WHERE job_id='job-stale'")
+            conn.commit()
+        with rs._async_jobs_lock:
+            rs._async_jobs.pop("job-stale", None)
+        resp = rs.render_job_status("job-stale")
+        self.assertEqual(resp["state"], "orphaned")
+
+
 class TestFinalEncodeFailure(V4Base):
     """F10 — double final-encode failure must not expose lossless intermediate."""
 

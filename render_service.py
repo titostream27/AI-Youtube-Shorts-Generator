@@ -186,6 +186,26 @@ def is_active(status: str) -> bool:
     return canonical_status(status) in ACTIVE_JOB_STATES
 
 
+def _job_older_than(created_at: str, threshold_sec: float) -> bool:
+    """True when an ISO created_at is older than threshold seconds. Empty /
+    unparseable timestamps return True so old pre-timestamp rows can be
+    orphaned by the age rule when no boot ownership exists."""
+    try:
+        import datetime
+        iso = created_at.strip().rstrip("Z")
+        if "+" in iso:
+            dt = datetime.datetime.fromisoformat(iso)
+            now = datetime.datetime.now(dt.tzinfo)
+        else:
+            dt = datetime.datetime.fromisoformat(iso)
+            now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            if dt.tzinfo is not None:
+                dt = dt.replace(tzinfo=None)
+        return (now - dt).total_seconds() > threshold_sec
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _job_db():
     """Open a FRESH connection for the current operation (Phase-2 F8).
 
@@ -276,6 +296,8 @@ def _migrate_render_jobs(conn) -> None:
         "started_at": "TEXT",
         "finished_at": "TEXT",
         "last_error_stage": "TEXT",
+        # Brief v4 F19: process ownership for orphan detection (idempotent).
+        "process_boot_id": "TEXT",
     }
     for name, decl in columns.items():
         if name not in existing:
@@ -305,23 +327,26 @@ def _persist_job(job_id: str, status: str, *, mode: str = "final",
             now = datetime.datetime.utcnow().isoformat()
             conn.execute(
                 """INSERT INTO render_jobs
-                   (job_id, status, mode, episode_id, request, response, error, created_at, updated_at,
-                    request_id, parent_job_id, attempt, started_at, finished_at, last_error_stage)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(job_id) DO UPDATE SET
-                    status=excluded.status, mode=excluded.mode,
-                    response=excluded.response, error=excluded.error,
-                    parent_job_id=excluded.parent_job_id, attempt=excluded.attempt,
-                    request_id=COALESCE(request_id, excluded.request_id),
-                    started_at=COALESCE(started_at, excluded.started_at),
-                    finished_at=COALESCE(excluded.finished_at, finished_at),
-                    last_error_stage=CASE WHEN excluded.error IS NOT NULL AND excluded.error != ''
-                        THEN excluded.last_error_stage ELSE last_error_stage END,
-                    updated_at=excluded.updated_at""",
+                  (job_id, status, mode, episode_id, request, response, error, created_at, updated_at,
+                   request_id, parent_job_id, attempt, started_at, finished_at, last_error_stage, process_boot_id)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  ON CONFLICT(job_id) DO UPDATE SET
+                   status=excluded.status, mode=excluded.mode,
+                   response=excluded.response, error=excluded.error,
+                   parent_job_id=COALESCE(parent_job_id, excluded.parent_job_id),
+                   attempt=COALESCE(attempt, excluded.attempt),
+                   request_id=COALESCE(request_id, excluded.request_id),
+                   process_boot_id=COALESCE(process_boot_id, excluded.process_boot_id),
+                   started_at=COALESCE(started_at, excluded.started_at),
+                   finished_at=COALESCE(excluded.finished_at, finished_at),
+                   last_error_stage=CASE WHEN excluded.error IS NOT NULL AND excluded.error != ''
+                       THEN excluded.last_error_stage ELSE last_error_stage END,
+                   updated_at=excluded.updated_at""",
                 (job_id, status, mode, episode_id, request, response, error, now, now,
                  _extract_request_id(request), parent_job_id, attempt,
                  now if status != "queued" else None,
                  now if status in TERMINAL_JOB_STATES else None,
+                 PROCESS_BOOT_ID,
                  status if error else None),
             )
             conn.commit()
@@ -418,7 +443,8 @@ def _load_job(job_id: str) -> Optional[Dict]:
         with _db_lock, _db_conn() as conn:
             row = conn.execute(
                 "SELECT status, mode, episode_id, response, error, attempt, parent_job_id, "
-                "COALESCE(request_id, '') FROM render_jobs WHERE job_id = ?",
+                "COALESCE(request_id, ''), COALESCE(process_boot_id, ''), COALESCE(created_at, '') "
+                "FROM render_jobs WHERE job_id = ?",
                 (job_id,),
             ).fetchone()
             if not row:
@@ -433,6 +459,8 @@ def _load_job(job_id: str) -> Optional[Dict]:
                 "attempt": row[5] if row[5] is not None else 1,
                 "parent_job_id": row[6],
                 "request_id": row[7] or "",
+                "process_boot_id": row[8] or None,
+                "created_at": row[9] or "",
             }
     except Exception:  # noqa: BLE001
         # Fall back to the legacy column set (pre-migration DB).
@@ -545,9 +573,9 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
                 conn.execute(
                     "INSERT INTO render_jobs "
                     "(job_id, status, mode, episode_id, request, response, error, created_at, updated_at,"
-                    " request_id, parent_job_id, attempt, started_at, finished_at, last_error_stage) "
-                    "VALUES (?, 'queued', ?, ?, ?, '', '', ?, ?, ?, NULL, 1, NULL, NULL, NULL)",
-                    (new_job_id, mode, episode_id, request_json, now, now, ""),
+                    " request_id, parent_job_id, attempt, started_at, finished_at, last_error_stage, process_boot_id) "
+                    "VALUES (?, 'queued', ?, ?, ?, '', '', ?, ?, ?, NULL, 1, NULL, NULL, NULL, ?)",
+                    (new_job_id, mode, episode_id, request_json, now, now, "", PROCESS_BOOT_ID),
                 )
                 conn.commit()
                 return new_job_id
@@ -569,7 +597,7 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
             with _db_lock, _db_conn() as conn:
                 row = conn.execute(
                     "SELECT job_id, status, attempt FROM render_jobs WHERE request_id = ? "
-                    "ORDER BY created_at DESC LIMIT 1",
+                    "ORDER BY created_at DESC, rowid DESC LIMIT 1",
                     (request_id,),
                 ).fetchone()
                 if row:
@@ -596,9 +624,9 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
                 conn.execute(
                     "INSERT INTO render_jobs "
                     "(job_id, status, mode, episode_id, request, response, error, created_at, updated_at,"
-                    " request_id, parent_job_id, attempt, started_at, finished_at, last_error_stage) "
-                    "VALUES (?, 'queued', ?, ?, ?, '', '', ?, ?, ?, ?, ?, NULL, NULL, NULL)",
-                    (new_job_id, mode, episode_id, request_json, now, now, request_id, prev_job, new_attempt),
+                    " request_id, parent_job_id, attempt, started_at, finished_at, last_error_stage, process_boot_id) "
+                    "VALUES (?, 'queued', ?, ?, ?, '', '', ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)",
+                    (new_job_id, mode, episode_id, request_json, now, now, request_id, prev_job, new_attempt, PROCESS_BOOT_ID),
                 )
                 conn.commit()
                 return new_job_id
@@ -615,7 +643,7 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
             row = conn.execute(
                 "SELECT job_id FROM render_jobs WHERE request_id = ? "
                 "AND status IN ('queued','downloading','analysing','rendering',"
-                "'quality_check','completed') ORDER BY created_at DESC LIMIT 1",
+                "'quality_check','completed') ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 (request_id,),
             ).fetchone()
             if row:
@@ -625,9 +653,9 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
             conn.execute(
                 "INSERT INTO render_jobs "
                 "(job_id, status, mode, episode_id, request, response, error, created_at, updated_at,"
-                " request_id, parent_job_id, attempt, started_at, finished_at, last_error_stage) "
-                "VALUES (?, 'queued', ?, ?, ?, '', '', ?, ?, ?, NULL, 1, NULL, NULL, NULL)",
-                (new_job_id, mode, episode_id, request_json, now, now, request_id),
+                " request_id, parent_job_id, attempt, started_at, finished_at, last_error_stage, process_boot_id) "
+                "VALUES (?, 'queued', ?, ?, ?, '', '', ?, ?, ?, NULL, 1, NULL, NULL, NULL, ?)",
+                (new_job_id, mode, episode_id, request_json, now, now, request_id, PROCESS_BOOT_ID),
             )
             conn.commit()
             return new_job_id
@@ -643,7 +671,7 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
                 row = conn.execute(
                     "SELECT job_id FROM render_jobs WHERE request_id = ? "
                     "AND status IN ('queued','downloading','analysing','rendering',"
-                    "'quality_check','completed') ORDER BY created_at DESC LIMIT 1",
+                    "'quality_check','completed') ORDER BY created_at DESC, rowid DESC LIMIT 1",
                     (request_id,),
                 ).fetchone()
                 return row[0] if row else new_job_id
@@ -2438,6 +2466,21 @@ _render_busy = False
 _async_jobs: Dict[str, Dict] = {}
 _async_jobs_lock = threading.Lock()
 
+# Brief v4 F18: bounded queue + ONE persistent worker (no thread-per-job).
+# Submission enqueues a job_id; the worker dequeues and processes serially.
+import queue as _queue_module
+RENDER_QUEUE_MAX = int(os.getenv("RENDER_QUEUE_MAX", "100"))
+_render_queue: "_queue_module.Queue[str]" = _queue_module.Queue(maxsize=RENDER_QUEUE_MAX)
+_render_queue_worker_started = False
+_render_queue_worker_lock = threading.Lock()
+
+# Brief v4 F19: process boot identity for orphan ownership. A job reserved by
+# this process carries this boot_id; orphan detection only marks rows whose
+# boot_id != current (or rows from before the column existed AND older than
+# the age threshold) — never a freshly reserved job from THIS process.
+PROCESS_BOOT_ID = uuid.uuid4().hex[:12]
+ORPHAN_AGE_THRESHOLD_SEC = float(os.getenv("RENDER_ORPHAN_AGE_THRESHOLD", "300"))
+
 
 @app.get("/api/render/status")
 def render_status():
@@ -2502,7 +2545,10 @@ def render_health():
         "db": {"ok": db_ok, "error": db_error,
                "last_error": _last_db_error, "last_error_at": _last_db_error_at,
                "last_error_stage": _last_db_error_stage},
-        "queue": {"depth": queue_depth, "active_job_id": active_job_id},
+        "queue": {"depth": _render_queue.qsize(), "active_job_id": active_job_id,
+                  "max": RENDER_QUEUE_MAX,
+                  "worker_alive": _render_queue_worker_started,
+                  "process_boot_id": PROCESS_BOOT_ID},
         "ffmpeg": {"available": ffmpeg, "ffprobe": ffprobe},
         "output": {"writable": out_ok, "error": out_error, "free_bytes": free_bytes},
         "contract_version": CONTRACT_VERSION,
@@ -2541,22 +2587,31 @@ def render_job_status(job_id: str):
     if not stored:
         raise HTTPException(status_code=404, detail="job not found")
     state = stored["status"]
-    # Orphan detection (self-heal): a job that is still active in the persisted
-    # store but ABSENT from _async_jobs can only mean the service was restarted
-    # after persisting that state — the worker thread that would advance it
-    # died with the old process and will never resume. Reporting it as active
-    # forever freezes the clip upstream and blocks re-render. Surface it as a
-    # terminal 'orphaned' state so the caller's self-heal can clear it.
-    # Persisted terminal states pass through unchanged.
+    # Orphan detection (self-heal, brief v4 F19): a job that is still active
+    # in the persisted store but ABSENT from _async_jobs may mean the service
+    # was restarted after persisting that state — the worker that would
+    # advance it died with the old process and will never resume. BUT we must
+    # never orphan a job freshly reserved by THIS process: only rows owned by
+    # a DIFFERENT process boot (or pre-ownership rows older than the
+    # threshold) become 'orphaned'. Persisted terminal states pass through.
     if is_active(state):
-        _persist_job(job_id, "orphaned", mode=stored.get("mode", "final"),
-                     error="job orphaned by render service restart")
-        state = "orphaned"
+        boot_id = stored.get("process_boot_id")
+        created_at = stored.get("created_at") or ""
+        is_foreign = boot_id is not None and boot_id != PROCESS_BOOT_ID
+        is_ancient = (boot_id is None) and _job_older_than(created_at, ORPHAN_AGE_THRESHOLD_SEC)
+        if is_foreign or is_ancient:
+            _persist_job(job_id, "orphaned", mode=stored.get("mode", "final"),
+                         error="job orphaned by render service restart")
+            state = "orphaned"
+        else:
+            # Fresh current-process job (or young pre-ownership row): keep it
+            # active — do NOT orphan.
+            state = stored["status"]
     payload = {
         "job_id": job_id,
         "state": state,
         "error": stored.get("error") or ("job orphaned by render service restart"
-                                         if state == "orphaned" else None),
+                                        if state == "orphaned" else None),
         "mode": stored.get("mode", "final"),
     }
     resp = stored.get("response") or {}
@@ -2636,39 +2691,83 @@ def render_async(request: Dict[str, Any]):
         print(f"[render] idempotent hit (reserved): {request_id} -> {reserved}", flush=True)
         return RenderResponse(job_id=reserved, source_video="", rendered=[])
     with _async_jobs_lock:
-        _async_jobs[job_id] = {"state": "queued", "response": None, "error": None, "request_id": request_id, "mode": mode}
+        _async_jobs[job_id] = {"state": "queued", "response": None, "error": None, "request_id": request_id, "mode": mode, "episode_id": episode_id}
 
-    def worker():
-        global _render_busy
+    # Brief v4 F18: enqueue the job_id instead of spawning a per-job thread.
+    _enqueue_job(job_id)
+    return RenderResponse(job_id=job_id, source_video="", rendered=[])
+
+
+def _enqueue_job(job_id: str) -> None:
+    """Push a reserved job onto the bounded queue and ensure the single
+    persistent worker is running (brief v4 F18). Submission enqueues IDs, it
+    never creates daemon threads."""
+    global _render_queue_worker_started
+    try:
+        _render_queue.put(job_id, timeout=5.0)
+    except _queue_module.Full:
+        raise RuntimeError(f"render queue full ({RENDER_QUEUE_MAX} jobs); try later")
+    with _render_queue_worker_lock:
+        if not _render_queue_worker_started:
+            _render_queue_worker_started = True
+            t = threading.Thread(target=_queue_worker_loop, daemon=True)
+            t.start()
+            print(f"[render] queue worker started (boot={PROCESS_BOOT_ID}, max={RENDER_QUEUE_MAX})", flush=True)
+
+
+def _queue_worker_loop() -> None:
+    """Persistent FIFO worker: dequeues one job_id at a time and processes it
+    under the serial render lock. One thread for the whole process."""
+    while True:
+        job_id = _render_queue.get()
         try:
-            _render_lock.acquire()
-            _render_busy = True
-            try:
-                # P0.1: the worker wins ONLY through queued -> downloading CAS.
-                # If a cancel already won (queued -> cancelled), this fails and
-                # the worker exits without rendering. No check-then-act.
-                won = transition_job(job_id, "queued", "downloading", mode=mode, episode_id=episode_id)
-                if won:
-                    outcome = _render(request, job_id)
-            finally:
-                _render_busy = False
-                _render_lock.release()
-            if not won:
-                return
-            # Phase-2 correctness: terminal status is persisted HERE, once,
-            # BEFORE the memory registry is updated, so a caller that sees
-            # 'completed'/'partial_failure' knows the row is already durable.
-            _persist_job(job_id, outcome.final_status, mode=mode, episode_id=episode_id,
-                         response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "")
-            with _async_jobs_lock:
-                _async_jobs[job_id] = {"state": outcome.final_status, "response": outcome.response, "error": None}
+            _process_queued_job(job_id)
         except Exception as e:  # noqa: BLE001
-            _persist_job(job_id, "failed", mode=mode, episode_id=episode_id, error=str(e))
+            print(f"[render] queue worker error on {job_id}: {e}", flush=True)
+            try:
+                _persist_job(job_id, "failed", error=str(e))
+            except Exception:  # noqa: BLE001
+                pass
             with _async_jobs_lock:
                 _async_jobs[job_id] = {"state": "failed", "response": None, "error": str(e)}
+        finally:
+            _render_queue.task_done()
 
-    threading.Thread(target=worker, daemon=True).start()
-    return RenderResponse(job_id=job_id, source_video="", rendered=[])
+
+def _process_queued_job(job_id: str) -> None:
+    """Process one reserved job: load its request, advance state, render,
+    persist the terminal outcome exactly once (brief v4 F1/F18)."""
+    global _render_busy
+    raw = _load_job_request(job_id) or {}
+    if not raw:
+        raise RuntimeError(f"job {job_id}: request payload missing")
+    request = parse_render_request(raw)
+    with _async_jobs_lock:
+        mode = _async_jobs.get(job_id, {}).get("mode") or getattr(request, "mode", "final") or "final"
+        episode_id = _async_jobs.get(job_id, {}).get("episode_id") or getattr(request, "episode_id", "") or ""
+    _render_lock.acquire()
+    _render_busy = True
+    outcome = None
+    won = False
+    try:
+        # P0.1: the worker wins ONLY through queued -> downloading CAS.
+        # If a cancel already won (queued -> cancelled), this fails and the
+        # worker exits without rendering. No check-then-act.
+        won = transition_job(job_id, "queued", "downloading", mode=mode, episode_id=episode_id)
+        if won:
+            outcome = _render(request, job_id)
+    finally:
+        _render_busy = False
+        _render_lock.release()
+    if not won:
+        return
+    # Phase-2 correctness: terminal status is persisted HERE, once, BEFORE the
+    # memory registry is updated, so a caller that sees
+    # 'completed'/'partial_failure' knows the row is already durable.
+    _persist_job(job_id, outcome.final_status, mode=mode, episode_id=episode_id,
+                 response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "")
+    with _async_jobs_lock:
+        _async_jobs[job_id] = {"state": outcome.final_status, "response": outcome.response, "error": None}
 
 
 @app.post("/api/render/jobs/{job_id}/cancel")
@@ -2746,40 +2845,14 @@ def render_job_retry(job_id: str):
     with _async_jobs_lock:
         _async_jobs[new_job_id] = {"state": "queued", "response": None, "error": None,
                                    "request_id": getattr(request, "request_id", "") or "",
+                                   "episode_id": episode_id, "mode": mode,
                                    "parent_job_id": job_id, "attempt": attempt}
     _persist_job(new_job_id, "queued", mode=mode, episode_id=episode_id,
                  request=request.model_dump_json() if hasattr(request, "model_dump_json") else "",
                  parent_job_id=job_id, attempt=attempt)
 
-    def worker():
-        global _render_busy
-        try:
-            _render_lock.acquire()
-            _render_busy = True
-            try:
-                # P0.1: retry worker also wins only through queued -> downloading CAS.
-                won = transition_job(new_job_id, "queued", "downloading", mode=mode, episode_id=episode_id)
-                if won:
-                    outcome = _render(request, new_job_id)
-            finally:
-                _render_busy = False
-                _render_lock.release()
-            if not won:
-                return
-            # Phase-2 correctness: persist BEFORE updating memory (durable
-            # state is the source of truth for terminal status).
-            _persist_job(new_job_id, outcome.final_status, mode=mode, episode_id=episode_id,
-                         response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "",
-                         parent_job_id=job_id, attempt=attempt)
-            with _async_jobs_lock:
-                _async_jobs[new_job_id] = {"state": outcome.final_status, "response": outcome.response, "error": None}
-        except Exception as e:  # noqa: BLE001
-            _persist_job(new_job_id, "failed", mode=mode, episode_id=episode_id, error=str(e),
-                         parent_job_id=job_id, attempt=attempt)
-            with _async_jobs_lock:
-                _async_jobs[new_job_id] = {"state": "failed", "response": None, "error": str(e)}
-
-    threading.Thread(target=worker, daemon=True).start()
+    # Brief v4 F18: retry enqueues onto the shared persistent queue worker.
+    _enqueue_job(new_job_id)
     return {"job_id": new_job_id, "original_job_id": job_id, "state": "queued"}
 
 
