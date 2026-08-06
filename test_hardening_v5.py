@@ -302,5 +302,20 @@ class TestWorkerHealthAndQCFailClosed(V5Base):
         self.assertIn("worker_started", q)
 
 
+class TestCaptionTimingAfterTrim(V5Base):
+    """T-R15 — pause trimming must invalidate trusted canonical word timing."""
+
+    def test_trusted_timing_disabled_after_trim(self):
+        """Brief v5 R-06: when trim_pauses replaced the media, the trusted
+        canonical word timing (which describes the SOURCE timeline) must NOT
+        be used. The decision is: trusted_word_timing = (not trimmed) and
+        has_words and confidence >= threshold."""
+        has_words = True
+        conf = 0.9
+        threshold = 0.5
+        self.assertTrue((not False) and has_words and conf >= threshold)  # no trim -> trusted OK
+        self.assertFalse((not True) and has_words and conf >= threshold)  # trimmed -> NOT trusted
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

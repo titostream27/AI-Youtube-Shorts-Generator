@@ -2205,12 +2205,14 @@ def _render(request, job_id: str) -> RenderOutcome:
             # changes the timeline — captions are re-aligned below by re-running
             # whisper against the TRIMMED file, not the source window.
             trimmed_path = None
+            trimmed_media = False
             if os.getenv("RENDER_TRIM_REMOVE_LONG_PAUSES", "0") == "1":
                 try:
                     from audio_master import trim_pauses
                     trimmed_path = trim_pauses(out_path, 0.0, float(c["end_sec"]) - float(c["start_sec"]))
                     if trimmed_path and os.path.exists(trimmed_path):
                         os.replace(trimmed_path, out_path)
+                        trimmed_media = True
                         print(f"[render] clip {i}: long pauses trimmed", flush=True)
                         # Invalidate caption cache so whisper re-transcribes.
                         _transcribe_with_whisper.cache_clear() if hasattr(_transcribe_with_whisper, "cache_clear") else None
@@ -2222,7 +2224,12 @@ def _render(request, job_id: str) -> RenderOutcome:
                 # directly — skip full Whisper. Cue-only captions stay as the
                 # canonical cues (forced-alignment/Whisper is only a fallback
                 # when there is no trusted transcript at all).
-                trusted_word_timing = bool(c.get("has_word_timing")) and float(c.get("alignment_confidence") or 0) >= float(os.getenv("RENDER_CAPTION_CONFIDENCE_THRESHOLD", "0.5"))
+                # Brief v5 R-06: trusted canonical word timing describes the
+                # SOURCE media timeline. After pause trimming the media
+                # timeline changed — trusted words MUST NOT be used as-is.
+                # Invalidate trusted timing and force alignment/transcription
+                # against the FINAL trimmed media.
+                trusted_word_timing = (not trimmed_media) and bool(c.get("has_word_timing")) and float(c.get("alignment_confidence") or 0) >= float(os.getenv("RENDER_CAPTION_CONFIDENCE_THRESHOLD", "0.5"))
                 if trusted_word_timing:
                     transcript_captions = c["captions"]
                     print(f"[render] clip {i}: using canonical word timing ({c.get('provider', 'unknown')} v{c.get('transcript_version', '')})", flush=True)
