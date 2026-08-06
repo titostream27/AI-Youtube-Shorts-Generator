@@ -1446,20 +1446,17 @@ def _burn_karaoke_captions(
     # Phase 2: prefer the explicit timeline artifact when provided.
     # Brief v5 V-01: timeline_ref is used by compose() via state_at(ts) so
     # caption avoidance follows per-frame geometry, not a final snapshot.
+    # Brief v6 R06: production REQUIRES an explicit timeline — never read
+    # module-global statistics from a previous clip.
+    if timeline is None:
+        raise RenderTimelineMissingError(
+            "caption compositor requires an explicit RenderTimeline; "
+            "refusing to fall back to module-global face tracks"
+        )
     timeline_ref = timeline
-    if timeline is not None:
-        face_tracks_ref = list(getattr(timeline, "face_tracks", []) or [])
-        speaker_track_id_ref = getattr(timeline, "speaker_track_id", None)
-        split_ranges_ref = list(getattr(timeline, "split_ranges", []) or [])
-    else:
-        try:
-            from shorts_generator.local.clipper import get_last_face_tracks, get_split_ranges
-            face_tracks_ref, speaker_track_id_ref = get_last_face_tracks()
-            split_ranges_ref = get_split_ranges()
-        except Exception:  # noqa: BLE001
-            face_tracks_ref = []
-            speaker_track_id_ref = None
-            split_ranges_ref = []
+    face_tracks_ref = list(getattr(timeline, "face_tracks", []) or [])
+    speaker_track_id_ref = getattr(timeline, "speaker_track_id", None)
+    split_ranges_ref = list(getattr(timeline, "split_ranges", []) or [])
     # Time intervals (start_sec, end_sec) where the shot uses the reaction
     # split layout. When split is active the speaker is in the TOP pane and
     # the reactor in the BOTTOM pane, so a bottom-anchored caption would cover

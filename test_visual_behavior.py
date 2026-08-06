@@ -117,5 +117,24 @@ class TestCaptionCollision(V5BaseVisual):
         self.assertGreaterEqual(len(st["safe_caption_zones"]), 1)
 
 
+class TestNoGlobalFallback(V5BaseVisual):
+    """V-NOGLOB-01 — two sequential render stubs cannot inherit stats."""
+
+    def test_require_explicit_timeline_rejects_bare_path(self):
+        import render_service as rs
+        if not hasattr(rs, "_require_explicit_timeline"):
+            self.skipTest("_require_explicit_timeline not defined")
+        with self.assertRaises(rs.RenderTimelineMissingError):
+            rs._require_explicit_timeline("/tmp/out.mp4", "job-1")
+
+    def test_require_explicit_timeline_accepts_tuple(self):
+        import render_service as rs
+        if not hasattr(rs, "_require_explicit_timeline"):
+            self.skipTest("_require_explicit_timeline not defined")
+        t = RenderTimeline()
+        result = rs._require_explicit_timeline(("/tmp/out.mp4", t), "job-1")
+        self.assertEqual(result[0], "/tmp/out.mp4")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
