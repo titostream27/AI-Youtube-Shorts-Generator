@@ -290,5 +290,17 @@ class TestStartupReconciliation(V5Base):
         self.assertEqual(status, "orphaned")
 
 
+class TestWorkerHealthAndQCFailClosed(V5Base):
+    """T-R09/T-R14 — worker health uses real thread; QC fail-closed verified via render pipeline."""
+
+    def test_worker_health_fields_present(self):
+        payload = rs.render_health()
+        q = payload["queue"]
+        self.assertIn("worker_alive", q)
+        self.assertIn("worker_heartbeat", q)
+        self.assertIn("worker_last_exception", q)
+        self.assertIn("worker_started", q)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -2447,7 +2447,22 @@ def _render(request, job_id: str) -> RenderOutcome:
                     artifact.error = item["error"]
                     print(f"[render] clip {i}: QC FAILED ({qc['warnings'][:3]})", flush=True)
             except Exception as e:  # noqa: BLE001
+                # Brief v5 4.5: FINAL mode must fail closed when QC is
+                # unavailable — a clip without QC cannot be published. Preview
+                # mode may continue with a warning (publishable=false).
                 print(f"[render] clip {i}: quality gate error ({e}), continuing", flush=True)
+                if mode == "final":
+                    item["status"] = "error"
+                    item["error"] = f"quality gate unavailable: {e}"
+                    artifact.status = "error"
+                    artifact.error = item["error"]
+                    artifact.qc.status = "unavailable"
+                else:
+                    artifact.qc.status = "unavailable"
+                    item.setdefault("quality", {}).update({
+                        "status": "unavailable",
+                        "warnings": [f"quality gate unavailable: {e}"],
+                    })
 
             if item["status"] == "ok":
                 item["clip_path"] = os.path.abspath(out_path)
@@ -2527,6 +2542,12 @@ RENDER_QUEUE_MAX = int(os.getenv("RENDER_QUEUE_MAX", "100"))
 _render_queue: "_queue_module.Queue[str]" = _queue_module.Queue(maxsize=RENDER_QUEUE_MAX)
 _render_queue_worker_started = False
 _render_queue_worker_lock = threading.Lock()
+# Brief v5 9.2: keep the ACTUAL thread reference + heartbeat + last exception
+# so health reports thread.is_alive() (not a boolean flag that stays True
+# after a crash).
+_render_queue_worker_thread: "threading.Thread | None" = None
+_render_worker_heartbeat_at: str = ""
+_render_worker_last_exception: str = ""
 
 # Brief v4 F19: process boot identity for orphan ownership. A job reserved by
 # this process carries this boot_id; orphan detection only marks rows whose
@@ -2601,7 +2622,12 @@ def render_health():
                "last_error_stage": _last_db_error_stage},
         "queue": {"depth": _render_queue.qsize(), "active_job_id": active_job_id,
                   "max": RENDER_QUEUE_MAX,
-                  "worker_alive": _render_queue_worker_started,
+                  # Brief v5 9.2: real thread reference + is_alive(); the
+                  # boolean flag alone stays True after a crash.
+                  "worker_started": _render_queue_worker_started,
+                  "worker_alive": bool(_render_queue_worker_thread and _render_queue_worker_thread.is_alive()),
+                  "worker_heartbeat": _render_worker_heartbeat_at,
+                  "worker_last_exception": _render_worker_last_exception,
                   "process_boot_id": PROCESS_BOOT_ID},
         "ffmpeg": {"available": ffmpeg, "ffprobe": ffprobe},
         "output": {"writable": out_ok, "error": out_error, "free_bytes": free_bytes},
@@ -2825,6 +2851,7 @@ def _enqueue_job(job_id: str) -> None:
             _render_queue_worker_started = True
             t = threading.Thread(target=_queue_worker_loop, daemon=True)
             t.start()
+            _render_queue_worker_thread = t
             print(f"[render] queue worker started (boot={PROCESS_BOOT_ID}, max={RENDER_QUEUE_MAX})", flush=True)
 
 
@@ -2907,6 +2934,8 @@ def _queue_worker_loop() -> None:
         try:
             _process_queued_job(job_id)
         except Exception as e:  # noqa: BLE001
+            global _render_worker_last_exception
+            _render_worker_last_exception = f"{type(e).__name__}: {e}"
             print(f"[render] queue worker error on {job_id}: {e}", flush=True)
             try:
                 # Brief v5 R-02: canonical transition to failed — never a raw
@@ -2919,6 +2948,8 @@ def _queue_worker_loop() -> None:
             with _async_jobs_lock:
                 _async_jobs[job_id] = {"state": "failed", "response": None, "error": str(e)}
         finally:
+            global _render_worker_heartbeat_at
+            _render_worker_heartbeat_at = datetime.datetime.utcnow().isoformat()
             _render_queue.task_done()
 
 
