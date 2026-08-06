@@ -1768,10 +1768,11 @@ def crop_clip_local(
     if cache_dir and os.path.exists(out_path):
         import shutil
         shutil.copyfile(out_path, cache_path)
-        # P0.2: persist a versioned timeline sidecar beside the cached media so
-        # a later cache HIT returns the same typed timeline (T06).
-        if return_timeline:
-            RenderTimeline.capture().to_json(sidecar_path)
+        # Brief v4 F20/E1: persist the timeline sidecar on EVERY cache write,
+        # regardless of whether THIS caller asked for a timeline — so any later
+        # cache HIT returns the same typed result even when the original caller
+        # used return_timeline=False.
+        RenderTimeline.capture().to_json(sidecar_path)
         print(f"[clip/local] cached: {os.path.basename(cache_path)}", flush=True)
 
     if return_timeline:

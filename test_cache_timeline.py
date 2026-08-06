@@ -138,6 +138,31 @@ class TestCacheTimelineContract(unittest.TestCase):
         """Helper mirror of _render_once returning only the cached media path."""
         return self._render_once()
 
+    def test_sidecar_written_even_when_caller_does_not_request_timeline(self):
+        """Brief v4 F20: a cache write with return_timeline=False must still
+        persist the sidecar so a later timeline-requesting caller gets a hit."""
+        out = str(self.tmp / "out_noflag.mp4")
+
+        def fake_reframe(cut_path, out_path, aspect_ratio, **kw):
+            clipper._FRAME_TIMELINE.clear()
+            clipper._FRAME_TIMELINE.append({"frame_no": 1, "t_sec": 0.033, "speaker_track_id": 1, "split_alpha": 0.0, "face_count": 1})
+            _write_video(out_path + ".silent.mkv")
+            return out_path + ".silent.mkv"
+
+        with mock.patch.object(clipper, "_cut_subclip", return_value=None), \
+             mock.patch.object(clipper, "_reframe_vertical", side_effect=fake_reframe), \
+             mock.patch.object(clipper, "subprocess", return_value=None):
+            result = clipper.crop_clip_local(
+                self.src, 1.0, 5.0, "9:16", out, cache_dir=self.cache,
+                final_encode=False, return_timeline=False, profile_version="f20",
+            )
+        self.assertIsInstance(result, str)  # bare path, no timeline requested
+        # Sidecar must still exist next to the cached media.
+        from pathlib import Path
+        cache_dir = Path(self.cache)
+        sidecars = list(cache_dir.glob("*f20*.timeline.json"))
+        self.assertEqual(len(sidecars), 1, "sidecar must be written even without return_timeline")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
