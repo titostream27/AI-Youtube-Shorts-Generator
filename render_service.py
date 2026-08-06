@@ -2299,6 +2299,15 @@ def _render(request, job_id: str) -> RenderOutcome:
                     print(f"[render] clip {i}: clean H.264 fallback encode succeeded", flush=True)
                 except Exception as e2:  # noqa: BLE001
                     print(f"[render] clip {i}: clean retry failed ({e2}), keeping lossless intermediate", flush=True)
+                    # Brief v4 F10: a lossless FFV1 intermediate is NOT a
+                    # publishable artifact (YouTube rejects FFV1). Mark the
+                    # clip failed so no video_url is exposed; the final encode
+                    # failure must fail CLOSED.
+                    item["status"] = "error"
+                    item["error"] = f"final encode failed: styled+clean ({e}; {e2})"
+                    artifact.status = "error"
+                    artifact.error = item["error"]
+                    _RENDER_STATS["final_encode_failed"] = True
 
             # ── Phase 3 (brief §45): audio mastering chain ──
             # Applied AFTER the final video encode: re-encodes audio only
@@ -2316,9 +2325,10 @@ def _render(request, job_id: str) -> RenderOutcome:
 
             # ── Phase 4 (brief §50): automated quality gate ──
             # Run QC on the FINAL file (after hook + final encode + mastering).
-            # When QC_BLOCK_UPLOAD=1 and the video fails, mark the clip failed
-            # so the publisher refuses to upload.
-            transition_job(job_id, "rendering", "quality_check", mode=mode, episode_id=episode_id)
+            # Brief v4 F3: this is PER-ARTIFACT QC — it must NOT change the
+            # JOB state (the job enters quality_check ONCE after all clips are
+            # rendered, below). When QC_BLOCK_UPLOAD=1 and the video fails,
+            # mark the clip failed so the publisher refuses to upload.
             try:
                 from quality_gate import quality_gate
                 qc = quality_gate(out_path)
@@ -2383,6 +2393,12 @@ def _render(request, job_id: str) -> RenderOutcome:
         artifacts.append(artifact)
 
     print(f"[render] job {job_id} finished in {time.time() - start:.1f}s", flush=True)
+    # Brief v4 F3: the job enters quality_check ONCE, after ALL clips have
+    # rendered — never inside the per-clip loop. Observers always see the
+    # true current stage (rendering while clips render, quality_check only
+    # after the last clip).
+    if transition_job(job_id, "rendering", "quality_check", mode=mode, episode_id=episode_id):
+        print(f"[render] job {job_id}: quality_check (all clips rendered)", flush=True)
     # Phase-2 correctness: compute the terminal status but DO NOT persist it.
     # The orchestration layer persists it exactly once (RenderOutcome).
     import json
