@@ -33,6 +33,7 @@ from render_contract import (
     CaptionWord,
     ClipRequest,
     RenderArtifact,
+    RenderArtifactResult,
     RenderJobStatus,
     RenderRequest,
     RenderRequestV2,
@@ -2581,8 +2582,32 @@ def _render(request, job_id: str) -> RenderOutcome:
     resp = RenderResponse(
         job_id=job_id,
         source_video=source,
-        rendered=rendered,
-        artifacts=[a.model_dump() for a in artifacts],
+        # Brief v6 6.3: strictly typed artifacts — convert item dicts to
+        # RenderArtifactResult (no raw List[Dict] in the response model).
+        rendered=[
+            RenderArtifactResult(
+                clip_id=str(it.get("clip_id", "")),
+                status=it.get("status", "error"),
+                video_url=it.get("video_url"),
+                thumbnail_url=it.get("thumbnail_url"),
+                publishable=bool(it.get("status") == "ok"),
+                qc_status=(it.get("quality") or {}).get("status", "unavailable"),
+                error=({"message": it["error"]} if it.get("error") else None),
+            )
+            for it in rendered
+        ],
+        artifacts=[
+            RenderArtifactResult(
+                clip_id=str(a.clip_id),
+                status=a.status,
+                video_url=a.video_url,
+                thumbnail_url=a.thumbnail_url,
+                publishable=a.status == "ok",
+                qc_status=getattr(a.qc, "status", "unavailable") or "unavailable",
+                error=({"message": a.error} if getattr(a, "error", None) else None),
+            )
+            for a in artifacts
+        ],
         mode=mode,
         source=src_info or {},
     )

@@ -188,9 +188,11 @@ class TestPartialFailureParity(HardeningTestBase):
 
     def test_partial_failure_memory_and_sqlite_both_expose_artifacts(self):
         job_id = "pf-parity"
+        # Brief v6 6.3: RenderResponse is strictly typed — artifacts are
+        # RenderArtifactResult objects, not raw dicts.
         rendered = [
-            {"clip_id": 1, "status": "ok", "clip_url": "/out/short_01.mp4"},
-            {"clip_id": 2, "status": "error", "error": "encode failed"},
+            rs.RenderArtifactResult(clip_id="1", status="ok", video_url="/out/short_01.mp4", publishable=True, qc_status="passed"),
+            rs.RenderArtifactResult(clip_id="2", status="error", error={"message": "encode failed"}, publishable=False, qc_status="failed"),
         ]
         response = rs.RenderResponse(job_id=job_id, source_video="src.mp4", rendered=rendered)
         rs._persist_job(
@@ -209,19 +211,19 @@ class TestPartialFailureParity(HardeningTestBase):
         # Successful artifact visible from BOTH stores.
         mem_rendered = mem["response"].rendered if mem.get("response") else []
         stored_rendered = (stored.get("response") or {}).get("rendered", [])
-        ok_artifacts_mem = [r for r in mem_rendered if r.get("status") == "ok"]
+        ok_artifacts_mem = [r for r in mem_rendered if r.status == "ok"]
         ok_artifacts_db = [r for r in stored_rendered if r.get("status") == "ok"]
         self.assertEqual(len(ok_artifacts_mem), 1)
         self.assertEqual(len(ok_artifacts_db), 1)
-        self.assertEqual(ok_artifacts_db[0]["clip_url"], "/out/short_01.mp4")
+        self.assertEqual(ok_artifacts_db[0]["video_url"], "/out/short_01.mp4")
 
     def test_status_endpoint_exposes_partial_failure_artifacts_from_memory(self):
         """P1.R3 — /api/render/status/{job_id} must expose successful artifacts
         for a partial_failure kept in memory, identically to the persisted path."""
         job_id = "pf-http"
         rendered = [
-            {"clip_id": 1, "status": "ok", "clip_url": "/out/short_01.mp4"},
-            {"clip_id": 2, "status": "error", "error": "encode failed"},
+            rs.RenderArtifactResult(clip_id="1", status="ok", video_url="/out/short_01.mp4", publishable=True, qc_status="passed"),
+            rs.RenderArtifactResult(clip_id="2", status="error", error={"message": "encode failed"}, publishable=False, qc_status="failed"),
         ]
         response = rs.RenderResponse(job_id=job_id, source_video="src.mp4", rendered=rendered)
         with rs._async_jobs_lock:
@@ -233,9 +235,9 @@ class TestPartialFailureParity(HardeningTestBase):
         self.assertEqual(payload["state"], "partial_failure")
         self.assertIn("rendered", payload)
         self.assertEqual(len(payload["rendered"]), 2)
-        ok = [r for r in payload["rendered"] if r.get("status") == "ok"]
+        ok = [r for r in payload["rendered"] if r.status == "ok"]
         self.assertEqual(len(ok), 1)
-        self.assertEqual(ok[0]["clip_url"], "/out/short_01.mp4")
+        self.assertEqual(ok[0].video_url, "/out/short_01.mp4")
 
 
 if __name__ == "__main__":

@@ -273,7 +273,11 @@ class TestFinalEncodeFailure(V4Base):
         def fake_render(req, job_id):
             outcome = rs.RenderOutcome(
                 rs.RenderResponse(job_id=job_id, source_video="", rendered=[
-                    {"clip_id": 1, "status": "error", "error": "final encode failed: styled+clean"},
+                    rs.RenderArtifactResult(
+                        clip_id="1", status="error", publishable=False,
+                        error={"message": "final encode failed: styled+clean"},
+                        qc_status="failed",
+                    ),
                 ]), "completed")
             return outcome
 
@@ -289,7 +293,7 @@ class TestFinalEncodeFailure(V4Base):
             state = rs._async_jobs.get(resp.job_id, {}).get("state")
         self.assertIn(state, ("partial_failure", "failed", "completed"))
         # No publishable H.264 final URL may be reported for the failed clip.
-        self.assertTrue(any(r.get("status") == "error" for r in resp.rendered))
+        self.assertTrue(any(r.status == "error" for r in resp.rendered))
 
 
 if __name__ == "__main__":

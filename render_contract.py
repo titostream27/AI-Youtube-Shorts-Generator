@@ -23,7 +23,7 @@ Phase 1 §5.5: validation rules are shared with the TypeScript schema
 Schema in contracts/render-request-v2.schema.json. Both sides must pass and
 reject the same fixtures.
 """
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -126,7 +126,7 @@ class CaptionCue(BaseModel):
 
 class CaptionPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    language: str = "en"
+    language: str = "auto"  # Brief v6 6.1: default unknown language is auto, not en.
     provider: str = "unknown"
     transcript_version: str = ""
     alignment_confidence: float = Field(default=0.0, ge=0, le=1)
@@ -195,11 +195,43 @@ class RenderRequestV2(BaseModel):
             norm_id = str(clip.clip_id).strip()
             if not norm_id:
                 raise ValueError(f"clip_id must normalize to a non-empty string, got {clip.clip_id!r}")
-            # Brief v5 C-01: reject NaN/Infinity in numeric fields.
-            for field_name in ("start_sec", "end_sec", "hook_end_sec", "payoff_start_sec"):
+            # Brief v5 C-01: reject NaN/Infinity in numeric fields (C02: read
+            # NARRATIVE fields from clip.narrative, not the clip itself).
+            for field_name in ("start_sec", "end_sec"):
                 val = getattr(clip, field_name, None)
                 if val is not None and not _is_finite(val):
                     raise ValueError(f"clip {norm_id}: {field_name} must be finite")
+            narrative = clip.narrative
+            if narrative is not None:
+                for field_name in ("hook_end_sec", "payoff_start_sec"):
+                    val = getattr(narrative, field_name, None)
+                    if val is not None and not _is_finite(val):
+                        raise ValueError(f"clip {norm_id}: narrative.{field_name} must be finite")
+                # Brief v6 6.2: narrative fields must sit INSIDE the clip and
+                # hook <= payoff.
+                if narrative.hook_end_sec is not None and not (
+                    clip.start_sec <= narrative.hook_end_sec <= clip.end_sec
+                ):
+                    raise ValueError(
+                        f"clip {norm_id}: narrative.hook_end_sec ({narrative.hook_end_sec}) "
+                        f"outside clip range [{clip.start_sec},{clip.end_sec}]"
+                    )
+                if narrative.payoff_start_sec is not None and not (
+                    clip.start_sec <= narrative.payoff_start_sec <= clip.end_sec
+                ):
+                    raise ValueError(
+                        f"clip {norm_id}: narrative.payoff_start_sec ({narrative.payoff_start_sec}) "
+                        f"outside clip range [{clip.start_sec},{clip.end_sec}]"
+                    )
+                if (
+                    narrative.hook_end_sec is not None
+                    and narrative.payoff_start_sec is not None
+                    and narrative.payoff_start_sec < narrative.hook_end_sec
+                ):
+                    raise ValueError(
+                        f"clip {norm_id}: payoff_start_sec ({narrative.payoff_start_sec}) "
+                        f"must be >= hook_end_sec ({narrative.hook_end_sec})"
+                    )
             if norm_id in seen_ids:
                 raise ValueError(f"duplicate clip_id after normalization: {norm_id!r}")
             seen_ids.add(norm_id)
@@ -215,6 +247,7 @@ class RenderRequestV2(BaseModel):
                     f"clip {clip.clip_id}: invalid preferred_layout "
                     f"{clip.layout_plan.preferred_layout!r}"
                 )
+            last_cue_end = None
             for cue in clip.caption_plan.cues:
                 if cue.start_sec < clip.start_sec or cue.end_sec > clip.end_sec:
                     raise ValueError(
@@ -222,6 +255,18 @@ class RenderRequestV2(BaseModel):
                         f"{cue.end_sec}] outside clip range "
                         f"[{clip.start_sec},{clip.end_sec}]"
                     )
+                if cue.end_sec <= cue.start_sec:
+                    raise ValueError(
+                        f"clip {clip.clip_id}: cue end_sec ({cue.end_sec}) must be > "
+                        f"start_sec ({cue.start_sec})"
+                    )
+                if last_cue_end is not None and cue.start_sec < last_cue_end - 0.05:
+                    raise ValueError(
+                        f"clip {clip.clip_id}: cue [{cue.start_sec}] out of order "
+                        f"(previous ended {last_cue_end})"
+                    )
+                last_cue_end = max(last_cue_end or 0, cue.end_sec)
+            last_event_sec = None
             for ev in clip.editing_events:
                 if ev.time_sec < clip.start_sec or ev.time_sec > clip.end_sec:
                     raise ValueError(
@@ -232,6 +277,11 @@ class RenderRequestV2(BaseModel):
                     raise ValueError(
                         f"clip {clip.clip_id}: invalid editing event type {ev.type!r}"
                     )
+                if last_event_sec is not None and ev.time_sec < last_event_sec:
+                    raise ValueError(
+                        f"clip {clip.clip_id}: editing events out of chronological order"
+                    )
+                last_event_sec = ev.time_sec
         return self
 
 
@@ -255,6 +305,8 @@ class RenderRequest(BaseModel):
 # ── Responses ──────────────────────────────────────────────────────────────
 
 class QCDetail(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: str = "unavailable"  # passed | failed | unavailable (brief v6)
     score: float = 0
     output_width: int = 1080
     output_height: int = 1920
@@ -340,13 +392,14 @@ class RenderArtifactResult(BaseModel):
 
 
 class RenderResponse(BaseModel):
+    """Brief v6 6.3 — strictly typed response: rendered/artifacts use
+    RenderArtifactResult, never List[Dict]."""
+    model_config = ConfigDict(extra="forbid")
     job_id: str
-    source_video: str
-    rendered: List[Dict]
-    # Phase 2/4 (brief §23): structured QC artifacts + job metadata exposed on
-    # the response so GET /api/render/status/:id can return them without
-    # re-parsing the persisted payload.
-    artifacts: Optional[List[Dict]] = None
+    status: Literal["completed", "partial_failure"] = "completed"
+    source_video: str = ""
+    rendered: List[RenderArtifactResult] = Field(default_factory=list)
+    artifacts: Optional[List[RenderArtifactResult]] = None
     mode: str = "final"
     source: Optional[Dict] = None
 
