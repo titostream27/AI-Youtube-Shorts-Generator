@@ -1425,6 +1425,9 @@ def _burn_karaoke_captions(
 
     # ── Phase 3 (brief §44): face collision avoidance needs face boxes ──
     # Phase 2: prefer the explicit timeline artifact when provided.
+    # Brief v5 V-01: timeline_ref is used by compose() via state_at(ts) so
+    # caption avoidance follows per-frame geometry, not a final snapshot.
+    timeline_ref = timeline
     if timeline is not None:
         face_tracks_ref = list(getattr(timeline, "face_tracks", []) or [])
         speaker_track_id_ref = getattr(timeline, "speaker_track_id", None)
@@ -1555,22 +1558,37 @@ def _burn_karaoke_captions(
             canvas.save(path)
             return
 
-        # ── Phase 3 (brief §44): face collision avoidance ──
+        # ── Phase 3 (brief §44) + Brief v5 V-01: face collision avoidance ──
         # When enabled, drop the bottom-margin anchor down/up around a detected
         # face (mouth zone) so captions never cover the speaker's mouth.
+        # Brief v5 7.2: use time-indexed timeline state (state_at) per frame
+        # rather than the FINAL face snapshot — captions stay synchronized with
+        # camera/face movement across the clip.
         face_avoid = os.getenv("RENDER_CAPTION_FACE_AVOIDANCE", "1") != "0"
         mouth_zone: Optional[Tuple[int, int, int, int]] = None  # (x0,y0,x1,y1)
-        if face_avoid and face_tracks_ref:
-            # Find the current speaker's face box; anchor captions above or
-            # below it depending on which half of the frame it occupies.
-            sp = next((t for t in face_tracks_ref if t.get("track_id") == speaker_track_id_ref), None)
-            f = sp or (max(face_tracks_ref, key=lambda t: t.get("area", 0)) if face_tracks_ref else None)
-            if f is not None and f.get("w"):
-                bx0 = int(max(0, f["cx"] - f["w"] / 2))
-                by0 = int(max(0, f["cy"] - f["h"] / 2))
-                bx1 = int(min(width, f["cx"] + f["w"] / 2))
-                by1 = int(min(height, f["cy"] + f["h"] / 2))
-                mouth_zone = (bx0, by0, bx1, by1)
+        if face_avoid:
+            frame_state = None
+            if timeline_ref is not None:
+                try:
+                    frame_state = timeline_ref.state_at(ts)
+                except Exception:  # noqa: BLE001
+                    frame_state = None
+            faces_at_ts = None
+            if frame_state is not None and frame_state.get("faces"):
+                faces_at_ts = frame_state["faces"]
+            elif face_tracks_ref:
+                faces_at_ts = face_tracks_ref
+            if faces_at_ts:
+                # Prefer the active speaker track at this timestamp.
+                active_sp_id = frame_state.get("active_speaker_id") if frame_state else (speaker_track_id_ref if speaker_track_id_ref is not None else None)
+                sp = next((t for t in faces_at_ts if t.get("track_id") == active_sp_id), None)
+                f = sp or (max(faces_at_ts, key=lambda t: t.get("area", 0)) if faces_at_ts else None)
+                if f is not None and f.get("w"):
+                    bx0 = int(max(0, f["cx"] - f["w"] / 2))
+                    by0 = int(max(0, f["cy"] - f["h"] / 2))
+                    bx1 = int(min(width, f["cx"] + f["w"] / 2))
+                    by1 = int(min(height, f["cy"] + f["h"] / 2))
+                    mouth_zone = (bx0, by0, bx1, by1)
 
         # Stack active lines upward from the bottom margin (higher on screen to
         # clear the source video's own lower-third text/watermarks).

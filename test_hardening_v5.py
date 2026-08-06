@@ -377,5 +377,27 @@ class TestStrictContract(V5Base):
             RenderArtifactResult(clip_id="c", status="error", publishable=True, error=None)
 
 
+class TestTimelineExplicitResult(V5Base):
+    """T-V01 — ReframeResult + time-indexed timeline (brief v5 7.1/7.2)."""
+
+    def test_reframe_result_object(self):
+        """The public reframe entry returns an explicit object with timeline."""
+        from shorts_generator.local import clipper
+        with mock.patch.object(clipper, "_reframe_vertical", return_value="out.mp4"):
+            res = clipper.reframe_vertical("in.mp4", "out.mp4", "9:16")
+        self.assertEqual(res.output_path, "out.mp4")
+        self.assertIsNotNone(res.timeline)
+        self.assertIsNotNone(res.stats)
+        self.assertIn("pipeline_version", res.__dict__)
+
+    def test_state_at_empty_timeline_explicit(self):
+        """A timeline with no frames returns explicit empty state, never stale."""
+        from shorts_generator.local.clipper import RenderTimeline
+        t = RenderTimeline()
+        st = t.state_at(5.0)
+        self.assertEqual(st["reason"], "no_timeline")
+        self.assertEqual(st["safe_caption_zones"], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

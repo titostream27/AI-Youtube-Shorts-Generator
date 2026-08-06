@@ -10,6 +10,7 @@ import os
 import math
 import subprocess
 import time
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 # ── Phase 3 (brief §44): last-frame face tracking snapshot ──
@@ -79,6 +80,21 @@ def get_split_ranges() -> List[Tuple[float, float]]:
 # Replaces the module-global snapshots for NEW callers. crop_clip_local with
 # return_timeline=True returns (path, RenderTimeline) so the renderer never
 # has to read module globals; the globals + getters remain for legacy callers.
+
+@dataclass
+class ReframeResult:
+    """Brief v5 7.1 — explicit result of one reframe pass.
+
+    The core reframe function returns THIS object (never a bare path when
+    a timeline was requested). Legacy callers that only want a path use
+    `.output_path`.
+    """
+    output_path: str
+    timeline: "RenderTimeline"
+    stats: Dict[str, object]
+    cache_key: str = ""
+    pipeline_version: str = ""
+
 
 class RenderTimeline:
     """Explicit per-clip render timeline artifact (Phase 2 §render timelines).
@@ -216,6 +232,29 @@ def _ratio(aspect_ratio: str) -> float:
         return float(w) / float(h)
     except (ValueError, ZeroDivisionError):
         return 9.0 / 16.0
+
+
+def reframe_vertical(in_path: str, out_path: str, aspect_ratio: str,
+                     emphasis_events: Optional[List[Dict]] = None,
+                     layout_mode: str = "face_crop",
+                     output_size: Optional[Tuple[int, int]] = None,
+                     cache_key: str = "", pipeline_version: str = "") -> ReframeResult:
+    """Brief v5 7.1 — public reframe entry that returns an explicit
+    ReframeResult (path + timeline + stats + cache_key + pipeline_version).
+    The internal _reframe_vertical remains for legacy bare-path callers.
+    """
+    result_path = _reframe_vertical(in_path, out_path, aspect_ratio,
+                                    emphasis_events=emphasis_events,
+                                    layout_mode=layout_mode,
+                                    output_size=output_size)
+    timeline = RenderTimeline.capture()
+    return ReframeResult(
+        output_path=result_path,
+        timeline=timeline,
+        stats=timeline.stats,
+        cache_key=cache_key,
+        pipeline_version=pipeline_version or os.getenv("RENDER_PIPELINE_VERSION", "0.1.0"),
+    )
 
 
 def _cut_subclip(source_path: str, start: float, end: float, out_path: str) -> str:
