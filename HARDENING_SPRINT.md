@@ -1,10 +1,47 @@
 # Hardening Sprint 2026 — Architecture & Operations Guide
 
 Scope: Podcast Opportunity Miner (content-miner) + AI-Youtube-Shorts-Generator
-hardening sprint (v1/v2/v3). Fixes correctness, contract, evaluation, cache,
+hardening sprint (v1/v2/v3/v4). Fixes correctness, contract, evaluation, cache,
 timeline, and boundary gaps before feature expansion.
 
-## Revision v3 (this sprint) — what changed
+## Revision v4 (this sprint) — what changed
+
+- **Phase A: render job correctness.** Sync jobs now go through the SAME
+  durable reservation + in-memory registration as async/retry (transition_job
+  can actually advance them; exceptions persist `failed`). V1 async without
+  request_id inserts a durable queued row. Multi-clip jobs stay in
+  `rendering` until ALL clips render, then enter `quality_check` once —
+  per-clip QC no longer mutates job state. Force-rerender does NOT change the
+  semantic request hash (execution control is not content) and increments
+  attempt monotonically with parent lineage. Double final-encode failure
+  fails CLOSED: no lossless intermediate is exposed as a publishable URL.
+  `_reserve_job` distinguishes sqlite3.IntegrityError (duplicate race) from
+  other DB failures (raise + diagnostics, no worker). Thread-per-job was
+  replaced by a bounded `queue.Queue` + one persistent worker; orphan
+  detection uses `process_boot_id` ownership + age threshold (fresh current-
+  process jobs are never orphaned). Health reports queue depth, worker alive,
+  boot id.
+- **Phase B: miner candidate correctness.** ONE `finalizeCandidate()` path
+  for semantic and repaired candidates: hard start gate (repair-or-reject
+  with preceding-context validation), final-slice rescoring (never rough
+  salience inheritance), identity/lineage stamping. Paragraph pause flushes
+  BEFORE adding the cue; question/transition openers anchored to utterance
+  start; word-level slicing clips first/last words to the window.
+- **Phase C: contract & captions.** Cues/words are intersected and clamped to
+  clip boundaries (zero/negative durations dropped). Language resolves
+  explicit -> transcript -> auto (never blind 'en'). Narrative timings are
+  per-clip (`narrativeByClipId`), never leaked across clips.
+- **Phase D: evaluation.** Temporal assignment uses SEPARATE label/prediction
+  namespaces (crossing matches both; one pred cannot match two labels).
+  `GoldenLabel.type` = positive | hard_negative | ignore; hard negatives are
+  false positives (hardNegativeFPR), never recall; ignores excluded. Top-K
+  and rank-aware recall use the same temporal assignment as recall (different
+  id but correct window = hit).
+- **Phase E: cache/CI.** Timeline sidecars are written on EVERY cache write
+  (even when the caller did not request a timeline). GitHub Actions CI added
+  for both repos; missing shared contract fixtures fail explicitly.
+
+## Revision v3 — what changed
 
 - **Phase A: reservations.** `_reserve_job` now treats ONLY
   `sqlite3.IntegrityError` as a duplicate-active-request race; any other DB
