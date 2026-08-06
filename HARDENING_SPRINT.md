@@ -1,8 +1,42 @@
 # Hardening Sprint 2026 — Architecture & Operations Guide
 
 Scope: Podcast Opportunity Miner (content-miner) + AI-Youtube-Shorts-Generator
-hardening sprint (v1/v2/v3/v4/v5). Fixes correctness, contract, evaluation, cache,
+hardening sprint (v1/v2/v3/v4/v5/v6). Fixes correctness, contract, evaluation, cache,
 timeline, and boundary gaps before feature expansion.
+
+## Revision v6 (this sprint) — what changed
+
+- **Renderer state/failure-path (R01..R07).**
+  require_transition() checked helper for EVERY active/terminal transition;
+  lost CAS raises JobTransitionConflict and stops work. Sync terminal
+  persistence return is checked (False never yields a success response).
+  Worker exception handler preserves a winning terminal state. quality_check
+  is a checked job-level stage; ensure_worker_running() restarts a dead
+  worker exactly once and the loop resets the started flag on exit. Health
+  gains oldest_queued_age_sec. Production crop/caption paths REQUIRE an
+  explicit RenderTimeline (RenderTimelineMissingError); no module-global
+  stats fallback anywhere in production.
+- **Miner finalization/slicing (M01..M03).**
+  finalizeCandidate fully revalidates the FINAL range after start repair
+  (duration, ending, contamination, topic boundary) before slicing.
+  sliceTranscriptForRange computes wordTimingCoverage and uses honest
+  precision word/hybrid/utterance; untimed overlapping speech retained in
+  hybrid; no-word fallback labeled 'utterance' not 'cue'.
+- **Contract parity (C01..C03).**
+  Shared fixtures: 6 new invalid (C-INV-01/02/04/06/08/09). Pydantic
+  narrative checks read clip.narrative (finite/in-clip/hook<=payoff); cue
+  and event chronological order. Zod language default 'auto' + narrative
+  in-clip. RenderResponse strictly typed with RenderArtifactResult;
+  QCDetail.status.
+- **Visual planner (R07/VIS-01..08).**
+  CameraPlanner pure state machine over detections/audio/scene events;
+  decision tests: single speaker, no size steal, handoff, miss hold, scene
+  reset, split, false face, audio hysteresis.
+- **Evaluator (E03).**
+  Legacy clipId helpers redirected to canonical AssignmentResult (temporal
+  IoU); no production metric depends on clipId equality.
+- **CI/docs.**
+  Renderer CI pins miner at v6 HEAD; hardening-v6 in blocking set.
 
 ## Revision v5 (this sprint) — what changed
 
