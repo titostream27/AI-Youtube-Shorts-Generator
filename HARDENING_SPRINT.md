@@ -1,10 +1,55 @@
 # Hardening Sprint 2026 — Architecture & Operations Guide
 
 Scope: Podcast Opportunity Miner (content-miner) + AI-Youtube-Shorts-Generator
-hardening sprint (v1/v2/v3/v4). Fixes correctness, contract, evaluation, cache,
+hardening sprint (v1/v2/v3/v4/v5). Fixes correctness, contract, evaluation, cache,
 timeline, and boundary gaps before feature expansion.
 
-## Revision v4 (this sprint) — what changed
+## Revision v5 (this sprint) — what changed
+
+- **Phase 1 — renderer lifecycle correctness (R-01..R-07).**
+  Sync and async now share one orchestration path (`_register_job_memory` +
+  `transition_job` + `_persist_terminal_via_transition`); idempotency hits
+  never create phantom memory entries; lost CAS raises JobTransitionConflict
+  and never renders; original exception class/message preserved. Terminal
+  status persists THROUGH the state machine BEFORE memory update (R-05) —
+  memory never claims completed when SQLite fails. `_persist_job` uses named
+  SQL parameters (R-03 tuple swap fixed) and raises PersistenceError on
+  failure. Queue admission compensates (durable queued -> failed,
+  error_stage=queue_admission) before HTTP 503 (R-04). Force lookup DB
+  failure fails the request (4.7). Startup reconciliation orphans stale
+  foreign-boot rows BEFORE serving (4.6). Worker health uses the real thread
+  reference (is_alive), heartbeat, last exception (9.2). Final mode fails
+  closed when QC is unavailable (4.5). Trusted caption word timing is
+  invalidated after pause trim (R-06).
+- **Phase 2 — miner finalization (M-01..M-04).**
+  finalizeCandidate() now slices the canonical transcript ONLY AFTER the
+  start gate resolves the final start — the final slice always describes
+  segment.startSec..endSec (M-01). Debug metadata comes from the final
+  result (M-02). Canonical `cue.words` propagate into utterances and drive
+  REAL word-level slicing (M-03). Repeated pronouns are NOT antecedents;
+  only entity evidence resolves openers (M-04).
+- **Phase 3 — contract parity (C-01).**
+  Every nested Zod object is strict; every nested Pydantic model forbids
+  extras. Clip IDs normalize to non-empty strings before duplicate
+  detection (1 == "1"). NaN/Infinity rejected in numeric fields.
+  RenderArtifactResult enforces 6.3 invariants (status=ok requires
+  video_url; status=error requires error + publishable=false).
+- **Phase 4 — timeline/visual (V-01).**
+  ReframeResult object (path + timeline + stats + cache_key +
+  pipeline_version); caption compositor uses timeline.state_at(ts) per frame
+  instead of the final face snapshot. Scenario-specific mocked-detection
+  tests added (single speaker, active switch, missed detection, caption
+  collision).
+- **Phase 5 — evaluation (G-01/G-02).**
+  computeAssignmentResult(): positives matched independently; hard-negative
+  overlaps reported for every prediction that touches them (a prediction may
+  overlap both, both facts reported). Rank-aware metrics iterate labels by
+  expected rank, not greedy order.
+- **Phase 6 — CI/docs (CI-01).**
+  Lint blocks; renderer CI pins the miner contract SHA; requirements
+  install fail-fast; visual tests included; test summaries published.
+
+## Revision v4 — what changed
 
 - **Phase A: render job correctness.** Sync jobs now go through the SAME
   durable reservation + in-memory registration as async/retry (transition_job
