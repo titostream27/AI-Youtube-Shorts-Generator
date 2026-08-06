@@ -26,7 +26,7 @@ class TestSharedFixturesPython(unittest.TestCase):
             VALID_DIR.exists(),
             "contracts/fixtures/valid not present — run the miner build first",
         )
-        v2_files = [p for p in VALID_DIR.glob("*.json") if "v2" in p.name]
+        v2_files = [p for p in VALID_DIR.glob("*.json") if "v2" in p.name and not p.name.startswith("render-result")]
         self.assertGreater(len(v2_files), 0, "expected at least one valid v2 fixture")
         for path in v2_files:
             with self.subTest(fixture=path.name):
@@ -44,6 +44,31 @@ class TestSharedFixturesPython(unittest.TestCase):
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 with self.assertRaises(Exception, msg=f"{path.name} should be invalid"):
                     RenderRequestV2(**payload)
+
+
+class TestRenderResultFixtureParity(unittest.TestCase):
+    """Hardening v3 E1 (#26/#29): the neutral render-result fixtures must pass
+    the Pydantic RenderResult validator identically to JSON Schema / Zod."""
+
+    def test_valid_render_result_fixtures_parse(self):
+        from render_contract import RenderResult
+        files = [p for p in VALID_DIR.glob("render-result*.json")]
+        self.assertGreater(len(files), 0, "expected render-result valid fixtures")
+        for path in files:
+            with self.subTest(fixture=path.name):
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                res = RenderResult(**payload)
+                self.assertEqual(res.contract_version, "2.0")
+
+    def test_invalid_render_result_fixtures_rejected(self):
+        from render_contract import RenderResult
+        files = [p for p in INVALID_DIR.glob("render-result*.json")]
+        self.assertGreater(len(files), 0, "expected render-result invalid fixtures")
+        for path in files:
+            with self.subTest(fixture=path.name):
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                with self.assertRaises(Exception, msg=f"{path.name} should be invalid"):
+                    RenderResult(**payload)
 
 
 if __name__ == "__main__":

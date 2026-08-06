@@ -404,7 +404,10 @@ class TestBrief2RendererCorrectness(JobLifecycleTestBase):
             )
             # Resubmit the SAME request_id after failure -> must create a NEW job.
             second = rs.render_async(dict(V2_BODY))
-        self.assertNotEqual(first.job_id, second.job_id)
+            self.assertNotEqual(first.job_id, second.job_id)
+            # Let the second worker finish so Windows can release the DB on teardown.
+            wait_until(lambda: rs._async_jobs.get(second.job_id, {}).get("state") in ("completed", "failed"),
+                       timeout=5)
 
     # ── F7: atomic idempotency / uniqueness ─────────────────────────────────
     def test_concurrent_duplicate_submissions_produce_one_active_job(self):

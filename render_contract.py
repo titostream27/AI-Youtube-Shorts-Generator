@@ -286,3 +286,35 @@ class RenderResponse(BaseModel):
     artifacts: Optional[List[Dict]] = None
     mode: str = "final"
     source: Optional[Dict] = None
+
+
+class RenderResultClip(BaseModel):
+    """One clip result inside the shared RenderResult (hardening v3 E1)."""
+    clip_id: Union[str, int]
+    status: str  # ok | error
+    clip_url: Optional[str] = None
+    duration_sec: Optional[float] = None
+    error: Optional[str] = None
+
+
+class RenderResult(BaseModel):
+    """Canonical render RESULT shared with the miner (hardening v3 E1).
+
+    Mirrors contracts/render-result-v2.schema.json so the same fixtures pass
+    JSON Schema, Zod (miner) and Pydantic (renderer) identically.
+    """
+    model_config = ConfigDict(extra="forbid")
+    contract_version: str = CONTRACT_VERSION
+    request_id: str
+    episode_id: str
+    job_id: Optional[str] = None
+    state: str  # completed|partial_failure|failed|cancelled
+    error: Optional[str] = None
+    source_video: Optional[str] = None
+    clips: List[RenderResultClip] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_state(self) -> "RenderResult":
+        if self.state not in ("completed", "partial_failure", "failed", "cancelled"):
+            raise ValueError(f"invalid render result state: {self.state}")
+        return self
