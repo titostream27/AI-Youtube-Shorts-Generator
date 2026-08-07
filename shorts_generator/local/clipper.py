@@ -1086,8 +1086,20 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                 scene_change=bool(scene_changed),
             )
             _planner_last_hold = _planner_step.hold_reason or _planner_step.reset_reason
-        except Exception:  # noqa: BLE001
+            if _planner_last_hold and _RENDER_STATS.get("planner_hold_reason") is None:
+                _RENDER_STATS["planner_hold_reason"] = _planner_last_hold
+        except Exception as exc:  # noqa: BLE001
+            # Brief v8 C14/V01: NEVER silently swallow a planner failure. Record
+            # a runtime diagnostic so the renderer fails closed / can surface a
+            # QC warning, instead of pretending the planner decided nothing.
             _planner_last_hold = None
+            if "runtime_warnings" not in _RENDER_STATS:
+                _RENDER_STATS["runtime_warnings"] = []
+            _RENDER_STATS["runtime_warnings"].append(
+                f"camera planner failed: {type(exc).__name__}: {exc}",
+            )
+            _RENDER_STATS["planner_failed"] = True
+            print(f"[track] planner error: {type(exc).__name__}: {exc}", flush=True)
         # Refresh face list every frame while split is enabled — the split
         # state machine needs to know when a reactor face disappears (if only
         # one face remains we must fade back to the single view).
