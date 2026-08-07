@@ -388,15 +388,44 @@ class RenderArtifactResult(BaseModel):
             raise ValueError(f"status must be 'ok' or 'error', got {self.status!r}")
         if self.qc_status not in ("passed", "failed", "unavailable"):
             raise ValueError(f"qc_status must be passed|failed|unavailable, got {self.qc_status!r}")
+        # Brief v7 4.3 (V7-R06): publishable=True requires ALL of:
+        #   status=ok, video_url present, qc_status=passed.
+        if self.publishable:
+            if self.status != "ok":
+                raise ValueError("publishable=True requires status=ok")
+            if not self.video_url:
+                raise ValueError("publishable=True requires video_url")
+            if self.qc_status != "passed":
+                raise ValueError(
+                    f"publishable=True requires qc_status=passed, got {self.qc_status!r}"
+                )
         return self
 
 
-class RenderResponse(BaseModel):
-    """Brief v6 6.3 — strictly typed response: rendered/artifacts use
-    RenderArtifactResult, never List[Dict]."""
+class RenderSubmissionResponse(BaseModel):
+    """Brief v7 4.1 (V7-R01) — typed submission response for async endpoints.
+
+    Represents a QUEUED or ACTIVE job, never a completed result. Clients
+    poll GET /api/render/status/{job_id} for completion.
+    """
     model_config = ConfigDict(extra="forbid")
     job_id: str
-    status: Literal["completed", "partial_failure"] = "completed"
+    request_id: str = ""
+    state: str  # queued | downloading | analysing | rendering | quality_check | ...
+    idempotent_hit: bool = False
+    attempt: int = 1
+    parent_job_id: Optional[str] = None
+    status_url: Optional[str] = None
+    result_url: Optional[str] = None
+
+
+class RenderResponse(BaseModel):
+    """Brief v6 6.3 / v7 4.2 — strictly typed FINAL response.
+
+    status has NO default — callers MUST pass it explicitly (V7-R02)."""
+    model_config = ConfigDict(extra="forbid")
+    job_id: str
+    status: Literal["completed", "partial_failure"]  # NO default — explicit
     source_video: str = ""
     rendered: List[RenderArtifactResult] = Field(default_factory=list)
     artifacts: Optional[List[RenderArtifactResult]] = None

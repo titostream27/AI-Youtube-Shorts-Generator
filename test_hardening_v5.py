@@ -93,13 +93,13 @@ class TestSyncIdempotencyNoPhantom(V5Base):
 
     def test_idempotency_hit_has_no_phantom_memory_entry(self):
         with mock.patch.object(rs, "_render", side_effect=lambda req, job_id: rs.RenderOutcome(
-                rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")):
+                rs.RenderResponse(job_id=job_id, source_video="", rendered=[], status="completed"), "completed")):
             first = rs.render(dict(V2_BODY))
         with rs._async_jobs_lock:
             mem_after_first = dict(rs._async_jobs)
         # Second submit with the SAME request_id -> idempotent hit.
         with mock.patch.object(rs, "_render", side_effect=lambda req, job_id: rs.RenderOutcome(
-                rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")):
+                rs.RenderResponse(job_id=job_id, source_video="", rendered=[], status="completed"), "completed")):
             second = rs.render(dict(V2_BODY))
         self.assertEqual(second.job_id, first.job_id)
         with rs._async_jobs_lock:
@@ -116,7 +116,7 @@ class TestSyncTransitionConflict(V5Base):
 
         def fake_render(req, job_id):
             calls["n"] += 1
-            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
+            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[], status="completed"), "completed")
 
         # Simulate the transition losing the CAS: force queued->downloading to fail.
         with mock.patch.object(rs, "transition_job", side_effect=lambda *a, **k: False), \
@@ -194,7 +194,7 @@ class TestTerminalDurabilityVsMemory(V5Base):
 
     def test_memory_never_reports_completed_on_persist_failure(self):
         def fake_render(req, job_id):
-            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
+            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[], status="completed"), "completed")
 
         # Make the canonical terminal persistence raise. Brief v6 4.3: the
         # failure must PROPAGATE (no success response) and memory must not
@@ -265,7 +265,7 @@ class TestForceRerenderIdentity(V5Base):
         body["request_id"] = "v5-force"
         body["force_rerender"] = True
         with mock.patch.object(rs, "_render", side_effect=lambda req, job_id: rs.RenderOutcome(
-                rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")):
+                rs.RenderResponse(job_id=job_id, source_video="", rendered=[], status="completed"), "completed")):
             first = rs.render(dict(body))
             # Second submission with force_rerender -> NEW attempt (not hit).
             second = rs.render(dict(body))

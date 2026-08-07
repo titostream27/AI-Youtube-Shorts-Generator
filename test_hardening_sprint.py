@@ -194,7 +194,7 @@ class TestPartialFailureParity(HardeningTestBase):
             rs.RenderArtifactResult(clip_id="1", status="ok", video_url="/out/short_01.mp4", publishable=True, qc_status="passed"),
             rs.RenderArtifactResult(clip_id="2", status="error", error={"message": "encode failed"}, publishable=False, qc_status="failed"),
         ]
-        response = rs.RenderResponse(job_id=job_id, source_video="src.mp4", rendered=rendered)
+        response = rs.RenderResponse(job_id=job_id, source_video="src.mp4", rendered=rendered, status="completed")
         rs._persist_job(
             job_id, "partial_failure", mode="final", episode_id="ep-harden",
             response=response.model_dump_json(),
@@ -225,7 +225,7 @@ class TestPartialFailureParity(HardeningTestBase):
             rs.RenderArtifactResult(clip_id="1", status="ok", video_url="/out/short_01.mp4", publishable=True, qc_status="passed"),
             rs.RenderArtifactResult(clip_id="2", status="error", error={"message": "encode failed"}, publishable=False, qc_status="failed"),
         ]
-        response = rs.RenderResponse(job_id=job_id, source_video="src.mp4", rendered=rendered)
+        response = rs.RenderResponse(job_id=job_id, source_video="src.mp4", rendered=rendered, status="completed")
         with rs._async_jobs_lock:
             rs._async_jobs[job_id] = {
                 "state": "partial_failure", "response": response, "error": None,

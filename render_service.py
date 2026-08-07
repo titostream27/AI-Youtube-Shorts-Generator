@@ -38,7 +38,7 @@ from render_contract import (
     RenderRequest,
     RenderRequestV2,
     RenderResponse,
-    SourceInfo,
+    RenderSubmissionResponse,
 )
 
 RENDER_ROOT = Path(os.getenv("RENDER_OUTPUT_DIR", "rendered")).resolve()
@@ -2582,15 +2582,22 @@ def _render(request, job_id: str) -> RenderOutcome:
     resp = RenderResponse(
         job_id=job_id,
         source_video=source,
-        # Brief v6 6.3: strictly typed artifacts — convert item dicts to
-        # RenderArtifactResult (no raw List[Dict] in the response model).
+        # Brief v7 4.2 (V7-R02): explicit status from final_status.
+        status=final_status,
+        # Brief v7 4.3 (V7-R03/R06): one canonical artifact list.
+        # publishable derived via model_validator: final + ok + qc passed.
         rendered=[
             RenderArtifactResult(
                 clip_id=str(it.get("clip_id", "")),
                 status=it.get("status", "error"),
                 video_url=it.get("video_url"),
                 thumbnail_url=it.get("thumbnail_url"),
-                publishable=bool(it.get("status") == "ok"),
+                publishable=(
+                    it.get("status") == "ok"
+                    and bool(it.get("video_url"))
+                    and (it.get("quality") or {}).get("status") == "passed"
+                    and mode == "final"
+                ),
                 qc_status=(it.get("quality") or {}).get("status", "unavailable"),
                 error=({"message": it["error"]} if it.get("error") else None),
             )
@@ -2602,7 +2609,12 @@ def _render(request, job_id: str) -> RenderOutcome:
                 status=a.status,
                 video_url=a.video_url,
                 thumbnail_url=a.thumbnail_url,
-                publishable=a.status == "ok",
+                publishable=(
+                    a.status == "ok"
+                    and bool(a.video_url)
+                    and (getattr(a.qc, "status", "unavailable") or "unavailable") == "passed"
+                    and mode == "final"
+                ),
                 qc_status=getattr(a.qc, "status", "unavailable") or "unavailable",
                 error=({"message": a.error} if getattr(a, "error", None) else None),
             )
@@ -2910,7 +2922,12 @@ def render_async(request: Dict[str, Any]):
             for jid, job in _async_jobs.items():
                 if job.get("request_id") == request_id and canonical_status(job.get("state", "")) in IDEMPOTENT_HIT_STATES:
                     print(f"[render] idempotent hit: {request_id} -> {jid}", flush=True)
-                    return RenderResponse(job_id=jid, source_video="", rendered=[])
+                    return RenderSubmissionResponse(
+                        job_id=jid, request_id=request_id,
+                        state=canonical_status(job.get("state", "queued")),
+                        idempotent_hit=True,
+                        attempt=job.get("attempt", 1),
+                    )
 
     job_id = uuid.uuid4().hex[:10]
     mode = getattr(request, "mode", "final") or "final"
@@ -2922,7 +2939,10 @@ def render_async(request: Dict[str, Any]):
     reserved = _reserve_job(request_id, job_id, mode=mode, episode_id=episode_id, request_json=request_json, force=force_rerender)
     if reserved != job_id:
         print(f"[render] idempotent hit (reserved): {request_id} -> {reserved}", flush=True)
-        return RenderResponse(job_id=reserved, source_video="", rendered=[])
+        return RenderSubmissionResponse(
+            job_id=reserved, request_id=request_id,
+            state="queued", idempotent_hit=True,
+        )
     with _async_jobs_lock:
         _async_jobs[job_id] = {"state": "queued", "response": None, "error": None, "request_id": request_id, "mode": mode, "episode_id": episode_id}
 
@@ -2933,7 +2953,10 @@ def render_async(request: Dict[str, Any]):
         _enqueue_job(job_id)
     except QueueAdmissionError as exc:
         raise HTTPException(status_code=503, detail="Render queue is full") from exc
-    return RenderResponse(job_id=job_id, source_video="", rendered=[])
+    return RenderSubmissionResponse(
+        job_id=job_id, request_id=request_id,
+        state="queued", attempt=1,
+    )
 
 
 def _enqueue_job(job_id: str) -> None:
@@ -3268,7 +3291,19 @@ def render(request: Dict[str, Any]):
         # Brief v5 R-01: idempotent hit — DO NOT create a phantom memory
         # entry for a job that does not exist. Return the existing job.
         print(f"[render] sync idempotent hit: {request_id} -> {reserved}", flush=True)
-        return RenderResponse(job_id=reserved, source_video="", rendered=[])
+        # Brief v7 4.1: sync idempotent hit returns the stored final result
+        # or a 409 if the job is still active.
+        with _async_jobs_lock:
+            existing = _async_jobs.get(reserved, {})
+            stored_resp = existing.get("response")
+        if stored_resp and isinstance(stored_resp, RenderResponse):
+            return stored_resp
+        # Job exists but not yet completed — return 409 Conflict.
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job {reserved} is still active (state={existing.get('state', 'unknown')}). "
+                   f"Use GET /api/render/status/{reserved} to poll.",
+        )
     _register_job_memory(job_id, request_id, mode, episode_id)
     # Block until the current job finishes (true FIFO queue) — a 503 timeout
     # would just push the error back to the client, not serialize the work.

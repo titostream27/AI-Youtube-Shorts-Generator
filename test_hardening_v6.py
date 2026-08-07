@@ -76,7 +76,7 @@ class TestCheckedActiveTransitions(V6Base):
 
         def fake_render(req, job_id):
             calls["n"] += 1
-            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
+            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[], status="completed"), "completed")
 
         with mock.patch.object(rs, "_render", side_effect=fake_render):
             real_transition = rs.transition_job
@@ -124,7 +124,7 @@ class TestSyncTerminalPersistReturn(V6Base):
 
     def test_persist_false_no_completed_memory(self):
         def fake_render(req, job_id):
-            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
+            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[], status="completed"), "completed")
 
         with mock.patch.object(rs, "_persist_terminal_via_transition", return_value=False), \
              mock.patch.object(rs, "_render", side_effect=fake_render):

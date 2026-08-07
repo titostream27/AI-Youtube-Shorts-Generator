@@ -54,7 +54,7 @@ def wait_until(pred, timeout=5.0, interval=0.05):
 
 def dummy_outcome(status="completed"):
     """Build a RenderOutcome from a dummy response (Phase-2 _render contract)."""
-    dummy = rs.RenderResponse(job_id="ignored", source_video="", rendered=[])
+    dummy = rs.RenderResponse(job_id="ignored", source_video="", rendered=[], status="completed")
     return rs.RenderOutcome(dummy, status)
 
 
@@ -93,7 +93,7 @@ class TestAsyncJobIdentity(JobLifecycleTestBase):
     def test_async_submission_job_id_matches_registry_and_db(self):
         """Guard (characterization): submission response job_id == registry
         key == persisted row. Should hold even after refactors."""
-        dummy = rs.RenderResponse(job_id="ignored", source_video="", rendered=[])
+        dummy = rs.RenderResponse(job_id="ignored", source_video="", rendered=[], status="completed")
         with mock.patch.object(rs, "_render", return_value=rs.RenderOutcome(dummy, "completed")) as rnd:
             resp = rs.render_async(dict(V2_BODY))
             job_id = resp.job_id
@@ -115,7 +115,7 @@ class TestAsyncJobIdentity(JobLifecycleTestBase):
         """RED (pre-fix): a successful async job stays 'queued' in SQLite —
         the worker only persists 'failed' on error, never 'completed' on
         success. Canonical state machine requires a terminal persisted state."""
-        dummy = rs.RenderResponse(job_id="ignored", source_video="", rendered=[])
+        dummy = rs.RenderResponse(job_id="ignored", source_video="", rendered=[], status="completed")
         with mock.patch.object(rs, "_render", return_value=rs.RenderOutcome(dummy, "completed")):
             resp = rs.render_async(dict(V2_BODY))
             self.assertTrue(
@@ -171,7 +171,7 @@ class TestPersistedIdempotency(JobLifecycleTestBase):
         # Simulated restart: registry is empty, DB has the job.
         with rs._async_jobs_lock:
             rs._async_jobs.clear()
-        dummy = rs.RenderResponse(job_id="ignored", source_video="", rendered=[])
+        dummy = rs.RenderResponse(job_id="ignored", source_video="", rendered=[], status="completed")
         with mock.patch.object(rs, "_render", return_value=rs.RenderOutcome(dummy, "completed")):
             resp = rs.render_async(dict(body))
         # Should return the EXISTING job, not create a duplicate.
@@ -191,7 +191,7 @@ class TestQueuedCancellation(JobLifecycleTestBase):
         def fake_render(request, job_id):
             calls.append((request, job_id))
             time.sleep(0.1)
-            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
+            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[], status="completed"), "completed")
 
         # Hold the lock so the worker stays queued.
         rs._render_lock.acquire()
@@ -220,7 +220,7 @@ class TestQueuedCancellation(JobLifecycleTestBase):
         try:
             with mock.patch.object(
                 rs, "_render",
-                side_effect=lambda req, jid: (time.sleep(0.05), rs.RenderOutcome(rs.RenderResponse(job_id=jid, source_video="", rendered=[]), "completed"))[1],
+                side_effect=lambda req, jid: (time.sleep(0.05), rs.RenderOutcome(rs.RenderResponse(job_id=jid, source_video="", rendered=[], status="completed"), "completed"))[1],
             ):
                 resp = rs.render_async(dict(V2_BODY))
                 job_id = resp.job_id
@@ -321,7 +321,7 @@ class TestBrief2RendererCorrectness(JobLifecycleTestBase):
 
         def fake_render(request, job_id):
             seen["mode"] = getattr(request, "mode", None)
-            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
+            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[], status="completed"), "completed")
 
         body = dict(V2_BODY)
         body["mode"] = "preview"
@@ -339,7 +339,7 @@ class TestBrief2RendererCorrectness(JobLifecycleTestBase):
 
         body = dict(V2_BODY)
         body["contract_version"] = "2.1"
-        with mock.patch.object(rs, "_render", return_value=rs.RenderOutcome(rs.RenderResponse(job_id="x", source_video="", rendered=[]), "completed")):
+        with mock.patch.object(rs, "_render", return_value=rs.RenderOutcome(rs.RenderResponse(job_id="x", source_video="", rendered=[], status="completed"), "completed")):
             client = TestClient(rs.app)
             resp = client.post("/api/render/async", json=body)
         # Unsupported version must be rejected (400/422), never silently parsed.
@@ -357,7 +357,7 @@ class TestBrief2RendererCorrectness(JobLifecycleTestBase):
                     rs.transition_job(job_id, "downloading", "rendering", mode="final", episode_id="ep-1")
                     entered.set()
                     time.sleep(0.4)
-                    return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
+                    return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[], status="completed"), "completed")
 
         with mock.patch.object(rs, "_render", side_effect=fake_render):
             resp = rs.render_async(dict(V2_BODY))
@@ -379,7 +379,7 @@ class TestBrief2RendererCorrectness(JobLifecycleTestBase):
                     rs.transition_job(job_id, "downloading", "rendering", mode="final", episode_id="ep-1")
                     entered.set()
                     time.sleep(0.5)
-                    return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
+                    return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[], status="completed"), "completed")
 
         with mock.patch.object(rs, "_render", side_effect=fake_render):
             resp = rs.render_async(dict(V2_BODY))
@@ -421,7 +421,7 @@ class TestBrief2RendererCorrectness(JobLifecycleTestBase):
         def fake_render(request, job_id):
             entered.set()
             time.sleep(0.5)
-            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
+            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[], status="completed"), "completed")
 
         results = []
 

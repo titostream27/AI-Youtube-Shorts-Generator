@@ -230,7 +230,7 @@ class TestForceRerender(unittest.TestCase):
                                       "caption_plan": {"language": "en", "cues": [], "highlight_terms": []},
                                       "editing_events": []}])
         with patch.object(rs, "_render", side_effect=lambda *a, **k: rs.RenderOutcome(
-            rs.RenderResponse(job_id=a[1], source_video="", rendered=[]), "completed")):
+            rs.RenderResponse(job_id=a[1], source_video="", rendered=[], status="completed"), "completed")):
             resp = rs.render_async(req)
         self.assertNotEqual(resp.job_id, "job-hit")
         self.assertTrue(resp.job_id.startswith("job-") is False)

@@ -92,7 +92,7 @@ class TestSyncOrchestration(V4Base):
         """RED: sync render currently never registers in _async_jobs, so
         transition_job(queued->downloading) fails and the job stays queued."""
         with mock.patch.object(rs, "_render", side_effect=lambda req, job_id: rs.RenderOutcome(
-            rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")):
+            rs.RenderResponse(job_id=job_id, source_video="", rendered=[], status="completed"), "completed")):
             resp = rs.render(dict(V2_BODY))
         # Terminal state must be persisted.
         self.assertEqual(self._db_status(resp.job_id), "completed")
@@ -129,7 +129,7 @@ class TestV1AsyncNoRequestId(V4Base):
             clips=[{"clip_id": 1, "title": "a", "start_sec": 1, "end_sec": 3, "aspect_ratio": "9:16"}],
         )
         patcher = mock.patch.object(rs, "_render", side_effect=lambda r, j: rs.RenderOutcome(
-            rs.RenderResponse(job_id=j, source_video="", rendered=[]), "completed"))
+            rs.RenderResponse(job_id=j, source_video="", rendered=[], status="completed"), "completed"))
         patcher.start()
         try:
             resp = rs.render_async(req)
@@ -161,7 +161,7 @@ class TestMultiClipSequencing(V4Base):
             # After all clips: QC once.
             rs.transition_job(job_id, "rendering", "quality_check", mode="final", episode_id="ep")
             states.append(("after-qc", rs._async_jobs.get(job_id, {}).get("state")))
-            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[]), "completed")
+            return rs.RenderOutcome(rs.RenderResponse(job_id=job_id, source_video="", rendered=[], status="completed"), "completed")
 
         patcher = mock.patch.object(rs, "_render", side_effect=fake_render)
         patcher.start()
@@ -209,7 +209,7 @@ class TestQueueAndOrphan(V4Base):
         single persistent worker consumes the queue."""
         before = threading.active_count()
         patcher = mock.patch.object(rs, "_render", side_effect=lambda r, j: rs.RenderOutcome(
-            rs.RenderResponse(job_id=j, source_video="", rendered=[]), "completed"))
+            rs.RenderResponse(job_id=j, source_video="", rendered=[], status="completed"), "completed"))
         patcher.start()
         try:
             jobs = []
@@ -278,7 +278,7 @@ class TestFinalEncodeFailure(V4Base):
                         error={"message": "final encode failed: styled+clean"},
                         qc_status="failed",
                     ),
-                ]), "completed")
+                ], status="completed"), "completed")
             return outcome
 
         patcher = mock.patch.object(rs, "_render", side_effect=fake_render)
