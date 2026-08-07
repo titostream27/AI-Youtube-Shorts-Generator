@@ -2631,51 +2631,65 @@ def _render(request, job_id: str) -> RenderOutcome:
             src_info = {"width": src_probe[0], "height": src_probe[1]}
     except Exception:  # noqa: BLE001
         pass
-    resp = RenderResponse(
+    # Brief v8 R02/C04: build the final response from ONE canonical artifact
+    # list derived from the RenderArtifact models (already QC-mutated). The
+    # legacy `rendered` key is an alias/serialization of the SAME list — never
+    # constructed from a second data structure aggregate QC cannot touch.
+    resp = _build_render_response(
         job_id=job_id,
         source_video=source,
-        # Brief v7 4.2 (V7-R02): explicit status from final_status.
-        status=final_status,
-        # Brief v7 4.3 (V7-R03/R06): one canonical artifact list.
-        # publishable derived via model_validator: final + ok + qc passed.
-        rendered=[
-            RenderArtifactResult(
-                clip_id=str(it.get("clip_id", "")),
-                status=it.get("status", "error"),
-                video_url=it.get("video_url"),
-                thumbnail_url=it.get("thumbnail_url"),
-                publishable=(
-                    it.get("status") == "ok"
-                    and bool(it.get("video_url"))
-                    and (it.get("quality") or {}).get("status") == "passed"
-                    and mode == "final"
-                ),
-                qc_status=(it.get("quality") or {}).get("status", "unavailable"),
-                error=({"message": it["error"]} if it.get("error") else None),
-            )
-            for it in rendered
-        ],
-        artifacts=[
-            RenderArtifactResult(
-                clip_id=str(a.clip_id),
-                status=a.status,
-                video_url=a.video_url,
-                thumbnail_url=a.thumbnail_url,
-                publishable=(
-                    a.status == "ok"
-                    and bool(a.video_url)
-                    and (getattr(a.qc, "status", "unavailable") or "unavailable") == "passed"
-                    and mode == "final"
-                ),
-                qc_status=getattr(a.qc, "status", "unavailable") or "unavailable",
-                error=({"message": a.error} if getattr(a, "error", None) else None),
-            )
-            for a in artifacts
-        ],
+        mode=mode,
+        canonical_results=_canonicalize(artifacts, mode),
+        final_status=final_status,
+        src_info=src_info or {},
+    )
+    return RenderOutcome(resp, final_status)
+
+
+def _canonicalize(artifact_models, mode: str) -> "list[RenderArtifactResult]":
+    """Convert RenderArtifact models (already QC-mutated) into the ONE
+    canonical RenderArtifactResult list used by every representation."""
+    out = []
+    for a in artifact_models:
+        out.append(RenderArtifactResult(
+            clip_id=str(a.clip_id),
+            status=a.status,
+            video_url=a.video_url,
+            thumbnail_url=a.thumbnail_url,
+            publishable=(
+                a.status == "ok"
+                and bool(a.video_url)
+                and (getattr(a.qc, "status", "unavailable") or "unavailable") == "passed"
+                and mode == "final"
+            ),
+            qc_status=getattr(a.qc, "status", "unavailable") or "unavailable",
+            error=({"message": a.error} if getattr(a, "error", None) else None),
+        ))
+    return out
+
+
+def _build_render_response(*, job_id: str, source_video: str, mode: str,
+                           canonical_results, final_status: str = "completed",
+                           src_info: dict = None) -> RenderResponse:
+    """Build a RenderResponse from ONE canonical list of RenderArtifactResult.
+
+    Aggregate QC has already demoted any invalid ok artifact. Deriving
+    `rendered` and `artifacts` from this ONE list guarantees they can never
+    diverge, and final_status/publishability are consistent.
+    """
+    canonical = list(canonical_results)
+    # Recompute final status from the SAME canonical list (paranoia guard).
+    ok_count = sum(1 for a in canonical if a.status == "ok")
+    effective_status = "completed" if ok_count == len(canonical) and canonical else "partial_failure"
+    return RenderResponse(
+        job_id=job_id,
+        source_video=source_video,
+        status=effective_status or final_status,
+        rendered=canonical,
+        artifacts=canonical,
         mode=mode,
         source=src_info or {},
     )
-    return RenderOutcome(resp, final_status)
 
 
 # Serial render queue: only ONE render job runs at a time. Concurrent

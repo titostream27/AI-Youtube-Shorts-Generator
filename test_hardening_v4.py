@@ -254,7 +254,7 @@ class TestQueueAndOrphan(V4Base):
         with rs._async_jobs_lock:
             rs._async_jobs.pop("job-stale", None)
         resp = rs.render_job_status("job-stale")
-        self.assertEqual(resp["state"], "orphaned")
+        self.assertEqual(resp.state, "orphaned")
 
 
 class TestFinalEncodeFailure(V4Base):
