@@ -124,6 +124,8 @@ class TestReserveAttemptHelper(V9DBIsolation):
                 reason="retry",
             )
             attempts.append(r.attempt)
+            # Simulate the render failing so the child becomes retryable.
+            rs._persist_job(r.job_id, "failed", mode="final", episode_id="ep-r2")
             prev = r.job_id
 
         self.assertEqual(attempts, [2, 3, 4])

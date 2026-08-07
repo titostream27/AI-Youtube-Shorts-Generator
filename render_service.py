@@ -337,6 +337,8 @@ def _migrate_render_jobs(conn) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_render_jobs_request_id ON render_jobs(request_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_render_jobs_status ON render_jobs(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_render_jobs_created_at ON render_jobs(created_at)")
+    # Brief v10 C06 (section 6.1): index on parent_job_id for lineage queries.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_render_jobs_parent_job_id ON render_jobs(parent_job_id)")
     # Phase-2 correctness (F7): at most ONE ACTIVE job per request_id. The
     # partial index only covers non-terminal states so a failed/completed job
     # may be resubmitted. This gives idempotency real uniqueness, not just a
@@ -346,6 +348,38 @@ def _migrate_render_jobs(conn) -> None:
         "WHERE request_id != '' AND status IN "
         "('queued','downloading','analysing','rendering','quality_check')"
     )
+    # Brief v10 C06: unique (request_id, attempt) guarantees monotonically
+    # allocated attempt numbers. STOP-safe: detect existing duplicates BEFORE
+    # creating the unique index; if any exist we must NOT silently create it
+    # (Section 15 stop condition). The unique index is intentionally partial on
+    # request_id != '' so V1 legacy jobs (empty request_id) are unaffected.
+    if _has_duplicate_request_attempt(conn):
+        raise PersistenceError(
+            "duplicate (request_id, attempt) rows exist; refusing to create "
+            "unique index (v10 stop condition). Clean up before retrying."
+        )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_render_jobs_request_attempt "
+        "ON render_jobs(request_id, attempt) "
+        "WHERE request_id IS NOT NULL AND request_id <> ''"
+    )
+
+
+def _has_duplicate_request_attempt(conn) -> bool:
+    """Return True when the existing render_jobs rows contain duplicate
+    (request_id, attempt) pairs for non-empty request_id — a stop condition
+    that must be resolved before the unique index can be created."""
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM ("
+            "  SELECT request_id, attempt FROM render_jobs "
+            "  WHERE request_id IS NOT NULL AND request_id <> '' "
+            "  GROUP BY request_id, attempt HAVING COUNT(*) > 1"
+            ") AS dup"
+        ).fetchone()
+        return bool(row and row[0] > 0)
+    except Exception:  # noqa: BLE001 — column may be absent on legacy schema
+        return False
 
 
 def _persist_job(job_id: str, status: str, *, mode: str = "final",
@@ -713,6 +747,143 @@ def _find_job_by_request(request_id: str) -> Optional[str]:
 IDEMPOTENT_HIT_STATES = (
     "queued", "downloading", "analysing", "rendering", "quality_check", "completed",
 )
+
+
+class AttemptReservation:
+    """Brief v10 C06 — result of an atomic attempt reservation.
+
+    job_id: the child job to use (newly created, or the durable winner).
+    attempt: the allocated attempt number (monotonic within the lineage).
+    parent_job_id: the source job this attempt derives from.
+    created: True when this call inserted a fresh queued row.
+    existing_winner_job_id: when created is False, the durable winner this
+    call resolved to (avoiding a duplicate attempt).
+    """
+
+    __slots__ = ("job_id", "attempt", "parent_job_id", "created", "existing_winner_job_id")
+
+    def __init__(self, job_id=None, attempt=1, parent_job_id=None,
+                 created=False, existing_winner_job_id=None):
+        self.job_id = job_id
+        self.attempt = attempt
+        self.parent_job_id = parent_job_id
+        self.created = created
+        self.existing_winner_job_id = existing_winner_job_id
+
+    def __repr__(self):
+        return (
+            f"AttemptReservation(job_id={self.job_id!r}, attempt={self.attempt}, "
+            f"parent_job_id={self.parent_job_id!r}, created={self.created}, "
+            f"winner={self.existing_winner_job_id!r})"
+        )
+
+
+def reserve_attempt(*, source_job_id, request_id, request_json, mode,
+                    episode_id, reason) -> AttemptReservation:
+    """Brief v10 C06 — single durable attempt allocator for retry and force.
+
+    Runs under BEGIN IMMEDIATE so concurrent retry/force calls cannot allocate
+    the same attempt number. Rules:
+      - For retry, the source job must be failed or partial_failure (verified
+        inside the transaction).
+      - next attempt = max(existing attempts for this request lineag) + 1,
+        read inside the transaction.
+      - Insert the new queued row before leaving the transaction.
+      - If a concurrent caller already created the same next active attempt,
+        the durable unique index (request_id, attempt) forces one winner; a
+        duplicate insert surfaces as IntegrityError and we return the winner.
+      - Legacy V1 (request_id == "") retry concurrency is unsupported -> 409.
+    """
+    import sqlite3
+    import datetime
+    from typing import cast as _cast
+
+    if reason not in ("retry", "force"):
+        raise ValueError(f"attempt reason must be 'retry' or 'force', got {reason!r}")
+
+    # V1 legacy: no request_id lineage -> polite 409, never nondeterministic.
+    if not request_id:
+        raise HTTPException(status_code=409, detail="retry concurrency unsupported for legacy V1 (empty request_id)")
+
+    new_job_id = uuid.uuid4().hex[:10]
+    try:
+        with _db_lock, _db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            # For retry, verify the source is a terminal retryable state.
+            if reason == "retry" and source_job_id:
+                row = conn.execute(
+                    "SELECT status FROM render_jobs WHERE job_id = ?", (source_job_id,)
+                ).fetchone()
+                if not row:
+                    conn.rollback()
+                    raise HTTPException(status_code=404, detail="source job not found for retry")
+                if canonical_status(row[0]) not in ("failed", "partial_failure"):
+                    src = canonical_status(row[0])
+                    conn.rollback()
+                    raise HTTPException(status_code=409, detail=f"job is {src}; retry only allowed from failed or partial_failure")
+                # Brief v10 C06: a concurrent retry may have already created a
+                # fresh ACTIVE child for this parent. Resolve to that child
+                # deterministically instead of allocating another attempt.
+                child = conn.execute(
+                    "SELECT job_id, attempt FROM render_jobs "
+                    "WHERE parent_job_id = ? AND status IN "
+                    "('queued','downloading','analysing','rendering','quality_check') "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (source_job_id,),
+                ).fetchone()
+                if child:
+                    conn.rollback()
+                    return AttemptReservation(
+                        job_id=child[0], attempt=int(child[1] or 1),
+                        parent_job_id=source_job_id, created=False,
+                        existing_winner_job_id=child[0],
+                    )
+            # Read latest attempt for this lineage inside the transaction.
+            row = conn.execute(
+                "SELECT MAX(attempt) FROM render_jobs "
+                "WHERE request_id = ? AND attempt IS NOT NULL",
+                (request_id,),
+            ).fetchone()
+            max_attempt = row[0] if (row and row[0] is not None) else 0
+            alloc_attempt = int(max_attempt) + 1
+            parent = source_job_id
+            now = datetime.datetime.utcnow().isoformat()
+            try:
+                conn.execute(
+                    "INSERT INTO render_jobs "
+                    "(job_id, status, mode, episode_id, request, response, error, created_at, updated_at,"
+                    " request_id, parent_job_id, attempt, started_at, finished_at, last_error_stage, process_boot_id)"
+                    " VALUES (?, 'queued', ?, ?, ?, '', '', ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)",
+                    (new_job_id, mode, episode_id, request_json, now, now,
+                     request_id, parent, alloc_attempt, PROCESS_BOOT_ID),
+                )
+            except sqlite3.IntegrityError:
+                # A concurrent caller already reserved this (request_id, attempt):
+                # return the durable winner deterministically instead of a 500.
+                conn.rollback()
+                winner = conn.execute(
+                    "SELECT job_id FROM render_jobs "
+                    "WHERE request_id = ? AND attempt = ? ORDER BY created_at ASC LIMIT 1",
+                    (request_id, alloc_attempt),
+                ).fetchone()
+                winner_id = winner[0] if winner else new_job_id
+                return AttemptReservation(
+                    job_id=winner_id, attempt=alloc_attempt, parent_job_id=parent,
+                    created=False, existing_winner_job_id=winner_id,
+                )
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        _record_db_error("reserve_attempt", e)
+        if isinstance(e, HTTPException):
+            raise
+        if isinstance(e, PersistenceError):
+            raise
+        raise PersistenceError(f"reserve_attempt failed: {e}") from e
+
+    return AttemptReservation(
+        job_id=new_job_id, attempt=alloc_attempt, parent_job_id=parent, created=True,
+        existing_winner_job_id=None,
+    )
 
 
 def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
