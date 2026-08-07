@@ -2824,50 +2824,14 @@ def _render(request, job_id: str) -> RenderOutcome:
             try:
                 from quality_gate import quality_gate
                 qc = quality_gate(out_path)
-                item["quality"] = {
-                    "status": qc["status"],
-                    "score": qc["quality_score"],
-                    "warnings": qc["warnings"][:6],
-                }
-                # Structured QC detail (brief §23).
-                artifact.qc.score = float(qc["quality_score"])
-                artifact.qc.output_width = int(qc.get("checks", {}).get("resolution", "1080x1920").split("x")[0] or 1080)
-                try:
-                    artifact.qc.output_height = int(qc["checks"]["resolution"].split("x")[1])
-                except Exception:  # noqa: BLE001
-                    pass
-                artifact.qc.codec = qc.get("checks", {}).get("codec", "h264")
-                artifact.qc.pixel_format = qc.get("checks", {}).get("pix_fmt", "yuv420p")
-                artifact.qc.audio_lufs = qc.get("checks", {}).get("audio_lufs")
-                artifact.qc.audio_true_peak = qc.get("checks", {}).get("audio_true_peak")
-                artifact.qc.audio_sync_ms = qc.get("checks", {}).get("audio_sync_ms")
-                artifact.qc.black_frame_ratio = qc.get("checks", {}).get("black_frame_ratio", 0) or 0
-                artifact.qc.frozen_frame_ratio = qc.get("checks", {}).get("frozen_frame_ratio", 0) or 0
+                _apply_qc_to_artifact(artifact, item, qc, mode)
                 artifact.qc.upscale_factor = _estimate_upscale(source, output_w, output_h)
-                artifact.qc.warnings = qc["warnings"][:6]
-                if qc["status"] != "pass":
-                    item["status"] = "error"
-                    item["error"] = f"quality gate failed: {qc['warnings'][:3]}"
-                    artifact.status = "error"
-                    artifact.error = item["error"]
-                    print(f"[render] clip {i}: QC FAILED ({qc['warnings'][:3]})", flush=True)
             except Exception as e:  # noqa: BLE001
                 # Brief v5 4.5: FINAL mode must fail closed when QC is
                 # unavailable — a clip without QC cannot be published. Preview
                 # mode may continue with a warning (publishable=false).
                 print(f"[render] clip {i}: quality gate error ({e}), continuing", flush=True)
-                if mode == "final":
-                    item["status"] = "error"
-                    item["error"] = f"quality gate unavailable: {e}"
-                    artifact.status = "error"
-                    artifact.error = item["error"]
-                    artifact.qc.status = "unavailable"
-                else:
-                    artifact.qc.status = "unavailable"
-                    item.setdefault("quality", {}).update({
-                        "status": "unavailable",
-                        "warnings": [f"quality gate unavailable: {e}"],
-                    })
+                _apply_qc_to_artifact(artifact, item, None, mode)
 
             if item["status"] == "ok":
                 item["clip_path"] = os.path.abspath(out_path)
@@ -2943,6 +2907,73 @@ def _render(request, job_id: str) -> RenderOutcome:
         src_info=src_info or {},
     )
     return RenderOutcome(resp, final_status)
+
+
+def _apply_qc_to_artifact(artifact, item, qc, mode: str) -> bool:
+    """Apply one quality_gate result to an artifact (brief v11 C12).
+
+    Returns True when the artifact stays publishable-eligible (ok + passed).
+    The canonical qc.status vocabulary is 'passed' | 'failed' | 'unavailable'
+    (QCDetail contract). quality_gate returns 'pass'/'fail' — the mapping to
+    the canonical value happens HERE, so the aggregate-QC gate and
+    _canonicalize() always see the same vocabulary.
+
+    Before v11 this mapping was missing: a passing gate ('pass', score 100)
+    left artifact.qc.status at its default 'unavailable', the aggregate gate
+    demoted the artifact to error (fail-closed on unavailable), and every
+    real render died with an empty error.
+    """
+    if qc is None:
+        artifact.qc.status = "unavailable"
+        if mode == "final":
+            item["status"] = "error"
+            item["error"] = "quality gate unavailable"
+            artifact.status = "error"
+            artifact.error = item["error"]
+            print(f"[render] clip {artifact.clip_id}: quality gate unavailable (final)", flush=True)
+            return False
+        item.setdefault("quality", {}).update({
+            "status": "unavailable",
+            "warnings": ["quality gate unavailable"],
+        })
+        return True
+
+    item["quality"] = {
+        "status": qc["status"],
+        "score": qc["quality_score"],
+        "warnings": qc["warnings"][:6],
+    }
+    # Structured QC detail (brief §23).
+    artifact.qc.score = float(qc["quality_score"])
+    try:
+        artifact.qc.output_width = int(qc.get("checks", {}).get("resolution", "1080x1920").split("x")[0] or 1080)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        artifact.qc.output_height = int(qc["checks"]["resolution"].split("x")[1])
+    except Exception:  # noqa: BLE001
+        pass
+    artifact.qc.codec = qc.get("checks", {}).get("codec", "h264")
+    artifact.qc.pixel_format = qc.get("checks", {}).get("pix_fmt", "yuv420p")
+    artifact.qc.audio_lufs = qc.get("checks", {}).get("audio_lufs")
+    artifact.qc.audio_true_peak = qc.get("checks", {}).get("audio_true_peak")
+    artifact.qc.audio_sync_ms = qc.get("checks", {}).get("audio_sync_ms")
+    artifact.qc.black_frame_ratio = qc.get("checks", {}).get("black_frame_ratio", 0) or 0
+    artifact.qc.frozen_frame_ratio = qc.get("checks", {}).get("frozen_frame_ratio", 0) or 0
+    artifact.qc.upscale_factor = artifact.qc.upscale_factor  # set by caller
+    artifact.qc.warnings = qc["warnings"][:6]
+
+    if qc["status"] != "pass":
+        item["status"] = "error"
+        item["error"] = f"quality gate failed: {qc['warnings'][:3]}"
+        artifact.status = "error"
+        artifact.error = item["error"]
+        artifact.qc.status = "failed"
+        print(f"[render] clip {artifact.clip_id}: QC FAILED ({qc['warnings'][:3]})", flush=True)
+        return False
+
+    artifact.qc.status = "passed"
+    return True
 
 
 def _canonicalize(artifact_models, mode: str) -> "list[RenderArtifactResult]":
