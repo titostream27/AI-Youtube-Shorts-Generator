@@ -12,13 +12,43 @@ Run: .venv/Scripts/python.exe -m pytest test_hardening_v7.py -q
 """
 import os
 import sys
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import render_service as rs
 from render_contract import RenderResponse, RenderArtifactResult
+
+
+class V7DBIsolation(unittest.TestCase):
+    """Brief v8 C15/F1 — every SQLite-touching test gets an isolated temp DB
+    and closed connections, so the full suite has zero file-lock failures."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmp.name)
+        self.db_path = self.tmp_path / "jobs.db"
+        self.out_root = self.tmp_path / "out"
+        self.out_root.mkdir()
+        self._patchers = [
+            mock.patch.object(rs, "JOB_DB_PATH", self.db_path),
+            mock.patch.object(rs, "RENDER_ROOT", self.out_root),
+        ]
+        for p in self._patchers:
+            p.start()
+            self.addCleanup(p.stop)
+        rs._close_db_conns()
+        with rs._async_jobs_lock:
+            rs._async_jobs.clear()
+
+    def tearDown(self):
+        rs._close_db_conns()
+        time.sleep(0.1)  # let worker threads release DB handles on Windows
+        self._tmp.cleanup()
+
 
 V2_BODY = {
     "contract_version": "2.0",
@@ -40,7 +70,7 @@ V2_BODY = {
 }
 
 
-class TestAsyncSubmissionResponse(unittest.TestCase):
+class TestAsyncSubmissionResponse(V7DBIsolation):
     """API-01: async new submission must never serialize as completed."""
 
     def test_async_new_submission_not_completed(self):
@@ -58,7 +88,7 @@ class TestAsyncSubmissionResponse(unittest.TestCase):
         self.assertIsNone(status, "submission response must not have final status")
 
 
-class TestAsyncIdempotentHit(unittest.TestCase):
+class TestAsyncIdempotentHit(V7DBIsolation):
     """API-02: async idempotent hit must expose actual job state, not completed."""
 
     def test_idempotent_hit_returns_actual_state(self):
@@ -80,7 +110,7 @@ class TestAsyncIdempotentHit(unittest.TestCase):
         )
 
 
-class TestPartialFailureStatus(unittest.TestCase):
+class TestPartialFailureStatus(V7DBIsolation):
     """API-03: partial-failure final response must have status=partial_failure
     in the response object, in-memory job, AND persisted SQLite row."""
 
@@ -117,7 +147,7 @@ class TestPartialFailureStatus(unittest.TestCase):
         )
 
 
-class TestPublishabilityInvariants(unittest.TestCase):
+class TestPublishabilityInvariants(V7DBIsolation):
     """API-03 supplement: publishable must respect mode and QC."""
 
     def test_preview_artifact_never_publishable(self):
