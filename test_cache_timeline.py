@@ -57,15 +57,28 @@ class TestCacheTimelineContract(unittest.TestCase):
         clipper._FRAME_TIMELINE.clear()
         self._tmp.cleanup()
 
+    @staticmethod
+    def _fake_reframe_factory():
+        """Return a fake _reframe_vertical that writes into the per-render
+        ReframeContext (kw['trace']) per the v10 production contract — never
+        the module-global _FRAME_TIMELINE."""
+        def fake_reframe(cut_path, out_path, aspect_ratio, **kw):
+            ctx = kw.get("trace")
+            target = ctx.frames if ctx is not None else clipper._FRAME_TIMELINE
+            target.clear()
+            target.append({"frame_no": 1, "t_sec": 0.033, "speaker_track_id": 1, "split_alpha": 0.0, "face_count": 1})
+            _write_video(out_path + ".silent.mkv")
+            return out_path + ".silent.mkv"
+        return fake_reframe
+
     def _render_once(self, profile="a1"):
         """First (miss) render writes a sidecar; returns path+timeline."""
         out = str(self.tmp / "out.mp4")
         # Fake an actual reframe that writes media and records a timeline.
-        def fake_reframe(cut_path, out_path, aspect_ratio, **kw):
-            clipper._FRAME_TIMELINE.clear()
-            clipper._FRAME_TIMELINE.append({"frame_no": 1, "t_sec": 0.033, "speaker_track_id": 1, "split_alpha": 0.0, "face_count": 1})
-            _write_video(out_path + ".silent.mkv")
-            return out_path + ".silent.mkv"
+        # Brief v10 C10 (V10-V01): the mock writes INTO the per-render
+        # ReframeContext (kw["trace"]), matching the new production contract —
+        # never the module-global _FRAME_TIMELINE.
+        fake_reframe = self._fake_reframe_factory()
         with mock.patch.object(clipper, "_cut_subclip", return_value=None), \
              mock.patch.object(clipper, "_reframe_vertical", side_effect=fake_reframe), \
              mock.patch.object(clipper, "subprocess", return_value=None):
@@ -114,11 +127,7 @@ class TestCacheTimelineContract(unittest.TestCase):
 
         out = str(self.tmp / "out3.mp4")
 
-        def fake_reframe2(cut_path, out_path, aspect_ratio, **kw):
-            clipper._FRAME_TIMELINE.clear()
-            clipper._FRAME_TIMELINE.append({"frame_no": 1, "t_sec": 0.033, "speaker_track_id": 1, "split_alpha": 0.0, "face_count": 1})
-            _write_video(out_path + ".silent.mkv")
-            return out_path + ".silent.mkv"
+        fake_reframe2 = self._fake_reframe_factory()
 
         with mock.patch.object(clipper, "_cut_subclip", return_value=None), \
              mock.patch.object(clipper, "_reframe_vertical", side_effect=fake_reframe2), \
@@ -143,11 +152,7 @@ class TestCacheTimelineContract(unittest.TestCase):
         persist the sidecar so a later timeline-requesting caller gets a hit."""
         out = str(self.tmp / "out_noflag.mp4")
 
-        def fake_reframe(cut_path, out_path, aspect_ratio, **kw):
-            clipper._FRAME_TIMELINE.clear()
-            clipper._FRAME_TIMELINE.append({"frame_no": 1, "t_sec": 0.033, "speaker_track_id": 1, "split_alpha": 0.0, "face_count": 1})
-            _write_video(out_path + ".silent.mkv")
-            return out_path + ".silent.mkv"
+        fake_reframe = self._fake_reframe_factory()
 
         with mock.patch.object(clipper, "_cut_subclip", return_value=None), \
              mock.patch.object(clipper, "_reframe_vertical", side_effect=fake_reframe), \

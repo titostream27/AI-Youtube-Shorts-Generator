@@ -96,6 +96,84 @@ class ReframeResult:
     pipeline_version: str = ""
 
 
+# Brief v10 C10 (V10-V01): per-render owned render trace. A fresh context is
+# created per crop_clip_local call and passed through the production reframe
+# path. When supplied, _reframe_vertical writes its frame/stats/track state
+# directly into the context; the final timeline is materialised FROM it, so
+# two interleaved renders never cross-contaminate via module globals.
+@dataclass
+class ReframeContext:
+    frames: List[Dict[str, object]] = field(default_factory=list)
+    stats: Dict[str, object] = field(default_factory=dict)
+    face_tracks: List[Dict] = field(default_factory=list)
+    split_ranges: List[Tuple[float, float]] = field(default_factory=list)
+    split_alpha: float = 0.0
+    speaker_track_id: Optional[int] = None
+
+
+class _GlobalRenderStateAdapter:
+    """Legacy adapter that reads/writes the module-global render state.
+
+    Kept so CLI paths and older callers that do NOT pass a ReframeContext keep
+    the exact legacy behaviour. New production paths always pass a context and
+    never touch these globals.
+    """
+
+    @property
+    def frames(self) -> List[Dict[str, object]]:
+        return _FRAME_TIMELINE
+
+    @frames.setter
+    def frames(self, value: List[Dict[str, object]]) -> None:
+        global _FRAME_TIMELINE
+        _FRAME_TIMELINE = value
+
+    @property
+    def stats(self) -> Dict[str, object]:
+        return _RENDER_STATS
+
+    @stats.setter
+    def stats(self, value: Dict[str, object]) -> None:
+        global _RENDER_STATS
+        _RENDER_STATS = value
+
+    @property
+    def face_tracks(self) -> List[Dict]:
+        return _LAST_FACE_TRACKS
+
+    @face_tracks.setter
+    def face_tracks(self, value: List[Dict]) -> None:
+        global _LAST_FACE_TRACKS
+        _LAST_FACE_TRACKS = value
+
+    @property
+    def split_ranges(self) -> List[Tuple[float, float]]:
+        return _SPLIT_RANGES
+
+    @split_ranges.setter
+    def split_ranges(self, value: List[Tuple[float, float]]) -> None:
+        global _SPLIT_RANGES
+        _SPLIT_RANGES = value
+
+    @property
+    def split_alpha(self) -> float:
+        return _LAST_SPLIT_ALPHA
+
+    @split_alpha.setter
+    def split_alpha(self, value: float) -> None:
+        global _LAST_SPLIT_ALPHA
+        _LAST_SPLIT_ALPHA = value
+
+    @property
+    def speaker_track_id(self) -> Optional[int]:
+        return _LAST_SPEAKER_TRACK_ID
+
+    @speaker_track_id.setter
+    def speaker_track_id(self, value: Optional[int]) -> None:
+        global _LAST_SPEAKER_TRACK_ID
+        _LAST_SPEAKER_TRACK_ID = value
+
+
 @dataclass
 class CameraPlannerConfig:
     """Brief v6 7.1 — deterministic planner knobs (defaults mirror the
@@ -313,6 +391,22 @@ class RenderTimeline:
             "stats": self.stats,
         }
 
+    def materialize_from(self, ctx: "ReframeContext") -> "RenderTimeline":
+        """Brief v10 C10 — build a timeline from a per-render ReframeContext.
+
+        This is the TRUE per-render owned path: the returned timeline is built
+        from THIS render's collected context (never module globals), so two
+        interleaved renders cannot cross-contaminate.
+        """
+        t = self.__class__()
+        t.face_tracks = list(ctx.face_tracks)
+        t.speaker_track_id = ctx.speaker_track_id
+        t.split_alpha = ctx.split_alpha
+        t.split_ranges = list(ctx.split_ranges)
+        t.stats = dict(ctx.stats)
+        t.frames = list(ctx.frames)
+        return t
+
     # ── Hardening sprint P0.2: versioned sidecar serialization ─────────────
     @classmethod
     def from_json(cls, sidecar_path: str) -> "RenderTimeline":
@@ -409,13 +503,19 @@ def reframe_vertical(in_path: str, out_path: str, aspect_ratio: str,
                      cache_key: str = "", pipeline_version: str = "") -> ReframeResult:
     """Brief v5 7.1 — public reframe entry that returns an explicit
     ReframeResult (path + timeline + stats + cache_key + pipeline_version).
+
+    Brief v10 C10 (V10-V01): the internal reframe runs with a PER-RENDER
+    ReframeContext and the returned timeline is materialised FROM that
+    context — never from `RenderTimeline.capture()` (stale module globals).
     The internal _reframe_vertical remains for legacy bare-path callers.
     """
+    ctx = ReframeContext()
     result_path = _reframe_vertical(in_path, out_path, aspect_ratio,
                                     emphasis_events=emphasis_events,
                                     layout_mode=layout_mode,
-                                    output_size=output_size)
-    timeline = RenderTimeline.capture()
+                                    output_size=output_size,
+                                    trace=ctx)
+    timeline = ctx.finalize() if hasattr(ctx, "finalize") else RenderTimeline().materialize_from(ctx)
     return ReframeResult(
         output_path=result_path,
         timeline=timeline,
@@ -446,7 +546,7 @@ def _cut_subclip(source_path: str, start: float, end: float, out_path: str) -> s
     return out_path
 
 
-def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_events: Optional[List[Dict]] = None, layout_mode: str = "face_crop", output_size: Optional[Tuple[int, int]] = None) -> str:
+def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_events: Optional[List[Dict]] = None, layout_mode: str = "face_crop", output_size: Optional[Tuple[int, int]] = None, trace: Optional[ReframeContext] = None) -> str:
     """Crop the cut clip to the target aspect ratio, tracking faces if possible.
 
     Face tracking is DUAL-MODE: YuNet (ONNX DNN, stable) is tried first per
@@ -615,10 +715,11 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
     blur_split_bot_id: Optional[int] = None
     blur_split_pw: Optional[float] = None
     # Phase 4 (brief §23): per-reframe QC stats.
-    global _RENDER_STATS
-    global _LAST_SPLIT_ALPHA
-    global _SPLIT_RANGES
-    _RENDER_STATS = {
+    # Brief v10 C10 (V10-V01): per-render owned state. When `trace` is passed,
+    # ALL frame/stats/track writes go to that context, never module globals.
+    # Legacy callers (trace=None) fall back to the global adapter.
+    _rctx = trace if trace is not None else _GlobalRenderStateAdapter()
+    _rctx.stats = {
         "focus_switch_count": 0,
         "focus_ping_pong_detected": False,
         "random_crop_detected": False,
@@ -627,10 +728,9 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         "switch_history": [],
     }
     # Phase-2 (F20): reset the per-frame timeline for this reframe pass.
-    global _FRAME_TIMELINE
-    _FRAME_TIMELINE = []
-    _LAST_SPLIT_ALPHA = 0.0
-    _SPLIT_RANGES = []
+    _rctx.frames = []
+    _rctx.split_alpha = 0.0
+    _rctx.split_ranges = []
     switch_history: List[Tuple[Optional[int], int]] = []
     candidate_focus_track_id: Optional[int] = None
     candidate_focus_since = 0
@@ -904,10 +1004,10 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                 challenger_streak = 0
 
             # Publish per-frame tracking snapshot for caption face avoidance.
-            global _LAST_FACE_TRACKS, _LAST_SPEAKER_TRACK_ID
-            global _LAST_SPLIT_ALPHA
-            _LAST_FACE_TRACKS = new_tracks
-            _LAST_SPEAKER_TRACK_ID = speaker_track_id
+
+
+            _rctx.face_tracks = new_tracks
+            _rctx.speaker_track_id = speaker_track_id
 
             speaker_track = best
             speaker_track_id = speaker_track["track_id"]
@@ -1086,19 +1186,19 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                 scene_change=bool(scene_changed),
             )
             _planner_last_hold = _planner_step.hold_reason or _planner_step.reset_reason
-            if _planner_last_hold and _RENDER_STATS.get("planner_hold_reason") is None:
-                _RENDER_STATS["planner_hold_reason"] = _planner_last_hold
+            if _planner_last_hold and _rctx.stats.get("planner_hold_reason") is None:
+                _rctx.stats["planner_hold_reason"] = _planner_last_hold
         except Exception as exc:  # noqa: BLE001
             # Brief v8 C14/V01: NEVER silently swallow a planner failure. Record
             # a runtime diagnostic so the renderer fails closed / can surface a
             # QC warning, instead of pretending the planner decided nothing.
             _planner_last_hold = None
-            if "runtime_warnings" not in _RENDER_STATS:
-                _RENDER_STATS["runtime_warnings"] = []
-            _RENDER_STATS["runtime_warnings"].append(
+            if "runtime_warnings" not in _rctx.stats:
+                _rctx.stats["runtime_warnings"] = []
+            _rctx.stats["runtime_warnings"].append(
                 f"camera planner failed: {type(exc).__name__}: {exc}",
             )
-            _RENDER_STATS["planner_failed"] = True
+            _rctx.stats["planner_failed"] = True
             print(f"[track] planner error: {type(exc).__name__}: {exc}", flush=True)
         # Refresh face list every frame while split is enabled — the split
         # state machine needs to know when a reactor face disappears (if only
@@ -1124,10 +1224,10 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
             )
         frame_no += 1
         # Phase 4 (brief §23): per-frame QC stats.
-        _RENDER_STATS["frames"] = int(_RENDER_STATS["frames"]) + 1
+        _rctx.stats["frames"] = int(_rctx.stats["frames"]) + 1
         # Phase-2 (F20): append a time-indexed frame entry.
         try:
-            _FRAME_TIMELINE.append({
+            _rctx.frames.append({
                 "frame_no": frame_no,
                 "t_sec": round(frame_no / fps, 3),
                 "speaker_track_id": speaker_track_id,
@@ -1161,10 +1261,10 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
             cut = max(0.0, (0 - focus_track["cy"] - focus_track["h"] / 2) / max(1, focus_track["h"]))
             if focus_track["cy"] - focus_track["h"] / 2 < 0:
                 cut = max(cut, (-(focus_track["cy"] - focus_track["h"] / 2)) / max(1, focus_track["h"]))
-            _RENDER_STATS["face_cutoff_ratio"] = max(float(_RENDER_STATS["face_cutoff_ratio"]), min(1.0, cut))
+            _rctx.stats["face_cutoff_ratio"] = max(float(_rctx.stats["face_cutoff_ratio"]), min(1.0, cut))
         # Ping-pong: 3+ switches between the same two tracks within 1s.
         if detect_ping_pong(switch_history):
-            _RENDER_STATS["focus_ping_pong_detected"] = True
+            _rctx.stats["focus_ping_pong_detected"] = True
 
         if det is not None:
             # Anti-shake stage 1: median of recent detections (kills outliers).
@@ -1245,7 +1345,7 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                         if active_focus_track_id is None:
                             pass  # first adoption, not a switch
                         else:
-                            _RENDER_STATS["focus_switch_count"] = int(_RENDER_STATS["focus_switch_count"]) + 1
+                            _rctx.stats["focus_switch_count"] = int(_rctx.stats["focus_switch_count"]) + 1
                             switch_history.append((best_track["track_id"], frame_no))
                         active_focus_track_id = best_track["track_id"]
                         focus_hold_frames = 0
@@ -1287,7 +1387,7 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                         candidate_focus_track_id = best_track["track_id"]
                         candidate_focus_since = 1
                     if candidate_focus_since >= focus_confirm_frames:
-                        _RENDER_STATS["focus_switch_count"] = int(_RENDER_STATS["focus_switch_count"]) + 1
+                        _rctx.stats["focus_switch_count"] = int(_rctx.stats["focus_switch_count"]) + 1
                         switch_history.append((best_track["track_id"], frame_no))
                         active_focus_track_id = best_track["track_id"]
                         focus_hold_frames = 0
@@ -1472,11 +1572,11 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         # Publish the current split blend weight so the caption compositor
         # (render_service) can shift captions to the center of the frame while
         # the reaction split is active, keeping the bottom pane's face clear.
-        _LAST_SPLIT_ALPHA = split_alpha if (split_enabled and split_alpha > 0.0) else 0.0
+        _rctx.split_alpha = split_alpha if (split_enabled and split_alpha > 0.0) else 0.0
 
         # Reaction-split visibility flag for this frame. The blur_background
         # layout has its OWN two-panel split (decided later in the frame) — we
-        # OR both flags together and write _SPLIT_RANGES once, right before the
+        # OR both flags together and write _rctx.split_ranges once, right before the
         # writer, so captions center during ANY split layout.
         _reaction_split_on = split_enabled and split_alpha >= 0.5
         _blur_split_on = False
@@ -1750,17 +1850,17 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         # those frames even when a clip alternates single/split multiple times
         # and the final frame is single view.
         _cur_split_on = _reaction_split_on or _blur_split_on
-        if _cur_split_on and (not _SPLIT_RANGES or _SPLIT_RANGES[-1][1] is not None):
-            _SPLIT_RANGES.append([frame_no / max(fps, 1), None])
-        elif not _cur_split_on and _SPLIT_RANGES and _SPLIT_RANGES[-1][1] is None:
-            _SPLIT_RANGES[-1][1] = frame_no / max(fps, 1)
+        if _cur_split_on and (not _rctx.split_ranges or _rctx.split_ranges[-1][1] is not None):
+            _rctx.split_ranges.append([frame_no / max(fps, 1), None])
+        elif not _cur_split_on and _rctx.split_ranges and _rctx.split_ranges[-1][1] is None:
+            _rctx.split_ranges[-1][1] = frame_no / max(fps, 1)
 
         writer.write(cropped)
 
     cap.release()
     # Close any split interval still open at the end of the clip.
-    if _SPLIT_RANGES and _SPLIT_RANGES[-1][1] is None:
-        _SPLIT_RANGES[-1][1] = frame_no / max(fps, 1)
+    if _rctx.split_ranges and _rctx.split_ranges[-1][1] is None:
+        _rctx.split_ranges[-1][1] = frame_no / max(fps, 1)
     writer.release()
     # Windows keeps the file handle alive until the cv2 objects are garbage
     # collected — release references explicitly before any os.remove() below.
@@ -1965,10 +2065,15 @@ def crop_clip_local(
                 pass
 
     cut_path = out_path + ".cut.mp4"
+    # Brief v10 C10 (V10-V01): per-render owned trace. This context is created
+    # per crop_clip_local call and passed into _reframe_vertical so the final
+    # timeline + cache sidecar are built from THIS render's collected state,
+    # never from stale module globals.
+    rctx = ReframeContext()
     try:
         _cut_subclip(source_path, start_time, end_time, cut_path)
         # FFV1 lossless reframe; _reframe_vertical returns the silent mkv.
-        silent_path = _reframe_vertical(cut_path, out_path, aspect_ratio, emphasis_events=emphasis_events, layout_mode=layout_mode, output_size=output_size)
+        silent_path = _reframe_vertical(cut_path, out_path, aspect_ratio, emphasis_events=emphasis_events, layout_mode=layout_mode, output_size=output_size, trace=rctx)
         if final_encode:
             # Final H.264 (used by CLI/local mode).
             crf = os.getenv("RENDER_VIDEO_CRF", "17")
@@ -2019,14 +2124,16 @@ def crop_clip_local(
         # regardless of whether THIS caller asked for a timeline — so any later
         # cache HIT returns the same typed result even when the original caller
         # used return_timeline=False.
-        RenderTimeline.capture().to_json(sidecar_path)
+        # Brief v10 C10 (V10-V01): the sidecar is written FROM this render's
+        # ReframeContext, never from stale module globals.
+        RenderTimeline().materialize_from(rctx).to_json(sidecar_path)
         print(f"[clip/local] cached: {os.path.basename(cache_path)}", flush=True)
 
     if return_timeline:
         # Phase 2 (render timelines): return an explicit artifact so callers
-        # never read module globals. Rendering is serialized, so capturing
-        # the module state here is safe (it belongs to THIS clip).
-        return out_path, RenderTimeline.capture()
+        # never read module globals. Brief v10 C10: materialise from the
+        # per-render ReframeContext (this clip's owned state).
+        return out_path, RenderTimeline().materialize_from(rctx)
     return out_path
 
 
