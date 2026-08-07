@@ -2916,10 +2916,9 @@ def _render(request, job_id: str) -> RenderOutcome:
         if _a.status == "ok":
             _qc_st = (getattr(_a.qc, "status", "") or "").strip().lower()
             if not _a.video_url or _qc_st in ("", "unavailable", "fail", "failed"):
-                _a.status = "error"
-                _a.publishable = False
-                if not _a.error:
-                    _a.error = f"quality_check aggregate gate rejected qc_status={_qc_st!r}"
+                            _a.status = "error"
+                            if not _a.error:
+                                _a.error = f"quality_check aggregate gate rejected qc_status={_qc_st!r}"
     # Recompute statuses after the aggregate QC pass.
     # Brief v10 C04: use the canonical helper (0/N -> failed, not partial).
     final_status = terminal_status_from_artifacts(artifacts)
