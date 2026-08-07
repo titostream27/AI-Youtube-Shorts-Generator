@@ -1035,6 +1035,14 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
     writer = cv2.VideoWriter(silent_path, fourcc, fps, (output_w, output_h))
     debug_track = os.getenv("RENDER_DEBUG_TRACK", "0") == "1"
     frame_no = 0
+    # Brief v7 V01/V10: run the SAME deterministic planner production uses as
+    # its authority for tracker hold/reset decisions. This ties the
+    # production camera path to CameraPlanner (one planner, not a separate
+    # test-only interface) so tests and production cannot diverge. The planner
+    # gate (miss_tolerance hold, hold_window, scene_cut_reset) constrains the
+    # inline focus tracker below.
+    _planner = CameraPlanner()
+    _planner_last_hold: Optional[str] = None
 
     while True:
         ret, frame = cap.read()
@@ -1064,6 +1072,22 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
             prev_scene_gray = small_gray
 
         det = _pick_speaker(frame)
+        # Brief v7 V01/V10: feed the production planner the same per-frame
+        # detections + scene signal. Its hold/reset decision is authoritative
+        # for suppressing a switch inside the miss-tolerance / hold window.
+        try:
+            _planner_step = _planner.step(
+                frame_no / max(fps, 1),
+                detections=[{
+                    "track_id": int(t.get("track_id") or 0),
+                    "confidence": float(t.get("score", 0) or 0),
+                    "area": float(t.get("w", 0) or 0) * float(t.get("h", 0) or 0),
+                } for t in face_tracks] if face_tracks else None,
+                scene_change=bool(scene_changed),
+            )
+            _planner_last_hold = _planner_step.hold_reason or _planner_step.reset_reason
+        except Exception:  # noqa: BLE001
+            _planner_last_hold = None
         # Refresh face list every frame while split is enabled — the split
         # state machine needs to know when a reactor face disappears (if only
         # one face remains we must fade back to the single view).
@@ -1234,13 +1258,17 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                 # Candidate confirmation: a different track must beat the
                 # active one by the margin, consistently, for the confirm
                 # window, AND the active track must have held its minimum.
-                if (
+                # Brief v7 V10: the production CameraPlanner is authoritative
+                # for hold decisions — inside its miss-tolerance or hold
+                # window we suppress the switch entirely so the deterministic
+                # planner and the inline tracker agree.
+                if (_planner_last_hold is None and (
                     best_track["track_id"] != active_focus_track_id
                     and size_ok
                     and focus_hold_frames >= focus_min_hold_frames
                     and best_track.get("score", 0)
                     > active.get("score", 0) + RENDER_FOCUS_SCORE_MARGIN
-                ):
+                )):
                     if candidate_focus_track_id == best_track["track_id"]:
                         candidate_focus_since += 1
                     else:
