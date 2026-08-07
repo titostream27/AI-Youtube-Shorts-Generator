@@ -476,6 +476,8 @@ def transition_job(job_id: str, expected: str, target: str, *, mode: str = "fina
                 now = datetime.datetime.utcnow().isoformat()
                 # Brief v5 4.3: named parameters — never positional order.
                 if error or error_stage or response:
+                    # Brief v9 C04: set finished_at on terminal with error
+                    finished_at_val = now if target in ("completed", "failed", "cancelled", "partial_failure", "orphaned") else None
                     conn.execute(
                         """
                         UPDATE render_jobs
@@ -483,7 +485,8 @@ def transition_job(job_id: str, expected: str, target: str, *, mode: str = "fina
                                last_error_stage = COALESCE(:error_stage, last_error_stage),
                                response = :response,
                                error = :error,
-                               updated_at = :updated_at
+                               updated_at = :updated_at,
+                               finished_at = COALESCE(:finished_at, finished_at)
                          WHERE job_id = :job_id
                         """,
                         {
@@ -493,12 +496,29 @@ def transition_job(job_id: str, expected: str, target: str, *, mode: str = "fina
                             "response": response,
                             "error": error,
                             "updated_at": now,
+                            "finished_at": finished_at_val,
                         },
                     )
                 else:
+                    # Brief v9 C04: set started_at on first active state, finished_at on terminal.
+                    started_at_val = now if target == "downloading" else None
+                    finished_at_val = now if target in ("completed", "failed", "cancelled", "partial_failure", "orphaned") else None
                     conn.execute(
-                        "UPDATE render_jobs SET status = ?, updated_at = ? WHERE job_id = ?",
-                        (target, now, job_id),
+                        """
+                        UPDATE render_jobs
+                           SET status = :status,
+                               updated_at = :updated_at,
+                               started_at = COALESCE(:started_at, started_at),
+                               finished_at = COALESCE(:finished_at, finished_at)
+                         WHERE job_id = :job_id
+                        """,
+                        {
+                            "job_id": job_id,
+                            "status": target,
+                            "updated_at": now,
+                            "started_at": started_at_val,
+                            "finished_at": finished_at_val,
+                        },
                     )
                 conn.commit()
         except Exception as e:  # noqa: BLE001
@@ -533,7 +553,8 @@ def _load_job(job_id: str) -> Optional[Dict]:
         with _db_lock, _db_conn() as conn:
             row = conn.execute(
                 "SELECT status, mode, episode_id, response, error, attempt, parent_job_id, "
-                "COALESCE(request_id, ''), COALESCE(process_boot_id, ''), COALESCE(created_at, '') "
+                "COALESCE(request_id, ''), COALESCE(process_boot_id, ''), COALESCE(created_at, ''), "
+                "started_at, finished_at "
                 "FROM render_jobs WHERE job_id = ?",
                 (job_id,),
             ).fetchone()
@@ -551,6 +572,8 @@ def _load_job(job_id: str) -> Optional[Dict]:
                 "request_id": row[7] or "",
                 "process_boot_id": row[8] or None,
                 "created_at": row[9] or "",
+                "started_at": row[10],
+                "finished_at": row[11],
             }
     except Exception:  # noqa: BLE001
         # Fall back to the legacy column set (pre-migration DB).

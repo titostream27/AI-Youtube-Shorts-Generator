@@ -49,8 +49,9 @@ class TestLifecycleTimestamps(V9DBIsolation):
         """R09-06: queued->downloading must set started_at."""
         job_id = "ts-01"
         rs._persist_job(job_id, "queued", mode="final", episode_id="ep-ts")
-        # Register in memory (transition_job requires both memory and SQLite)
-        rs._register_job_memory(job_id, "ts-01", "final", "ep-ts")
+        # Set memory state to match SQLite state
+        with rs._async_jobs_lock:
+            rs._async_jobs[job_id] = {"state": "queued", "request_id": "ts-01", "mode": "final", "episode_id": "ep-ts"}
         # Transition queued->downloading
         won = rs.transition_job(job_id, "queued", "downloading", mode="final")
         self.assertTrue(won, "transition must win")
@@ -65,10 +66,12 @@ class TestLifecycleTimestamps(V9DBIsolation):
     def test_finished_at_set_on_terminal_transition(self):
         """R09-06: terminal transition must set finished_at."""
         job_id = "ts-02"
-        rs._persist_job(job_id, "rendering", mode="final", episode_id="ep-ts2")
-        rs._register_job_memory(job_id, "ts-02", "final", "ep-ts2")
-        # Transition rendering->completed
-        won = rs.transition_job(job_id, "rendering", "completed", mode="final")
+        rs._persist_job(job_id, "quality_check", mode="final", episode_id="ep-ts2")
+        # Set memory state to match SQLite state
+        with rs._async_jobs_lock:
+            rs._async_jobs[job_id] = {"state": "quality_check", "request_id": "ts-02", "mode": "final", "episode_id": "ep-ts2"}
+        # Transition quality_check->completed
+        won = rs.transition_job(job_id, "quality_check", "completed", mode="final")
         self.assertTrue(won, "transition must win")
         # Verify finished_at populated
         durable = rs._load_job(job_id)
@@ -82,7 +85,8 @@ class TestLifecycleTimestamps(V9DBIsolation):
         """R09-06: failed transition must set finished_at."""
         job_id = "ts-03"
         rs._persist_job(job_id, "rendering", mode="final", episode_id="ep-ts3")
-        rs._register_job_memory(job_id, "ts-03", "final", "ep-ts3")
+        with rs._async_jobs_lock:
+            rs._async_jobs[job_id] = {"state": "rendering", "request_id": "ts-03", "mode": "final", "episode_id": "ep-ts3"}
         won = rs.transition_job(job_id, "rendering", "failed", error="boom", error_stage="rendering")
         self.assertTrue(won)
         durable = rs._load_job(job_id)
