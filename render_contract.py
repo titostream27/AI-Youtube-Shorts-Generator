@@ -380,7 +380,10 @@ class SourceInfo(BaseModel):
 
 class RenderJobStatus(BaseModel):
     job_id: str
-    status: str  # queued|downloading|analysing_source|rendering_preview|rendering_final|quality_check|completed|partial_failure|failed|cancelled
+    # Brief v10 C12 (V10-R07): CANONICAL state vocabulary. Legacy names
+    # (analysing_source, rendering_preview, rendering_final) were deprecated
+    # and map to analysing/rendering — never emitted by the service.
+    status: str  # queued|downloading|analysing|rendering|quality_check|completed|partial_failure|failed|cancelled|orphaned
     mode: str = "final"
     source: SourceInfo = Field(default_factory=SourceInfo)
     artifacts: List[RenderArtifact] = Field(default_factory=list)
