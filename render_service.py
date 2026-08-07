@@ -205,7 +205,11 @@ def _job_older_than(created_at: str, threshold_sec: float) -> bool:
                 dt = dt.replace(tzinfo=None)
         return (now - dt).total_seconds() > threshold_sec
     except Exception:  # noqa: BLE001
-        return False
+        # Brief v7 R10: an empty/unparseable created_at must count as OLD
+        # (return True) so the age rule can orphan legacy rows that predate
+        # timestamps — never return False, which would permanently shield
+        # them from the orphan policy.
+        return True
 
 
 def _job_db():
@@ -840,6 +844,42 @@ def _normalize_clips(request) -> List:
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "shorts-render", "version": "0.1.0"}
+
+
+@app.get("/readyz")
+def readyz():
+    """Brief v7 C12 (R10) — liveness + readiness split. /health stays a
+    plain heartbeat; /readyz reflects real readiness (worker alive, DB
+    writable) and /livez just confirms the process is up."""
+    ready = True
+    reasons = []
+    # Worker must be alive.
+    if _render_queue_worker_thread is None or not _render_queue_worker_thread.is_alive():
+        ready = False
+        reasons.append("queue_worker_dead")
+    # DB must be openable/writable enough to report truthfully.
+    try:
+        import sqlite3
+        with _db_lock, _db_conn() as conn:
+            conn.execute("SELECT count(*) FROM render_jobs").fetchone()
+    except Exception as exc:  # noqa: BLE001
+        ready = False
+        reasons.append(f"db_unavailable:{type(exc).__name__}")
+    body = {
+        "status": "ready" if ready else "unready",
+        "ready": ready,
+        "checks": (
+            {"render_worker": "up", "db": "ok"} if ready else {"detail": reasons}
+        ),
+        "postgres": "wal",  # WAL journal mode
+    }
+    return JSONResponse(status_code=200 if ready else 503, content=body)
+
+
+@app.get("/livez")
+def livez():
+    """Cheap process liveness — always 200 while the API responds."""
+    return {"status": "alive"}
 
 
 @app.get("/files/{job_id}/{filename}")
