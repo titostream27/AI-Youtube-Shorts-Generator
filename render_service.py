@@ -2969,14 +2969,23 @@ def _enqueue_job(job_id: str) -> None:
     try:
         _render_queue.put(job_id, timeout=5.0)
     except _queue_module.Full:
-        # Brief v5 4.4: no durable queued job may exist without a queue item
-        # OR an explicit terminal failure describing queue admission.
+        # Brief v5 4.4 / v7 R08: no durable queued job may exist without a
+        # queue item OR an explicit COMMITTED terminal failure describing
+        # queue admission. If the queued->failed compensation does not
+        # commit, the stranded queued row is a correctness bug.
         try:
-            transition_job(job_id, "queued", "failed",
-                           error=f"queue_admission: render queue is full ({RENDER_QUEUE_MAX} jobs)",
-                           error_stage="queue_admission")
+            ok = transition_job(job_id, "queued", "failed",
+                                error=f"queue_admission: render queue is full ({RENDER_QUEUE_MAX} jobs)",
+                                error_stage="queue_admission")
         except Exception as e:  # noqa: BLE001
             _record_db_error("queue_full_compensation", e)
+            raise QueueAdmissionError(f"render queue is full ({RENDER_QUEUE_MAX} jobs); try later") from e
+        if not ok:
+            _record_db_error("queue_full_compensation",
+                             RuntimeError(f"compensation queued->failed lost for {job_id}"))
+            # Drop the stranded in-memory phantom so it cannot be polled.
+            with _async_jobs_lock:
+                _async_jobs.pop(job_id, None)
         raise QueueAdmissionError(f"render queue is full ({RENDER_QUEUE_MAX} jobs); try later")
     # Brief v6 4.5/R05: ensure the worker is ALIVE (restart if crashed).
     ensure_worker_running()
@@ -3268,14 +3277,19 @@ def render_job_retry(job_id: str):
     # and attempt (parent.attempt + 1), and preserves the original history.
     parent_attempt = int(stored.get("attempt") or 1)
     attempt = parent_attempt + 1
+    req_json = request.model_dump_json() if hasattr(request, "model_dump_json") else ""
+    # Brief v7 R09: persist the queued row FIRST, register memory only after
+    # the commit succeeds — a failed commit must not leave a phantom in-memory
+    # queued job the caller could poll.
+    if not _persist_job(new_job_id, "queued", mode=mode, episode_id=episode_id,
+                        request=req_json,
+                        parent_job_id=job_id, attempt=attempt):
+        raise HTTPException(status_code=500, detail="failed to persist retry job")
     with _async_jobs_lock:
         _async_jobs[new_job_id] = {"state": "queued", "response": None, "error": None,
                                    "request_id": getattr(request, "request_id", "") or "",
                                    "episode_id": episode_id, "mode": mode,
                                    "parent_job_id": job_id, "attempt": attempt}
-    _persist_job(new_job_id, "queued", mode=mode, episode_id=episode_id,
-                 request=request.model_dump_json() if hasattr(request, "model_dump_json") else "",
-                 parent_job_id=job_id, attempt=attempt)
 
     # Brief v4 F18: retry enqueues onto the shared persistent queue worker.
     _enqueue_job(new_job_id)
