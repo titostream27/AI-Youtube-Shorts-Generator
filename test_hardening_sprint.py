@@ -218,26 +218,31 @@ class TestPartialFailureParity(HardeningTestBase):
         self.assertEqual(ok_artifacts_db[0]["video_url"], "/out/short_01.mp4")
 
     def test_status_endpoint_exposes_partial_failure_artifacts_from_memory(self):
-        """P1.R3 — /api/render/status/{job_id} must expose successful artifacts
-        for a partial_failure kept in memory, identically to the persisted path."""
-        job_id = "pf-http"
-        rendered = [
-            rs.RenderArtifactResult(clip_id="1", status="ok", video_url="/out/short_01.mp4", publishable=True, qc_status="passed"),
-            rs.RenderArtifactResult(clip_id="2", status="error", error={"message": "encode failed"}, publishable=False, qc_status="failed"),
-        ]
-        response = rs.RenderResponse(job_id=job_id, source_video="src.mp4", rendered=rendered, status="completed")
-        with rs._async_jobs_lock:
-            rs._async_jobs[job_id] = {
-                "state": "partial_failure", "response": response, "error": None,
-                "request_id": f"req-{job_id}", "mode": "final",
-            }
-        payload = rs.render_job_status(job_id)
-        self.assertEqual(payload.state, "partial_failure")
-        self.assertIsNotNone(payload.response, "typed status must expose final response")
-        self.assertEqual(len(payload.response.rendered), 2)
-        ok = [r for r in payload.response.rendered if r.status == "ok"]
-        self.assertEqual(len(ok), 1)
-        self.assertEqual(ok[0].video_url, "/out/short_01.mp4")
+            """P1.R3 — /api/render/status/{job_id} must expose successful artifacts
+            for a partial_failure kept in memory, identically to the persisted path."""
+            job_id = "pf-http"
+            # Brief v9: SQLite is canonical - job must exist in SQLite first
+            rs._persist_job(job_id, "partial_failure", mode="final", episode_id="ep-pf")
+            with rs._db_lock, rs._db_conn() as conn:
+                conn.execute("UPDATE render_jobs SET request_id = ? WHERE job_id = ?", ("req-pf", job_id))
+                conn.commit()
+            rendered = [
+                rs.RenderArtifactResult(clip_id="1", status="ok", video_url="/out/short_01.mp4", publishable=True, qc_status="passed"),
+                rs.RenderArtifactResult(clip_id="2", status="error", error={"message": "encode failed"}, publishable=False, qc_status="failed"),
+            ]
+            response = rs.RenderResponse(job_id=job_id, source_video="src.mp4", rendered=rendered, status="completed")
+            with rs._async_jobs_lock:
+                rs._async_jobs[job_id] = {
+                    "state": "partial_failure", "response": response, "error": None,
+                    "request_id": "req-pf", "mode": "final",
+                }
+            payload = rs.render_job_status(job_id)
+            self.assertEqual(payload.state, "partial_failure")
+            self.assertIsNotNone(payload.response, "typed status must expose final response")
+            self.assertEqual(len(payload.response.rendered), 2)
+            ok = [r for r in payload.response.rendered if r.status == "ok"]
+            self.assertEqual(len(ok), 1)
+            self.assertEqual(ok[0].video_url, "/out/short_01.mp4")
 
 
 if __name__ == "__main__":

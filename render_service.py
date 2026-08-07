@@ -33,6 +33,8 @@ from render_contract import (
     CaptionRequest,
     CaptionWord,
     ClipRequest,
+    DurableJobSnapshot,
+    EffectiveJobSnapshot,
     RenderArtifact,
     RenderArtifactResult,
     RenderJobStatus,
@@ -574,6 +576,65 @@ def _load_job(job_id: str) -> Optional[Dict]:
         except Exception as e:  # noqa: BLE001
             _record_db_error("load_job", e)
             return None
+
+
+def _load_durable_snapshot(job_id: str) -> Optional[DurableJobSnapshot]:
+    """Brief v9 A1 — load canonical durable state from SQLite.
+
+    Returns a typed snapshot or None if the job does not exist.
+    """
+    row = _load_job(job_id)
+    if not row:
+        return None
+    return DurableJobSnapshot(
+        job_id=job_id,
+        state=row.get("status", "queued"),
+        request_id=row.get("request_id", ""),
+        mode=row.get("mode", "final"),
+        episode_id=row.get("episode_id", ""),
+        attempt=row.get("attempt", 1),
+        parent_job_id=row.get("parent_job_id"),
+        created_at=row.get("created_at", ""),
+        started_at=row.get("started_at"),
+        finished_at=row.get("finished_at"),
+        response=row.get("response"),
+        error=row.get("error"),
+        process_boot_id=row.get("process_boot_id"),
+    )
+
+
+def mirror_durable_after_failure(job_id: str, diagnostic: str) -> None:
+    """Brief v9 A2 — shared helper for persistence-failure mirroring.
+
+    Called by sync terminal persist failure, worker fatal exception, and
+    retry reservation failure. Mirrors durable state into memory with
+    runtime_error and persistence_degraded=True, preserving metadata.
+    """
+    durable = _load_durable_snapshot(job_id)
+    with _async_jobs_lock:
+        existing = _async_jobs.get(job_id, {})
+        if not durable:
+            # No durable row at all — fabricate unknown state.
+            _async_jobs[job_id] = {
+                "state": "unknown",
+                "runtime_error": diagnostic,
+                "persistence_degraded": True,
+                **{k: existing.get(k) for k in ("request_id", "mode", "episode_id", "attempt", "parent_job_id") if existing.get(k) is not None},
+            }
+            return
+        # Merge: state from durable (canonical), metadata from memory if present.
+        _async_jobs[job_id] = {
+            "state": durable.state,
+            "request_id": existing.get("request_id") or durable.request_id,
+            "mode": existing.get("mode") or durable.mode,
+            "episode_id": existing.get("episode_id") or durable.episode_id,
+            "attempt": existing.get("attempt") if existing.get("attempt") is not None else durable.attempt,
+            "parent_job_id": existing.get("parent_job_id") or durable.parent_job_id,
+            "response": existing.get("response") or durable.response,
+            "error": durable.error,
+            "runtime_error": diagnostic,
+            "persistence_degraded": True,
+        }
 
 
 def _find_job_by_request(request_id: str) -> Optional[str]:
@@ -2951,85 +3012,81 @@ def _reconcile_startup_orphans() -> int:
 
 @app.get("/api/render/status/{job_id}", response_model=RenderJobStatusResponse)
 def render_job_status(job_id: str):
-    """Return the canonical state of a render job (from memory when active,
-    from the persisted job DB after a restart — brief §19).
+    """Return the canonical state of a render job (brief v9 A1: durable-first).
 
-    Brief v8 A2: returns the typed RenderJobStatusResponse; canonical state
-    is the durable SQLite state, memory is used for live diagnostics only.
+    SQLite is canonical. Memory provides runtime diagnostics only and never
+    overrides durable state. GET is side-effect free; orphan detection is
+    owned by startup reconciliation.
     """
-    with _async_jobs_lock:
-        job = _async_jobs.get(job_id)
-    if job:
-        state = canonical_status(job["state"])
-        attempt = job.get("attempt", 1)
-        parent = job.get("parent_job_id")
-        resp = job.get("response")
-        response_model = None
-        if state in ("completed", "partial_failure") and isinstance(resp, RenderResponse):
-            response_model = resp
-        return RenderJobStatusResponse(
-            job_id=job_id,
-            request_id=job.get("request_id", "") or "",
-            state=state,
-            mode=job.get("mode", "final") or "final",
-            attempt=attempt if isinstance(attempt, int) else 1,
-            parent_job_id=parent,
-            error=job.get("error"),
-            response=response_model,
-            persistence_degraded=bool(job.get("persistence_degraded", False)),
-        )
-    # Not in memory: fall back to the persisted job store.
-    stored = _load_job(job_id)
-    if not stored:
+    # 1. Load canonical durable state from SQLite.
+    durable = _load_durable_snapshot(job_id)
+    if not durable:
         raise HTTPException(status_code=404, detail="job not found")
-    state = stored["status"]
-        # Orphan detection (self-heal, brief v4 F19): a job that is still active
-        # in the persisted store but ABSENT from _async_jobs may mean the service
-        # was restarted after persisting that state — the worker that would
-        # advance it died with the old process and will never resume. BUT we must
-        # never orphan a job freshly reserved by THIS process: only rows owned by
-        # a DIFFERENT process boot (or pre-ownership rows older than the
-    # threshold) become 'orphaned'. Persisted terminal states pass through.
+
+    # 2. Merge in-memory diagnostics if present.
+    with _async_jobs_lock:
+        mem = _async_jobs.get(job_id)
+
+    state = durable.state
+    error = durable.error
+    response_model = None
+    persistence_degraded = False
+    runtime_error = None
+    worker_attached = False
+
+    # Orphan detection: only for foreign-boot active rows.
     if is_active(state):
-        boot_id = stored.get("process_boot_id")
-        created_at = stored.get("created_at") or ""
+        boot_id = durable.process_boot_id
+        created_at = durable.created_at or ""
         is_foreign = boot_id is not None and boot_id != PROCESS_BOOT_ID
         is_ancient = (boot_id is None) and _job_older_than(created_at, ORPHAN_AGE_THRESHOLD_SEC)
         if is_foreign or is_ancient:
-            # Brief v5 R-02: orphaned through the canonical transition (any
-            # active state -> orphaned), not a raw persistence write.
-            transition_job(job_id, state, "orphaned", mode=stored.get("mode", "final"),
-                           error="job orphaned by render service restart")
+            # Brief v9: orphaned via startup reconciliation, not GET mutation.
+            # If we got here, startup already ran; just report orphaned.
             state = "orphaned"
-        else:
-            # Fresh current-process job (or young pre-ownership row): keep it
-            # active — do NOT orphan.
-            state = stored["status"]
-    error = stored.get("error")
-    if state == "orphaned" and not error:
-        error = "job orphaned by render service restart"
-    resp = stored.get("response")
-    response_model = None
-    if state in ("completed", "partial_failure") and resp:
+            error = error or "job orphaned by render service restart"
+        elif mem:
+            # Current-process active job: worker may be attached.
+            worker_attached = True
+
+    # Memory diagnostics overlay (never override canonical state).
+    if mem:
+        runtime_error = mem.get("runtime_error")
+        persistence_degraded = bool(mem.get("persistence_degraded", False))
+        # If memory state differs from durable, mark as degraded.
+        if mem.get("state") != state:
+            persistence_degraded = True
+        # If memory has a response object for terminal states, use it.
+        if state in ("completed", "partial_failure") and isinstance(mem.get("response"), RenderResponse):
+            response_model = mem["response"]
+
+    # Deserialize stored response if present.
+    if not response_model and durable.response:
         try:
             import json as _json
-            raw = resp
+            raw = durable.response
             if isinstance(raw, str):
                 raw = _json.loads(raw)
             if isinstance(raw, dict):
                 response_model = RenderResponse(**raw)
         except Exception:  # noqa: BLE001
             response_model = None
+
+    if state == "orphaned" and not error:
+        error = "job orphaned by render service restart"
+
     return RenderJobStatusResponse(
         job_id=job_id,
-        request_id=stored.get("request_id", "") or "",
+        request_id=durable.request_id,
         state=state,
-        mode=stored.get("mode", "final") or "final",
-        attempt=stored.get("attempt") if isinstance(stored.get("attempt"), int) else 1,
-        parent_job_id=stored.get("parent_job_id"),
+        mode=durable.mode,
+        attempt=durable.attempt,
+        parent_job_id=durable.parent_job_id,
         error=error,
         response=response_model,
-        persistence_degraded=False,
+        persistence_degraded=persistence_degraded,
+        runtime_error=runtime_error,
+        worker_attached=worker_attached,
     )
 
 
@@ -3314,23 +3371,21 @@ def _queue_worker_loop() -> None:
                 _render_worker_last_exception = f"{type(e).__name__}: {e}"
                 print(f"[render] queue worker error on {job_id}: {e}", flush=True)
                 try:
+                    # Brief v9 A2: mirror durable state, never fabricate.
                     # Brief v5 R-02: canonical transition to failed — never a raw
                     # _persist_job bypassing the state machine.
-                    # Brief v6 R02: only overwrite memory when the transition WINS.
-                    # If a terminal state (e.g. cancelled) already won, preserve it.
                     cur = _load_job(job_id)
                     src = canonical_status(cur["status"]) if cur else "queued"
                     won_failed = transition_job(job_id, src, "failed", error=str(e), error_stage="worker")
-                    with _async_jobs_lock:
-                        if won_failed:
-                            _async_jobs[job_id] = {"state": "failed", "response": None, "error": str(e)}
-                        else:
-                            # Transition lost: keep the winning state visible; only
-                            # annotate the exception in diagnostics.
-                            if job_id in _async_jobs:
-                                _async_jobs[job_id].setdefault("error", str(e))
+                    if won_failed:
+                        # Transition won: update memory to reflect durable failed.
+                        mirror_durable_after_failure(job_id, f"worker error: {e}")
+                    else:
+                        # Transition lost: mirror the winning durable state.
+                        mirror_durable_after_failure(job_id, f"worker error (transition lost): {e}")
                 except Exception:  # noqa: BLE001
-                    pass
+                    # Even transition failure must mirror durable state.
+                    mirror_durable_after_failure(job_id, f"worker error + transition failure: {e}")
             finally:
                 global _render_worker_heartbeat_at
                 _render_worker_heartbeat_at = datetime.datetime.utcnow().isoformat()
@@ -3382,46 +3437,13 @@ def _process_queued_job(job_id: str) -> None:
             response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "",
         )
     except PersistenceError as e:
-        # Brief v8 R03/STATE-01: NEVER fabricate a durable terminal state.
-        # Mirror the DURABLE (SQLite) winner into memory and flag degradation.
+        # Brief v9 A2: mirror durable state, never fabricate.
         _record_db_error("worker_terminal_persist", e)
-        durable = _load_job(job_id)
-        durable_state = canonical_status(durable["status"]) if durable else "unknown"
-        with _async_jobs_lock:
-            job = _async_jobs.get(job_id)
-            if job is not None:
-                job.update({
-                    "state": durable_state,
-                    "error": f"persist: {e}",
-                    "runtime_error": f"persist: {e}",
-                    "persistence_degraded": True,
-                })
-            else:
-                _async_jobs[job_id] = {"state": durable_state, "response": None,
-                                       "error": f"persist: {e}",
-                                       "runtime_error": f"persist: {e}",
-                                       "persistence_degraded": True}
+        mirror_durable_after_failure(job_id, f"persist: {e}")
         return
     if not terminal_ok:
-        # Brief v8 STATE-02: terminal transition lost — mirror the DURABLE
-        # winner into memory with a runtime_error diagnostic; do NOT invent
-        # a state.
-        durable = _load_job(job_id)
-        durable_state = durable.get("status") if durable else "unknown"
-        with _async_jobs_lock:
-            job = _async_jobs.get(job_id)
-            if job is not None:
-                job.update({
-                    "state": durable_state,
-                    "error": "terminal transition lost",
-                    "runtime_error": "terminal transition lost",
-                    "persistence_degraded": True,
-                })
-            else:
-                _async_jobs[job_id] = {"state": durable_state, "response": None,
-                                       "error": "terminal transition lost",
-                                       "runtime_error": "terminal transition lost",
-                                       "persistence_degraded": True}
+        # Brief v9 A2: terminal transition lost — mirror the DURABLE winner.
+        mirror_durable_after_failure(job_id, "terminal transition lost")
         return
     # Success: update in place so request_id/mode/episode/attempt/parent survive
     # (STATE-03/R09).

@@ -23,11 +23,42 @@ Phase 1 §5.5: validation rules are shared with the TypeScript schema
 Schema in contracts/render-request-v2.schema.json. Both sides must pass and
 reject the same fixtures.
 """
+from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 CONTRACT_VERSION = "2.0"
+
+
+@dataclass(frozen=True)
+class DurableJobSnapshot:
+    """Brief v9 A1 — canonical durable state loaded from SQLite.
+
+    Memory may add diagnostics, but never overrides canonical status.
+    """
+    job_id: str
+    state: str
+    request_id: str
+    mode: str
+    episode_id: str
+    attempt: int
+    parent_job_id: Optional[str]
+    created_at: str
+    started_at: Optional[str]
+    finished_at: Optional[str]
+    response: Optional[Dict]
+    error: Optional[str]
+    process_boot_id: Optional[str]
+
+
+@dataclass(frozen=True)
+class EffectiveJobSnapshot:
+    """Brief v9 A1 — effective state combining durable + runtime diagnostics."""
+    durable: DurableJobSnapshot
+    runtime_error: Optional[str]
+    persistence_degraded: bool
+    worker_attached: bool
 
 VALID_MODES = ("preview", "final")
 
@@ -425,7 +456,7 @@ _JOB_STATE_LITERAL = Literal[
 ]
 _RENDER_MODE_LITERAL = Literal["preview", "final"]
 class RenderJobStatusResponse(BaseModel):
-    """Brief v8 A2 — typed job status snapshot used by
+    """Brief v9 A1 — typed job status snapshot used by
     GET /api/render/status/{job_id}.
 
     Represents active AND terminal jobs without inventing final artifacts.
@@ -443,6 +474,8 @@ class RenderJobStatusResponse(BaseModel):
     error: Optional[Union[str, dict]] = None
     response: Optional["RenderResponse"] = None  # terminal result states only
     persistence_degraded: bool = False
+    runtime_error: Optional[str] = None  # brief v9: diagnostics from memory
+    worker_attached: bool = False  # brief v9: current-process active job has worker
 
 
 class RenderResponse(BaseModel):
