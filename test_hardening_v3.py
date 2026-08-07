@@ -201,10 +201,16 @@ class TestForceRerender(unittest.TestCase):
         self.assertEqual(parent["job-new"], "job-old")
 
     def test_force_rejected_when_attempt_already_active(self):
-        rs._reserve_job("req-force-2", "job-active", mode="final", episode_id="ep", request_json="{}")
-        with self.assertRaises(ValueError):
-            rs._reserve_job("req-force-2", "job-x", mode="final", episode_id="ep",
-                            request_json="{}", force=True)
+            # Brief v11: one active attempt per request. force while active
+            # resolves to the SAME active winner (no duplicate attempt), instead
+            # of raising like the retired v5 helper.
+            rs._reserve_job("req-force-2", "job-active", mode="final", episode_id="ep", request_json="{}")
+            r = rs.reserve_attempt(
+                source_job_id="job-active", request_id="req-force-2", request_json="{}",
+                mode="final", episode_id="ep", reason="force", preferred_job_id="job-x",
+            )
+            self.assertFalse(r.created)
+            self.assertEqual(r.job_id, "job-active")
 
     def test_async_force_bypasses_idempotent_hit(self):
         from unittest.mock import patch
@@ -229,20 +235,24 @@ class TestForceRerender(unittest.TestCase):
                                       "layout_plan": {"preferred_layout": "auto"},
                                       "caption_plan": {"language": "en", "cues": [], "highlight_terms": []},
                                       "editing_events": []}])
-        with patch.object(rs, "_render", side_effect=lambda *a, **k: rs.RenderOutcome(
-            rs.RenderResponse(job_id=a[1], source_video="", rendered=[], status="completed"), "completed")):
+        mock_render = patch.object(rs, "_render", side_effect=lambda *a, **k: rs.RenderOutcome(
+            rs.RenderResponse(job_id=a[1], source_video="", rendered=[], status="completed"), "completed"))
+        mock_render.start()
+        try:
             resp = rs.render_async(req)
-        self.assertNotEqual(resp.job_id, "job-hit")
-        self.assertTrue(resp.job_id.startswith("job-") is False)
-        # Let the worker thread finish so Windows releases the DB on teardown.
-        def _done():
-            st = rs._async_jobs.get(resp.job_id, {}).get("state")
-            return st in ("completed", "failed")
-        for _ in range(100):
-            if _done():
-                break
-            import time
-            time.sleep(0.02)
+            self.assertNotEqual(resp.job_id, "job-hit")
+            self.assertTrue(resp.job_id.startswith("job-") is False)
+            # Let the worker thread finish so Windows releases the DB on teardown.
+            def _done():
+                st = rs._async_jobs.get(resp.job_id, {}).get("state")
+                return st in ("completed", "failed")
+            for _ in range(100):
+                if _done():
+                    break
+                import time
+                time.sleep(0.02)
+        finally:
+            mock_render.stop()
 
 
 class TestTimelineStateAt(unittest.TestCase):

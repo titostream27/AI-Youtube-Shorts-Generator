@@ -244,21 +244,36 @@ class TestRetryLineage(V5Base):
         self.assertEqual(r3["parent_job_id"], j2)
 
     def test_retry_from_active_rejected(self):
+        # Brief v11: one active attempt per request. A force/retry while the
+        # parent is still active resolves to the SAME active job (no duplicate,
+        # no attempt increment) instead of raising — the endpoint contract now
+        # reports the winner as an idempotent hit.
         j = rs._reserve_job("v5-act", "a1", mode="final", episode_id="e", request_json="{}")
-        with self.assertRaises(ValueError):
-            rs._reserve_job("v5-act", "a2", mode="final", episode_id="e", request_json="{}", force=True)
+        r = rs.reserve_attempt(
+            source_job_id=j, request_id="v5-act", request_json="{}",
+            mode="final", episode_id="e", reason="force", preferred_job_id="a2",
+        )
+        self.assertFalse(r.created, "active winner must be returned, not a new attempt")
+        self.assertEqual(r.job_id, j, "one active attempt per request_id")
 
 
 class TestForceRerenderIdentity(V5Base):
     """T-R12 — force rerender same request_id, new attempt, no idempotency hit."""
 
     def test_force_lookup_db_failure_fails_request(self):
-        """Brief v5 4.7: a DB failure while loading the previous attempt must
-        FAIL the request, never be treated as previous-not-found."""
+        """Brief v5 4.7 / v11 C2: a DB failure while loading the previous
+        attempt must FAIL the request, never be treated as previous-not-found.
+        Production force now routes through reserve_attempt(reason='force')."""
         with mock.patch.object(rs, "_db_conn", side_effect=RuntimeError("db gone")):
             with self.assertRaises(rs.PersistenceError):
-                rs._reserve_job("v5-dbfail", "jf", mode="final", episode_id="e",
-                                request_json="{}", force=True)
+                rs.reserve_attempt(
+                    source_job_id="v5-dbfail",
+                    request_id="v5-dbfail",
+                    request_json="{}",
+                    mode="final",
+                    episode_id="e",
+                    reason="force",
+                )
 
     def test_force_new_attempt_same_request(self):
         body = dict(V2_BODY)

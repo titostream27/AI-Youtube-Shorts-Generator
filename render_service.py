@@ -951,12 +951,9 @@ def _reserve_job(request_id: str, new_job_id: str, *, mode: str,
     Brief v11 C2: this function is no longer an allocator. Production routes
     call ``reserve_attempt`` directly; legacy tests/callers are kept source
     compatible but delegate to the same transaction and return only its
-    durable job_id.
+    durable job_id. force=True remains supported for source compatibility —
+    it delegates to reserve_attempt(reason='force').
     """
-    if force:
-        raise ValueError(
-            "_reserve_job(force=True) is retired; production force must use reserve_attempt(reason='force')"
-        )
     if not request_id:
         # Legacy V1 has no lineage. Keep its one-off durable insertion behavior,
         # but never use it for attempt > 1.
