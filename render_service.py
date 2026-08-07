@@ -20,6 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -50,7 +51,29 @@ FORMAT = os.getenv("RENDER_FORMAT", "2160")
 # hub.aelflab.com/short), strip that prefix so routes like /files/... match.
 PATH_PREFIX = os.getenv("RENDER_PATH_PREFIX", "").strip().strip("/")
 
-app = FastAPI(title="Shorts Render Service", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Brief v8 B3/R04 — startup correctness independent of __main__.
+
+    Runs on BOTH `python render_service.py` and `uvicorn render_service:app`:
+    1. Ensure the output root exists.
+    2. Reconcile stale ACTIVE rows from a previous process -> orphaned.
+    3. Start the queue worker so /readyz is truthful on an idle service.
+    """
+    RENDER_ROOT.mkdir(parents=True, exist_ok=True)
+    print(f"[render] lifespan: output root {RENDER_ROOT}", flush=True)
+    try:
+        n = _reconcile_startup_orphans()
+        print(f"[render] lifespan reconcile: {n} job(s) orphaned", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[render] lifespan reconcile failed: {e}", flush=True)
+    ensure_worker_running()
+    yield
+    # Optional shutdown: nothing durable to flush; worker is daemon.
+
+
+app = FastAPI(title="Shorts Render Service", version="0.1.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -849,30 +872,78 @@ def health():
 
 @app.get("/readyz")
 def readyz():
-    """Brief v7 C12 (R10) — liveness + readiness split. /health stays a
-    plain heartbeat; /readyz reflects real readiness (worker alive, DB
-    writable) and /livez just confirms the process is up."""
+    """Brief v8 C08/R05/R06 — real readiness.
+
+    - The worker starts during app lifespan, so an IDLE healthy service is
+      ready (no lazy first-job dependency).
+    - DB readiness is a WRITE probe (temp-table insert/delete in a rolled-back
+      transaction), not a SELECT-only check.
+    - Reports worker_alive, heartbeat age, queue depth, oldest queued age,
+      SQLite journal mode, output writability, free disk, ffmpeg/ffprobe.
+    """
+    import shutil
     ready = True
     reasons = []
-    # Worker must be alive.
+    # Worker must be alive (started during lifespan).
     if _render_queue_worker_thread is None or not _render_queue_worker_thread.is_alive():
         ready = False
         reasons.append("queue_worker_dead")
-    # DB must be openable/writable enough to report truthfully.
+    # DB must be WRITABLE, not just readable.
+    db_ok = False
+    db_error = None
+    journal_mode = None
     try:
-        import sqlite3
         with _db_lock, _db_conn() as conn:
-            conn.execute("SELECT count(*) FROM render_jobs").fetchone()
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS _readyz_probe (v INTEGER)")
+            conn.execute("INSERT INTO _readyz_probe (v) VALUES (1)")
+            conn.execute("SELECT COUNT(*) FROM _readyz_probe")
+            conn.execute("DELETE FROM _readyz_probe")
+            conn.commit()
+            row = conn.execute("PRAGMA journal_mode").fetchone()
+            journal_mode = row[0] if row else None
+            db_ok = True
     except Exception as exc:  # noqa: BLE001
+        db_error = f"{type(exc).__name__}: {exc}"
         ready = False
-        reasons.append(f"db_unavailable:{type(exc).__name__}")
+        reasons.append(f"db_unwritable:{type(exc).__name__}")
+    # Output dir writability + free disk.
+    out_ok = False
+    out_error = None
+    free_bytes = None
+    try:
+        RENDER_ROOT.mkdir(parents=True, exist_ok=True)
+        probe = RENDER_ROOT / f".readyz_{os.getpid()}"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        out_ok = True
+        import ctypes
+        fb = ctypes.c_ulonglong(0)
+        ok = ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+            str(RENDER_ROOT.resolve()), None, None, ctypes.byref(fb),
+        )
+        free_bytes = int(fb.value) if ok else None
+    except Exception as exc:  # noqa: BLE001
+        out_error = f"{type(exc).__name__}: {exc}"
+        ready = False
+        reasons.append("output_unwritable")
+    try:
+        oldest = _oldest_queued_age_sec()
+    except Exception:  # noqa: BLE001
+        oldest = None
     body = {
         "status": "ready" if ready else "unready",
         "ready": ready,
-        "checks": (
-            {"render_worker": "up", "db": "ok"} if ready else {"detail": reasons}
-        ),
-        "postgres": "wal",  # WAL journal mode
+        "worker_alive": bool(_render_queue_worker_thread and _render_queue_worker_thread.is_alive()),
+        "worker_heartbeat_age_sec": _heartbeat_age_sec(),
+        "queue_depth": int(_render_queue.qsize()),
+        "oldest_queued_age_sec": oldest,
+        "sqlite": {"journal_mode": journal_mode or "unknown", "ok": db_ok, "error": db_error},
+        "output": {"writable": out_ok, "error": out_error, "free_bytes": free_bytes},
+        "ffmpeg": {
+            "ffmpeg": shutil.which("ffmpeg") is not None,
+            "ffprobe": shutil.which("ffprobe") is not None,
+        },
+        "checks": None if ready else reasons,
     }
     return JSONResponse(status_code=200 if ready else 503, content=body)
 
@@ -2728,6 +2799,17 @@ ORPHAN_AGE_THRESHOLD_SEC = float(os.getenv("RENDER_ORPHAN_AGE_THRESHOLD", "300")
 def render_status():
     """Report whether a render job is currently running (queue status)."""
     return {"busy": _render_busy}
+
+
+def _heartbeat_age_sec() -> float:
+    """Seconds since the worker last heartbeat. -1 if never heartbeated."""
+    if not _render_worker_heartbeat_at:
+        return -1.0
+    try:
+        hb = datetime.datetime.fromisoformat(_render_worker_heartbeat_at)
+        return max(0.0, (datetime.datetime.utcnow() - hb).total_seconds())
+    except Exception:  # noqa: BLE001
+        return -1.0
 
 
 def _oldest_queued_age_sec() -> float:
