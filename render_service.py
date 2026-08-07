@@ -767,9 +767,8 @@ def _find_job_by_request(request_id: str) -> Optional[str]:
                             return job_id
                 return None
             except Exception as e2:  # noqa: BLE001
-                print(f"[idempotency] legacy lookup failed for {request_id}: {e2}", flush=True)
                 _record_db_error("find_job_by_request_legacy", e2)
-                return None
+                raise PersistenceError(f"legacy request lookup failed: {e2}") from e2
         # Not a missing-column issue: fail closed.
         _record_db_error("find_job_by_request", e)
         raise PersistenceError(f"find_job_by_request failed: {e}") from e
@@ -1025,7 +1024,7 @@ def _load_job_request(job_id: str) -> Optional[Dict]:
             return json.loads(row[0])
     except Exception as e:  # noqa: BLE001
         _record_db_error("load_job_request", e)
-        return None
+        raise PersistenceError(f"load_job_request failed: {e}") from e
 
 
 def _normalize_clips(request) -> List:

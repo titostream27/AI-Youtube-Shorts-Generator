@@ -452,8 +452,8 @@ class TestBrief2RendererCorrectness(JobLifecycleTestBase):
         rs._last_persist_error = None
         rs._last_persist_error_at = None
         with mock.patch.object(rs, "_job_db", side_effect=RuntimeError("db corrupt")):
-            stored = rs._load_job("job-any")
-        self.assertIsNone(stored)
+            with self.assertRaises(rs.PersistenceError):
+                rs._load_job("job-any")
         # The read failure must be recorded in health diagnostics, not silent.
         self.assertIsNotNone(rs._last_persist_error, "read failure must be recorded")
 

@@ -71,7 +71,7 @@ class TestReservationErrors(V3Base):
         # directory (unopenable) — that raises on connect, not insert, but
         # still proves non-Integrity failures are NOT treated as a race hit.
         rs.JOB_DB_PATH = self.tmp / "not_a_dir" / "x.db"
-        with self.assertRaises(sqlite3.Error):
+        with self.assertRaises(rs.PersistenceError):
             rs._reserve_job("req-err-1", "job-err-1", mode="final",
                             episode_id="ep", request_json="{}")
         # And no job is registered as reserved.

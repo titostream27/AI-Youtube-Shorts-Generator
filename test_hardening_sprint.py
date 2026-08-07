@@ -170,8 +170,12 @@ class TestRetrySourceValidation(HardeningTestBase):
         for state in ("failed", "partial_failure"):
             job_id = f"retry-ok-{state}"
             self.seed_job(job_id, state)
-            # Unique request_id per retry so idempotency DB doesn't collide.
+            # The persisted lineage and the stored request must use the same
+            # request_id so the v11 allocator can continue attempt numbering.
             req = dict(V2_BODY, request_id=f"req-retry-{state}")
+            with rs._db_lock, rs._db_conn() as conn:
+                conn.execute("UPDATE render_jobs SET request_id=? WHERE job_id=?", (req["request_id"], job_id))
+                conn.commit()
             with mock.patch.object(rs, "_load_job_request", return_value=req):
                 resp = rs.render_job_retry(job_id)
             self.assertEqual(resp["original_job_id"], job_id)

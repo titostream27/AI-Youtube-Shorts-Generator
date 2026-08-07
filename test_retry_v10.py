@@ -165,9 +165,12 @@ class TestReserveAttemptHelper(V9DBIsolation):
 
         self.assertEqual(len(errors), 0, f"errors: {errors}")
         attempts = [r.attempt for r in results]
-        self.assertEqual(len(set(attempts)), len(attempts), f"duplicate attempt: {attempts}")
-        # Both must be > 1 (first child attempt after parent attempt 1).
-        self.assertTrue(all(a >= 2 for a in attempts), f"attempts must be >= 2: {attempts}")
+        # Brief v11 A1: one active attempt per request. Both concurrent force
+        # callers resolve to the same durable winner, not attempt 2 + attempt 3.
+        self.assertEqual(attempts, [2, 2])
+        self.assertEqual(results[0].job_id, results[1].job_id)
+        self.assertTrue(any(r.created for r in results))
+        self.assertTrue(any(not r.created for r in results))
 
     def test_rt04_retry_vs_force_race_unique_attempts(self):
         """V10-RT04: retry vs force race preserves unique attempt numbers."""
@@ -207,7 +210,9 @@ class TestReserveAttemptHelper(V9DBIsolation):
 
         self.assertEqual(len(errors), 0, f"errors: {errors}")
         attempts = [r.attempt for r in results]
-        self.assertEqual(len(set(attempts)), len(attempts), f"duplicate attempt: {attempts}")
+        # Brief v11 A1: retry-vs-force race resolves to one active winner.
+        self.assertEqual(attempts, [2, 2])
+        self.assertEqual(results[0].job_id, results[1].job_id)
 
     def test_rt05_db_error_no_memory_no_queue(self):
         """V10-RT05: DB error during attempt reservation creates no memory job
