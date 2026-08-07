@@ -10,8 +10,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      # Renderer contract fixtures live in the MINER repo. Brief v5 6.4/9.1:
-      # PIN the miner contract revision (never unpinned main).
+      # Renderer contract fixtures live in the MINER repo. Brief v7 C13:
+      # PIN the miner contract revision (never unpinned main). Updated from
+      # cd96695 -> c9ebd3f (brief v7 HEAD: M01-M04 lookahead/coverage/hybrid
+      # fixes + E01 hard-negative FPR semantics).
       - uses: actions/checkout@v4
         with:
           path: AI-Youtube-Shorts-Generator
@@ -20,7 +22,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: titostream27/youtube-content-miner
-          ref: cd96695
+          ref: c9ebd3f63c9cbff3505c182f3400639eb86b2176
           path: content-miner
 
       - uses: actions/setup-python@v5
@@ -32,9 +34,13 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Lifecycle + contract + cache + timeline + visual + hardening tests
+      # Brief v7 C13: discovery-based CI — pytest auto-collects every
+      # test_*.py instead of a hand-maintained list that silently misses
+      # new suites (test_hardening_v7, test_state_v7, test_visual_v7,
+      # test_ops_v7, ...).
+      - name: Run all discovered tests
         working-directory: AI-Youtube-Shorts-Generator
-        run: python -m pytest test_render_contract.py test_contract_fixtures.py test_job_lifecycle.py test_render_timeline.py test_hardening_sprint.py test_cache_timeline.py test_hardening_v3.py test_hardening_v4.py test_hardening_v5.py test_hardening_v6.py test_visual_behavior.py -q
+        run: python -m pytest -q
 
       - name: Shared contract fixtures must be present (fail, not skip)
         working-directory: AI-Youtube-Shorts-Generator
@@ -47,4 +53,4 @@ jobs:
         working-directory: AI-Youtube-Shorts-Generator
         run: |
           echo "## Test results" >> $GITHUB_STEP_SUMMARY
-          echo "- pytest: lifecycle/contract/cache/timeline/visual/hardening suites" >> $GITHUB_STEP_SUMMARY
+          echo "- pytest: discovery-based (all test_*.py suites)" >> $GITHUB_STEP_SUMMARY
