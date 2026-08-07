@@ -39,6 +39,7 @@ from render_contract import (
     RenderRequestV2,
     RenderResponse,
     RenderSubmissionResponse,
+    RenderJobStatusResponse,
 )
 
 RENDER_ROOT = Path(os.getenv("RENDER_OUTPUT_DIR", "rendered")).resolve()
@@ -2852,41 +2853,46 @@ def _reconcile_startup_orphans() -> int:
     return orphaned_count
 
 
-@app.get("/api/render/status/{job_id}")
+@app.get("/api/render/status/{job_id}", response_model=RenderJobStatusResponse)
 def render_job_status(job_id: str):
     """Return the canonical state of a render job (from memory when active,
-    from the persisted job DB after a restart — brief §19)."""
+    from the persisted job DB after a restart — brief §19).
+
+    Brief v8 A2: returns the typed RenderJobStatusResponse; canonical state
+    is the durable SQLite state, memory is used for live diagnostics only.
+    """
     with _async_jobs_lock:
         job = _async_jobs.get(job_id)
     if job:
         state = canonical_status(job["state"])
-        payload = {
-            "job_id": job_id,
-            "state": state,
-            "error": job.get("error"),
-            "mode": job.get("mode", "final"),
-        }
+        attempt = job.get("attempt", 1)
+        parent = job.get("parent_job_id")
         resp = job.get("response")
-        # P1.R3 partial-failure parity: expose successful artifacts from
-        # memory identically to the persisted path (completed AND
-        # partial_failure), not only completed.
-        if state in ("completed", "partial_failure") and resp:
-            payload["rendered"] = resp.rendered
-            payload["source_video"] = resp.source_video
-            payload["mode"] = getattr(resp, "mode", "final")
-            payload["artifacts"] = getattr(resp, "artifacts", None)
-        return payload
+        response_model = None
+        if state in ("completed", "partial_failure") and isinstance(resp, RenderResponse):
+            response_model = resp
+        return RenderJobStatusResponse(
+            job_id=job_id,
+            request_id=job.get("request_id", "") or "",
+            state=state,
+            mode=job.get("mode", "final") or "final",
+            attempt=attempt if isinstance(attempt, int) else 1,
+            parent_job_id=parent,
+            error=job.get("error"),
+            response=response_model,
+            persistence_degraded=bool(job.get("persistence_degraded", False)),
+        )
     # Not in memory: fall back to the persisted job store.
     stored = _load_job(job_id)
     if not stored:
         raise HTTPException(status_code=404, detail="job not found")
     state = stored["status"]
-    # Orphan detection (self-heal, brief v4 F19): a job that is still active
-    # in the persisted store but ABSENT from _async_jobs may mean the service
-    # was restarted after persisting that state — the worker that would
-    # advance it died with the old process and will never resume. BUT we must
-    # never orphan a job freshly reserved by THIS process: only rows owned by
-    # a DIFFERENT process boot (or pre-ownership rows older than the
+        # Orphan detection (self-heal, brief v4 F19): a job that is still active
+        # in the persisted store but ABSENT from _async_jobs may mean the service
+        # was restarted after persisting that state — the worker that would
+        # advance it died with the old process and will never resume. BUT we must
+        # never orphan a job freshly reserved by THIS process: only rows owned by
+        # a DIFFERENT process boot (or pre-ownership rows older than the
     # threshold) become 'orphaned'. Persisted terminal states pass through.
     if is_active(state):
         boot_id = stored.get("process_boot_id")
@@ -2903,20 +2909,32 @@ def render_job_status(job_id: str):
             # Fresh current-process job (or young pre-ownership row): keep it
             # active — do NOT orphan.
             state = stored["status"]
-    payload = {
-        "job_id": job_id,
-        "state": state,
-        "error": stored.get("error") or ("job orphaned by render service restart"
-                                        if state == "orphaned" else None),
-        "mode": stored.get("mode", "final"),
-    }
-    resp = stored.get("response") or {}
-    if resp:
-        payload["rendered"] = resp.get("rendered")
-        payload["source_video"] = resp.get("source_video")
-        payload["artifacts"] = resp.get("artifacts")
-        payload["source"] = resp.get("source")
-    return payload
+    error = stored.get("error")
+    if state == "orphaned" and not error:
+        error = "job orphaned by render service restart"
+    resp = stored.get("response")
+    response_model = None
+    if state in ("completed", "partial_failure") and resp:
+        try:
+            import json as _json
+            raw = resp
+            if isinstance(raw, str):
+                raw = _json.loads(raw)
+            if isinstance(raw, dict):
+                response_model = RenderResponse(**raw)
+        except Exception:  # noqa: BLE001
+            response_model = None
+    return RenderJobStatusResponse(
+        job_id=job_id,
+        request_id=stored.get("request_id", "") or "",
+        state=state,
+        mode=stored.get("mode", "final") or "final",
+        attempt=stored.get("attempt") if isinstance(stored.get("attempt"), int) else 1,
+        parent_job_id=stored.get("parent_job_id"),
+        error=error,
+        response=response_model,
+        persistence_degraded=False,
+    )
 
 
 def parse_render_request(request):
@@ -2942,10 +2960,48 @@ def parse_render_request(request):
     return RenderRequest(**request)
 
 
-@app.post("/api/render/async", response_model=RenderResponse)
+def get_existing_request_result(request_id: str):
+    """Brief v8 A3 — single idempotent-retrieval helper for sync and async.
+
+    Returns a JobSnapshot-like dict (or None) for an existing request_id,
+    reconciling memory and durable SQLite. The canonical state is the
+    DURABLE state; memory is used only for live diagnostics. Never
+    hardcodes 'queued' — returns the job's real persisted state/result,
+    including after process restart.
+    """
+    if not request_id:
+        return None
+    job_id = None
+    mem = None
+    # 1. Prefer an existing memory entry.
+    with _async_jobs_lock:
+        for jid, job in _async_jobs.items():
+            if job.get("request_id") == request_id and canonical_status(job.get("state", "")) in IDEMPOTENT_HIT_STATES:
+                job_id = jid
+                mem = job
+                break
+    # 2. Fall back to durable SQLite (survives process restart).
+    if job_id is None:
+        job_id = _find_job_by_request(request_id)
+    if job_id is None:
+        return None
+    stored = _load_job(job_id)
+    state = canonical_status((stored or {}).get("status") or (mem or {}).get("state") or "queued")
+    return {
+        "job_id": job_id,
+        "request_id": request_id,
+        "state": state,
+        "mode": (stored or {}).get("mode") or (mem or {}).get("mode", "final"),
+        "attempt": (stored or {}).get("attempt") or (mem or {}).get("attempt", 1),
+        "parent_job_id": (stored or {}).get("parent_job_id") or (mem or {}).get("parent_job_id"),
+        "response": (stored or {}).get("response"),
+        "idempotent_hit": True,
+    }
+
+
+@app.post("/api/render/async", response_model=RenderSubmissionResponse)
 def render_async(request: Dict[str, Any]):
     """Queue a render job (v1 or v2 contract) and return immediately.
-
     The request is parsed MANUALLY (not via Union) so that a v2 body with
     contract_version="2.0" is never mis-parsed as v1. FastAPI's Union tries
     v1 first, and v1 ignores unknown fields — which silently dropped
@@ -2965,20 +3021,19 @@ def render_async(request: Dict[str, Any]):
     request_id = getattr(request, "request_id", "") or ""
     force_rerender = bool(getattr(request, "force_rerender", False))
     if request_id and not force_rerender:
-        # Phase-2 correctness (F6): memory check uses canonical terminal
-        # vocabulary — a 'failed'/'partial_failure'/'cancelled' request is NOT
-        # an idempotent hit and may be resubmitted.
-        # Hardening v3 E3: force_rerender skips the idempotent-hit path.
-        with _async_jobs_lock:
-            for jid, job in _async_jobs.items():
-                if job.get("request_id") == request_id and canonical_status(job.get("state", "")) in IDEMPOTENT_HIT_STATES:
-                    print(f"[render] idempotent hit: {request_id} -> {jid}", flush=True)
-                    return RenderSubmissionResponse(
-                        job_id=jid, request_id=request_id,
-                        state=canonical_status(job.get("state", "queued")),
-                        idempotent_hit=True,
-                        attempt=job.get("attempt", 1),
-                    )
+        # Brief v8 A3/R07: single idempotent lookup reports the ACTUAL
+        # persisted state — never a hardcoded 'queued'.
+        existing = get_existing_request_result(request_id)
+        if existing is not None and existing["state"] not in ("failed", "cancelled"):
+            print(f"[render] idempotent hit: {request_id} -> {existing['job_id']} state={existing['state']}", flush=True)
+            return RenderSubmissionResponse(
+                job_id=existing["job_id"],
+                request_id=request_id,
+                state=existing["state"],
+                idempotent_hit=True,
+                attempt=existing["attempt"],
+                parent_job_id=existing["parent_job_id"],
+            )
 
     job_id = uuid.uuid4().hex[:10]
     mode = getattr(request, "mode", "final") or "final"
@@ -2990,9 +3045,15 @@ def render_async(request: Dict[str, Any]):
     reserved = _reserve_job(request_id, job_id, mode=mode, episode_id=episode_id, request_json=request_json, force=force_rerender)
     if reserved != job_id:
         print(f"[render] idempotent hit (reserved): {request_id} -> {reserved}", flush=True)
+        # Brief v8 R07: report the ACTUAL persisted state of the existing job,
+        # never a hardcoded queued.
+        ex = get_existing_request_result(request_id)
         return RenderSubmissionResponse(
             job_id=reserved, request_id=request_id,
-            state="queued", idempotent_hit=True,
+            state=ex["state"] if ex else "queued",
+            idempotent_hit=True,
+            attempt=ex["attempt"] if ex else 1,
+            parent_job_id=(ex or {}).get("parent_job_id"),
         )
     with _async_jobs_lock:
         _async_jobs[job_id] = {"state": "queued", "response": None, "error": None, "request_id": request_id, "mode": mode, "episode_id": episode_id}
@@ -3379,14 +3440,26 @@ def render(request: Dict[str, Any]):
         # Brief v5 R-01: idempotent hit — DO NOT create a phantom memory
         # entry for a job that does not exist. Return the existing job.
         print(f"[render] sync idempotent hit: {request_id} -> {reserved}", flush=True)
-        # Brief v7 4.1: sync idempotent hit returns the stored final result
-        # or a 409 if the job is still active.
+        # Brief v8 R08: the persisted completed result (absent from memory
+        # after a restart) must deserialize and return — never 409 unknown.
+        # Check memory first, then durable SQLite.
         with _async_jobs_lock:
             existing = _async_jobs.get(reserved, {})
             stored_resp = existing.get("response")
         if stored_resp and isinstance(stored_resp, RenderResponse):
             return stored_resp
-        # Job exists but not yet completed — return 409 Conflict.
+        # Not in memory: try the durable row.
+        durable = _load_job(reserved)
+        if durable and durable.get("response"):
+            try:
+                import json as _json
+                raw = durable["response"]
+                if isinstance(raw, dict):
+                    return RenderResponse(**raw)
+                return RenderResponse(**(_json.loads(raw) if isinstance(raw, str) else raw))
+            except Exception as e:  # noqa: BLE001
+                print(f"[render] sync idempotent: corrupt stored response for {reserved}: {e}", flush=True)
+        # Job exists but not completed anywhere — return 409 Conflict.
         raise HTTPException(
             status_code=409,
             detail=f"Job {reserved} is still active (state={existing.get('state', 'unknown')}). "

@@ -419,6 +419,32 @@ class RenderSubmissionResponse(BaseModel):
     result_url: Optional[str] = None
 
 
+_JOB_STATE_LITERAL = Literal[
+    "queued", "downloading", "analysing", "rendering", "quality_check",
+    "completed", "partial_failure", "failed", "cancelled", "orphaned",
+]
+_RENDER_MODE_LITERAL = Literal["preview", "final"]
+class RenderJobStatusResponse(BaseModel):
+    """Brief v8 A2 — typed job status snapshot used by
+    GET /api/render/status/{job_id}.
+
+    Represents active AND terminal jobs without inventing final artifacts.
+    The canonical state is the DURABLE (SQLite) state; memory is only used
+    for live diagnostics. `response` carries the final RenderResponse only
+    for terminal result states (completed / partial_failure).
+    """
+    model_config = ConfigDict(extra="forbid")
+    job_id: str
+    request_id: str = ""
+    state: _JOB_STATE_LITERAL
+    mode: _RENDER_MODE_LITERAL = "final"
+    attempt: int = 1
+    parent_job_id: Optional[str] = None
+    error: Optional[Union[str, dict]] = None
+    response: Optional["RenderResponse"] = None  # terminal result states only
+    persistence_degraded: bool = False
+
+
 class RenderResponse(BaseModel):
     """Brief v6 6.3 / v7 4.2 — strictly typed FINAL response.
 

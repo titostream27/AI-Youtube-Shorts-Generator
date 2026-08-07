@@ -232,10 +232,10 @@ class TestPartialFailureParity(HardeningTestBase):
                 "request_id": f"req-{job_id}", "mode": "final",
             }
         payload = rs.render_job_status(job_id)
-        self.assertEqual(payload["state"], "partial_failure")
-        self.assertIn("rendered", payload)
-        self.assertEqual(len(payload["rendered"]), 2)
-        ok = [r for r in payload["rendered"] if r.status == "ok"]
+        self.assertEqual(payload.state, "partial_failure")
+        self.assertIsNotNone(payload.response, "typed status must expose final response")
+        self.assertEqual(len(payload.response.rendered), 2)
+        ok = [r for r in payload.response.rendered if r.status == "ok"]
         self.assertEqual(len(ok), 1)
         self.assertEqual(ok[0].video_url, "/out/short_01.mp4")
 

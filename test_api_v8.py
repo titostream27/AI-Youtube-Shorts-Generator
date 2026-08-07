@@ -70,6 +70,7 @@ class TestAsyncRouteModel(unittest.TestCase):
 
     def tearDown(self):
         rs._close_db_conns()
+        time.sleep(0.3)  # let any spawned worker thread release DB handles
         self._tmp.cleanup()
 
     def test_async_route_uses_submission_response_model(self):
