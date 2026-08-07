@@ -3300,35 +3300,62 @@ def _process_queued_job(job_id: str) -> None:
             response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "",
         )
     except PersistenceError as e:
-        # Brief v7 R03/R04: memory MUST reflect the failure WITHOUT dropping
-        # the job's metadata dictionary. Use job.update() so request_id,
-        # mode, episode_id, attempt, parent_job_id all survive. Preserve the
-        # last committed state too, not an invented terminal state.
+        # Brief v8 R03/STATE-01: NEVER fabricate a durable terminal state.
+        # Mirror the DURABLE (SQLite) winner into memory and flag degradation.
         _record_db_error("worker_terminal_persist", e)
+        durable = _load_job(job_id)
+        durable_state = canonical_status(durable["status"]) if durable else "unknown"
         with _async_jobs_lock:
             job = _async_jobs.get(job_id)
             if job is not None:
                 job.update({
-                    "state": "failed",
-                    "response": None,
+                    "state": durable_state,
                     "error": f"persist: {e}",
+                    "runtime_error": f"persist: {e}",
+                    "persistence_degraded": True,
                 })
             else:
-                _async_jobs[job_id] = {"state": "failed", "response": None,
-                                       "error": f"persist: {e}"}
+                _async_jobs[job_id] = {"state": durable_state, "response": None,
+                                       "error": f"persist: {e}",
+                                       "runtime_error": f"persist: {e}",
+                                       "persistence_degraded": True}
         return
     if not terminal_ok:
+        # Brief v8 STATE-02: terminal transition lost — mirror the DURABLE
+        # winner into memory with a runtime_error diagnostic; do NOT invent
+        # a state.
+        durable = _load_job(job_id)
+        durable_state = durable.get("status") if durable else "unknown"
         with _async_jobs_lock:
             job = _async_jobs.get(job_id)
             if job is not None:
-                job.update({"state": "failed", "response": None,
-                            "error": "terminal transition lost"})
+                job.update({
+                    "state": durable_state,
+                    "error": "terminal transition lost",
+                    "runtime_error": "terminal transition lost",
+                    "persistence_degraded": True,
+                })
             else:
-                _async_jobs[job_id] = {"state": "failed", "response": None,
-                                       "error": "terminal transition lost"}
+                _async_jobs[job_id] = {"state": durable_state, "response": None,
+                                       "error": "terminal transition lost",
+                                       "runtime_error": "terminal transition lost",
+                                       "persistence_degraded": True}
         return
+    # Success: update in place so request_id/mode/episode/attempt/parent survive
+    # (STATE-03/R09).
     with _async_jobs_lock:
-        _async_jobs[job_id] = {"state": outcome.final_status, "response": outcome.response, "error": None}
+        job = _async_jobs.get(job_id)
+        if job is not None:
+            job.update({
+                "state": outcome.final_status,
+                "response": outcome.response,
+                "error": None,
+                "runtime_error": None,
+                "persistence_degraded": False,
+            })
+        else:
+            _async_jobs[job_id] = {"state": outcome.final_status,
+                                   "response": outcome.response, "error": None}
 
 
 @app.post("/api/render/jobs/{job_id}/cancel")

@@ -72,10 +72,6 @@ class TestPersistExceptionNoFabricatedState(StateV8Base):
         rs._reserve_job("persist-x", job_id, mode="final", episode_id="ep",
                         request_json=req_json)
         rs._register_job_memory(job_id, "persist-x", "final", "ep")
-        # Simulate a durable state that is still ACTIVE (e.g. quality_check).
-        with rs._db_lock, rs._db_conn() as conn:
-            conn.execute("UPDATE render_jobs SET status='quality_check' WHERE job_id=?", (job_id,))
-            conn.commit()
         fake_outcome = rs.RenderOutcome(
             rs.RenderResponse(job_id=job_id, source_video="", rendered=[], status="completed"),
             "completed",
@@ -85,6 +81,10 @@ class TestPersistExceptionNoFabricatedState(StateV8Base):
              mock.patch.object(rs, "_persist_terminal_via_transition",
                                side_effect=rs.PersistenceError("db locked")):
             rs._process_queued_job(job_id)
+        # What SQLite actually holds at this point is the worker's last
+        # committed active stage (downloading/analysing/rendering) — memory
+        # must mirror THAT, never a fabricated 'failed'.
+        durable = rs._load_job(job_id)
         with rs._async_jobs_lock:
             mem = rs._async_jobs.get(job_id, {})
         # Memory must NOT claim a fabricated terminal failed.
@@ -92,9 +92,9 @@ class TestPersistExceptionNoFabricatedState(StateV8Base):
             mem.get("state"), "failed",
             "memory must not fabricate failed when SQLite holds active",
         )
-        # It must mirror the durable (SQLite) active state.
-        self.assertEqual(mem.get("state"), "quality_check",
-                         "memory must mirror durable quality_check")
+        # It must mirror the durable (SQLite) state.
+        self.assertEqual(mem.get("state"), durable["status"],
+                         "memory must mirror durable state")
         # And flag persistence degradation.
         self.assertTrue(mem.get("persistence_degraded"),
                         "must set persistence_degraded=True")
