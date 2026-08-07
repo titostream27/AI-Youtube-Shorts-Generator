@@ -3035,7 +3035,13 @@ def _persist_terminal_via_transition(job_id: str, status: str, *, mode: str = "f
     # apply the final hop. Every hop is a validated CAS; a lost hop aborts.
     if status == "failed":
         return transition_job(job_id, src, "failed", mode=mode, episode_id=episode_id, error=error)
-    chain = ["queued", "downloading", "analysing", "rendering", "quality_check"]
+    # Brief v7 R07: never auto-advance FROM queued. A queued job that reports
+    # a render outcome has not actually worked (the worker must first win the
+    # queued->downloading CAS). Auto-advance is only allowed from an
+    # in-flight stage the worker demonstrably reached.
+    if src in ("queued", "cancelled"):
+        return False
+    chain = ["downloading", "analysing", "rendering", "quality_check"]
     if src in chain:
         try:
             idx = chain.index(src)
@@ -3159,15 +3165,32 @@ def _process_queued_job(job_id: str) -> None:
             response=outcome.response.model_dump_json() if hasattr(outcome.response, "model_dump_json") else "",
         )
     except PersistenceError as e:
-        # Brief v5 R-05: surface in health; do not claim terminal in memory.
+        # Brief v7 R03/R04: memory MUST reflect the failure WITHOUT dropping
+        # the job's metadata dictionary. Use job.update() so request_id,
+        # mode, episode_id, attempt, parent_job_id all survive. Preserve the
+        # last committed state too, not an invented terminal state.
         _record_db_error("worker_terminal_persist", e)
         with _async_jobs_lock:
-            _async_jobs[job_id] = {"state": "failed", "response": None, "error": f"persist: {e}"}
+            job = _async_jobs.get(job_id)
+            if job is not None:
+                job.update({
+                    "state": "failed",
+                    "response": None,
+                    "error": f"persist: {e}",
+                })
+            else:
+                _async_jobs[job_id] = {"state": "failed", "response": None,
+                                       "error": f"persist: {e}"}
         return
     if not terminal_ok:
         with _async_jobs_lock:
-            _async_jobs[job_id] = {"state": "failed", "response": None,
-                                   "error": "terminal transition lost"}
+            job = _async_jobs.get(job_id)
+            if job is not None:
+                job.update({"state": "failed", "response": None,
+                            "error": "terminal transition lost"})
+            else:
+                _async_jobs[job_id] = {"state": "failed", "response": None,
+                                       "error": "terminal transition lost"}
         return
     with _async_jobs_lock:
         _async_jobs[job_id] = {"state": outcome.final_status, "response": outcome.response, "error": None}
