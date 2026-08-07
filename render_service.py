@@ -700,7 +700,14 @@ def _find_job_by_request(request_id: str) -> Optional[str]:
 
     Phase 1 §5.3: queries the indexed request_id column directly — no JSON
     scan, no dependence on a nonexistent id column.
+
+    Brief v10 C07 (V10-R05): the legacy JSON-scan fallback ONLY runs when the
+    caught sqlite3.OperationalError specifically indicates the request_id
+    column is missing on an unmigrated legacy schema. ALL other SQLite errors
+    become PersistenceError (fail closed) — a DB read error must never be
+    interpreted as "no existing job".
     """
+    import sqlite3
     if not request_id:
         return None
     try:
@@ -713,32 +720,38 @@ def _find_job_by_request(request_id: str) -> Optional[str]:
                 (request_id,),
             ).fetchone()
             return row[0] if row else None
-    except Exception:  # noqa: BLE001
-        # Column may not exist yet on an un-migrated DB; fall back to the old
-        # JSON scan only for backward compatibility (never silently ignore).
-        try:
-            with _db_conn() as conn:
-                rows = conn.execute(
-                    "SELECT job_id, status, request FROM render_jobs "
-                    "WHERE status IN ('queued','downloading','analysing','rendering',"
-                    "'quality_check','completed') ORDER BY created_at DESC LIMIT 50"
-                ).fetchall()
-                import json
-                for job_id, status, request in rows:
-                    if not request:
-                        continue
-                    try:
-                        parsed = json.loads(request)
-                    except Exception:  # noqa: BLE001
-                        continue
-                    rid = parsed.get("request_id") if isinstance(parsed, dict) else None
-                    if rid == request_id:
-                        return job_id
-            return None
-        except Exception as e:  # noqa: BLE001
-            print(f"[idempotency] lookup failed for {request_id}: {e}", flush=True)
-            _record_db_error("find_job_by_request", e)
-            return None
+    except sqlite3.OperationalError as e:
+        # Narrow fallback: ONLY when the request_id column is missing.
+        if "request_id" in str(e).lower() and ("no such column" in str(e).lower() or "no column" in str(e).lower()):
+            try:
+                with _db_conn() as conn:
+                    rows = conn.execute(
+                        "SELECT job_id, status, request FROM render_jobs "
+                        "WHERE status IN ('queued','downloading','analysing','rendering',"
+                        "'quality_check','completed') ORDER BY created_at DESC LIMIT 50"
+                    ).fetchall()
+                    import json
+                    for job_id, status, request in rows:
+                        if not request:
+                            continue
+                        try:
+                            parsed = json.loads(request)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        rid = parsed.get("request_id") if isinstance(parsed, dict) else None
+                        if rid == request_id:
+                            return job_id
+                return None
+            except Exception as e2:  # noqa: BLE001
+                print(f"[idempotency] legacy lookup failed for {request_id}: {e2}", flush=True)
+                _record_db_error("find_job_by_request_legacy", e2)
+                return None
+        # Not a missing-column issue: fail closed.
+        _record_db_error("find_job_by_request", e)
+        raise PersistenceError(f"find_job_by_request failed: {e}") from e
+    except Exception as e:  # noqa: BLE001
+        _record_db_error("find_job_by_request", e)
+        raise PersistenceError(f"find_job_by_request failed: {e}") from e
 
 
 # Idempotent request statuses: an existing job in one of these states is
@@ -3332,31 +3345,26 @@ def parse_render_request(request):
 
 
 def get_existing_request_result(request_id: str):
-    """Brief v8 A3 — single idempotent-retrieval helper for sync and async.
+    """Brief v10 C07 — durable-first idempotent-retrieval helper for sync and
+    async (V10-R04).
 
-    Returns a JobSnapshot-like dict (or None) for an existing request_id,
-    reconciling memory and durable SQLite. The canonical state is the
-    DURABLE state; memory is used only for live diagnostics. Never
-    hardcodes 'queued' — returns the job's real persisted state/result,
-    including after process restart.
+    SQLite chooses the canonical job_id — never memory. Memory only overlays
+    live diagnostics for THAT chosen job. Canonical attempt policy: prefer an
+    ACTIVE attempt; otherwise newest terminal attempt by attempt DESC then
+    created_at DESC.
     """
     if not request_id:
         return None
-    job_id = None
-    mem = None
-    # 1. Prefer an existing memory entry.
-    with _async_jobs_lock:
-        for jid, job in _async_jobs.items():
-            if job.get("request_id") == request_id and canonical_status(job.get("state", "")) in IDEMPOTENT_HIT_STATES:
-                job_id = jid
-                mem = job
-                break
-    # 2. Fall back to durable SQLite (survives process restart).
-    if job_id is None:
-        job_id = _find_job_by_request(request_id)
+    # 1. Choose identity from DURABLE state (never iterate memory to pick one).
+    job_id = _find_job_by_request(request_id)
     if job_id is None:
         return None
     stored = _load_job(job_id)
+    # 2. Memory overlays diagnostics for the chosen job only.
+    mem = None
+    with _async_jobs_lock:
+        if job_id in _async_jobs:
+            mem = _async_jobs[job_id]
     state = canonical_status((stored or {}).get("status") or (mem or {}).get("state") or "queued")
     return {
         "job_id": job_id,
@@ -3696,16 +3704,13 @@ def render_job_cancel(job_id: str):
     if won:
         return {"job_id": job_id, "state": "cancelled"}
 
-    state = None
-    with _async_jobs_lock:
-        job = _async_jobs.get(job_id)
-        if job:
-            state = canonical_status(job.get("state", ""))
-    if not state:
-        stored = _load_job(job_id)
-        if not stored:
-            raise HTTPException(status_code=404, detail="job not found")
-        state = stored["status"]
+    # Brief v10 C07 (V10-R06): the cancel conflict response reads DURABLE
+    # state first; memory is diagnostic only. A stale memory snapshot must
+    # never report the wrong current state (e.g. after process restart).
+    stored = _load_job(job_id)
+    if not stored:
+        raise HTTPException(status_code=404, detail="job not found")
+    state = canonical_status(stored["status"])
     if is_active(state):
         return JSONResponse(
             status_code=409,
