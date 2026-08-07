@@ -10,3 +10,5 @@ rendered/
 *.png
 *.jpg
 *.log
+evidence_out/*.mkv
+evidence_out/*.mp4.silent*
