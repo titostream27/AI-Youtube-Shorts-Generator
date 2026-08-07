@@ -12,8 +12,9 @@ jobs:
     steps:
       # Renderer contract fixtures live in the MINER repo. Brief v7 C13:
       # PIN the miner contract revision (never unpinned main). Updated from
-      # cd96695 -> c9ebd3f (brief v7 HEAD: M01-M04 lookahead/coverage/hybrid
-      # fixes + E01 hard-negative FPR semantics).
+      # c9ebd3f -> 5c1c238 (brief v8 HEAD: time-based lookahead everywhere,
+      # finalization metadata, maximum-cardinality temporal assignment,
+      # explicit metric denominators).
       - uses: actions/checkout@v4
         with:
           path: AI-Youtube-Shorts-Generator
@@ -22,7 +23,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: titostream27/youtube-content-miner
-          ref: c9ebd3f63c9cbff3505c182f3400639eb86b2176
+          ref: 5c1c23849ae7c837a85a53377a617ffe99843cca
           path: content-miner
 
       - uses: actions/setup-python@v5
