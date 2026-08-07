@@ -2566,9 +2566,20 @@ def _render(request, job_id: str) -> RenderOutcome:
     # Brief v6 4.4 Option A (job-level phases) + R01: checked transition.
     require_transition(job_id, "rendering", "quality_check", mode=mode, episode_id=episode_id)
     print(f"[render] job {job_id}: quality_check (all clips rendered)", flush=True)
-    # Phase-2 correctness: compute the terminal status but DO NOT persist it.
-    # The orchestration layer persists it exactly once (RenderOutcome).
-    import json
+    # Brief v7 Q01 (real two-pass): the quality_check phase must DO work, not
+    # just hop state. Aggregate QC verifies the full artifact set — every ok
+    # artifact must have reached QC, produced a video_url, and passed the
+    # gate; any missing/regressed ok artifact is demoted to error so the
+    # final publishability decision is made on real QC results.
+    for _a in artifacts:
+        if _a.status == "ok":
+            _qc_st = (getattr(_a.qc, "status", "") or "").strip().lower()
+            if not _a.video_url or _qc_st in ("", "unavailable", "fail", "failed"):
+                _a.status = "error"
+                _a.publishable = False
+                if not _a.error:
+                    _a.error = f"quality_check aggregate gate rejected qc_status={_qc_st!r}"
+    # Recompute statuses after the aggregate QC pass.
     ok_count = sum(1 for a in artifacts if a.status == "ok")
     final_status = "completed" if ok_count == len(artifacts) else "partial_failure"
     src_info = None
