@@ -2776,8 +2776,8 @@ def _render(request, job_id: str) -> RenderOutcome:
                 if not _a.error:
                     _a.error = f"quality_check aggregate gate rejected qc_status={_qc_st!r}"
     # Recompute statuses after the aggregate QC pass.
-    ok_count = sum(1 for a in artifacts if a.status == "ok")
-    final_status = "completed" if ok_count == len(artifacts) else "partial_failure"
+    # Brief v10 C04: use the canonical helper (0/N -> failed, not partial).
+    final_status = terminal_status_from_artifacts(artifacts)
     src_info = None
     try:
         from visual_effects import probe_source_resolution
@@ -2823,6 +2823,28 @@ def _canonicalize(artifact_models, mode: str) -> "list[RenderArtifactResult]":
     return out
 
 
+def terminal_status_from_artifacts(results) -> str:
+    """Brief v10 C04 — canonical terminal status from a list of artifact
+    results (section 5.1). Single source of truth for both the render worker's
+    final_status and the response builder.
+
+    Rules:
+      N == 0                      -> "failed"
+      N > 0 and ok_count == N     -> "completed"
+      N > 0 and ok_count == 0     -> "failed"
+      N > 0 and 0 < ok_count < N  -> "partial_failure"
+    """
+    artifacts = list(results or [])
+    if not artifacts:
+        return "failed"
+    ok = sum(1 for a in artifacts if a.status == "ok")
+    if ok == len(artifacts):
+        return "completed"
+    if ok == 0:
+        return "failed"
+    return "partial_failure"
+
+
 def _build_render_response(*, job_id: str, source_video: str, mode: str,
                            canonical_results, final_status: str = "completed",
                            src_info: dict = None) -> RenderResponse:
@@ -2830,12 +2852,14 @@ def _build_render_response(*, job_id: str, source_video: str, mode: str,
 
     Aggregate QC has already demoted any invalid ok artifact. Deriving
     `rendered` and `artifacts` from this ONE list guarantees they can never
-    diverge, and final_status/publishability are consistent.
+    diverge, and final_status/publishability are consistent. Brief v10 C4:
+    effective terminal status comes from the shared
+    terminal_status_from_artifacts helper (V10-R01 0/N -> failed).
     """
     canonical = list(canonical_results)
-    # Recompute final status from the SAME canonical list (paranoia guard).
-    ok_count = sum(1 for a in canonical if a.status == "ok")
-    effective_status = "completed" if ok_count == len(canonical) and canonical else "partial_failure"
+    # Recompute final status from the SAME canonical list (paranoia guard)
+    # using the canonical helper — never duplicate the mapping logic.
+    effective_status = terminal_status_from_artifacts(canonical)
     return RenderResponse(
         job_id=job_id,
         source_video=source_video,
@@ -3080,7 +3104,7 @@ def render_job_status(job_id: str):
         if mem.get("state") != state:
             persistence_degraded = True
         # If memory has a response object for terminal states, use it.
-        if state in ("completed", "partial_failure") and isinstance(mem.get("response"), RenderResponse):
+        if state in ("completed", "partial_failure", "failed") and isinstance(mem.get("response"), RenderResponse):
             response_model = mem["response"]
 
     # Deserialize stored response if present.

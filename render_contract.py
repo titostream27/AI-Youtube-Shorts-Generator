@@ -479,12 +479,15 @@ class RenderJobStatusResponse(BaseModel):
 
 
 class RenderResponse(BaseModel):
-    """Brief v6 6.3 / v7 4.2 — strictly typed FINAL response.
+    """Brief v10 C04 — strictly typed FINAL response.
 
-    status has NO default — callers MUST pass it explicitly (V7-R02)."""
+    status has NO default — callers MUST pass it explicitly (V7-R02).
+    Brief v10 C01: status now includes "failed" so a TOTAL rendering failure
+    (0/N ok) is semantically distinct from partial success (V10-R01).
+    """
     model_config = ConfigDict(extra="forbid")
     job_id: str
-    status: Literal["completed", "partial_failure"]  # NO default — explicit
+    status: Literal["completed", "partial_failure", "failed"]  # NO default — explicit
     source_video: str = ""
     rendered: List[RenderArtifactResult] = Field(default_factory=list)
     artifacts: Optional[List[RenderArtifactResult]] = None
