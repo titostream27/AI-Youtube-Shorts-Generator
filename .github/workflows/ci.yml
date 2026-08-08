@@ -12,9 +12,10 @@ jobs:
     steps:
       # Renderer contract fixtures live in the MINER repo. Brief v7 C13:
       # PIN the miner contract revision (never unpinned main). Updated from
-      # c9ebd3f -> 5c1c238 (brief v8 HEAD: time-based lookahead everywhere,
-      # finalization metadata, maximum-cardinality temporal assignment,
-      # explicit metric denominators).
+      # 5c1c238 -> 84c5e3e (brief v10/v11 closure HEAD: added
+      # render-result-v2-failed / render-result-v2-partial parity fixtures
+      # and manifest entries; renderer supports the canonical failed/partial
+      # vocabulary since v10 C12).
       - uses: actions/checkout@v4
         with:
           path: AI-Youtube-Shorts-Generator
@@ -23,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: titostream27/youtube-content-miner
-          ref: 5c1c23849ae7c837a85a53377a617ffe99843cca
+          ref: 84c5e3e
           path: content-miner
 
       - uses: actions/setup-python@v5
