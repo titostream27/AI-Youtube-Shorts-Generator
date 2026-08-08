@@ -22,7 +22,14 @@ Synthetic six-second files under `evidence_out/` are visual-test fixtures and ar
 
 ## Remote CI
 
-The latest pushed fork run inspected was red and predates this recovery patch. Renderer CI is BLOCKED until the final recovery SHA is pushed and its exact GitHub Actions run is green.
+Final recovery SHA `f3e7f7d70fdbe15f09cc77bd33b67f1a520af605` is green on GitHub Actions run `31253140819`.
+
+Failures diagnosed and fixed on the way to green:
+
+- `31252188799` (d8d8a8e): checkout could not fetch the short miner ref `84c5e3e` — pinned the full immutable SHA.
+- `31252990091` (034ec1a): pytest collection failed because fastapi/pydantic were not installed, visual tests failed without ffmpeg, and `/readyz` used a Windows-only `ctypes.windll` free-disk check. Fixed by adding the runtime/test dependencies, installing ffmpeg in CI, and switching both free-disk checks to cross-platform `shutil.disk_usage`.
+
+Local CI-parity full discovery with only `requirements.txt` + fixture generation: **205 passed, 44 subtests passed, 0 failed, 0 errors, 0 skipped**.
 
 ## G3 verdict
 
