@@ -10,3 +10,12 @@ numpy>=1.26
 opencv-python-headless>=4.8.0
 # CI runs `python -m pytest` after installing this single requirements file.
 pytest>=8.0
+# render_service.py and render_contract.py import these at module load, and
+# every discovered test suite imports render_service or the contract. Without
+# them pytest fails at collection with ModuleNotFoundError, so CI was red even
+# before the visual-skip issue.
+fastapi>=0.110
+pydantic>=2.0
+uvicorn>=0.27
+# fastapi.testclient (TestClient) requires httpx.
+httpx>=0.24
