@@ -1,2 +1,7 @@
 requests>=2.31
 python-dotenv>=1.0
+# shorts_generator.local.clipper imports numpy at module load (Phase split
+# commit e72d107). Without it, CI (pip install -r requirements.txt) fails at
+# pytest collection with ModuleNotFoundError: numpy. This is a production
+# dependency, not a test-only one.
+numpy>=1.26
