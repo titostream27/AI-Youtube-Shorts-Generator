@@ -176,7 +176,8 @@ class TestRetrySourceValidation(HardeningTestBase):
             with rs._db_lock, rs._db_conn() as conn:
                 conn.execute("UPDATE render_jobs SET request_id=? WHERE job_id=?", (req["request_id"], job_id))
                 conn.commit()
-            with mock.patch.object(rs, "_load_job_request", return_value=req):
+            with mock.patch.object(rs, "_load_job_request", return_value=req), \
+                 mock.patch.object(rs, "_enqueue_job", return_value=None):
                 resp = rs.render_job_retry(job_id)
             self.assertEqual(resp["original_job_id"], job_id)
             self.assertEqual(resp["state"], "queued")

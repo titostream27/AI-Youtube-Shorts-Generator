@@ -1142,12 +1142,10 @@ def readyz():
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
         out_ok = True
-        import ctypes
-        fb = ctypes.c_ulonglong(0)
-        ok = ctypes.windll.kernel32.GetDiskFreeSpaceExW(
-            str(RENDER_ROOT.resolve()), None, None, ctypes.byref(fb),
-        )
-        free_bytes = int(fb.value) if ok else None
+        # Cross-platform free-disk check. The old Windows-only ctypes.windll
+        # path made /readyz fail closed on Linux runners with
+        # "module 'ctypes' has no attribute 'windll'".
+        free_bytes = int(shutil.disk_usage(RENDER_ROOT.resolve()).free)
     except Exception as exc:  # noqa: BLE001
         out_error = f"{type(exc).__name__}: {exc}"
         ready = False
@@ -3148,13 +3146,9 @@ def render_health():
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
         out_ok = True
-        import ctypes
-        free_bytes = ctypes.c_ulonglong(0)
-        ok = ctypes.windll.kernel32.GetDiskFreeSpaceExW(
-            str(RENDER_ROOT.resolve()),
-            None, None, ctypes.byref(free_bytes),
-        )
-        free_bytes = int(free_bytes.value) if ok else None
+        # Cross-platform free-disk check; shutil.disk_usage works on Windows
+        # and POSIX, unlike the previous ctypes.windll-only path.
+        free_bytes = int(shutil.disk_usage(RENDER_ROOT.resolve()).free)
     except Exception as e:  # noqa: BLE001
         out_error = f"{type(e).__name__}: {e}"
     # 5. Contract version + build id.

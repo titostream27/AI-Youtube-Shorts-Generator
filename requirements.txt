@@ -1,2 +1,21 @@
 requests>=2.31
 python-dotenv>=1.0
+# shorts_generator.local.clipper imports numpy at module load (Phase split
+# commit e72d107). Without it, CI (pip install -r requirements.txt) fails at
+# pytest collection with ModuleNotFoundError: numpy. This is a production
+# dependency, not a test-only one.
+numpy>=1.26
+# Required by production face tracking/QC and the blocking visual regression
+# suite. Headless avoids GUI system-library dependencies on GitHub runners.
+opencv-python-headless>=4.8.0
+# CI runs `python -m pytest` after installing this single requirements file.
+pytest>=8.0
+# render_service.py and render_contract.py import these at module load, and
+# every discovered test suite imports render_service or the contract. Without
+# them pytest fails at collection with ModuleNotFoundError, so CI was red even
+# before the visual-skip issue.
+fastapi>=0.110
+pydantic>=2.0
+uvicorn>=0.27
+# fastapi.testclient (TestClient) requires httpx.
+httpx>=0.24
