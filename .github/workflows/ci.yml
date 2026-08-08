@@ -12,7 +12,7 @@ jobs:
     steps:
       # Renderer contract fixtures live in the MINER repo. Brief v7 C13:
       # PIN the miner contract revision (never unpinned main). Updated from
-      # 5c1c238 -> 84c5e3e (brief v10/v11 closure HEAD: added
+      # 5c1c238 -> full immutable 84c5e3e SHA (brief v10/v11 closure:
       # render-result-v2-failed / render-result-v2-partial parity fixtures
       # and manifest entries; renderer supports the canonical failed/partial
       # vocabulary since v10 C12).
@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: titostream27/youtube-content-miner
-          ref: 84c5e3e
+          ref: 84c5e3e80a3381ce0e85bc8e6f9a09c3f4353047
           path: content-miner
 
       - uses: actions/setup-python@v5
