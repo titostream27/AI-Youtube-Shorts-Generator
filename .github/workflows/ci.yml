@@ -32,9 +32,18 @@ jobs:
           python-version: "3.11"
 
       - name: Install production requirements FAIL-FAST (brief v5 9.1)
+        working-directory: AI-Youtube-Shorts-Generator
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Generate deterministic visual fixtures
+        working-directory: AI-Youtube-Shorts-Generator
+        run: python scripts/make_visual_fixtures.py fixtures/visual
+
+      - name: Verify required visual dependency
+        working-directory: AI-Youtube-Shorts-Generator
+        run: python -c "import cv2; print(cv2.__version__)"
 
       # Brief v7 C13: discovery-based CI — pytest auto-collects every
       # test_*.py instead of a hand-maintained list that silently misses
