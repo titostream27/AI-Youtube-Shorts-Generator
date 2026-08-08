@@ -45,6 +45,12 @@ jobs:
         working-directory: AI-Youtube-Shorts-Generator
         run: python -c "import cv2; print(cv2.__version__)"
 
+      - name: Install ffmpeg for visual regression
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -1
+
       # Brief v7 C13: discovery-based CI — pytest auto-collects every
       # test_*.py instead of a hand-maintained list that silently misses
       # new suites (test_hardening_v7, test_state_v7, test_visual_v7,
