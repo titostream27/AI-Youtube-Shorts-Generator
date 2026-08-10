@@ -13,6 +13,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+# ── Brief Renderer V12: single-detection / track-store / layout-controller ──
+from .detection_snapshot import YuNetDetectionProvider  # noqa: E402
+from .face_tracks import TrackStore  # noqa: E402
+from .layout_controller import LayoutController, LayoutReason, LayoutState  # noqa: E402
+
 # ── Phase 3 (brief §44): last-frame face tracking snapshot ──
 # The reframe loop publishes its per-frame tracks here so downstream stages
 # (caption compositor) can avoid covering the speaker's mouth.
@@ -616,6 +621,13 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         except Exception:
             haar = None
 
+    # ── Brief Renderer V12: one detection snapshot per frame (R-01). The
+    # provider is the ONLY caller of YuNet inside the frame loop; TrackStore
+    # owns persistent identity + maturity; LayoutController owns layout.
+    _detection_provider = YuNetDetectionProvider(yunet, src_w, src_h, min_score=YUNET_MIN_SCORE)
+    _track_store = TrackStore(fps=fps)
+    _layout_ctrl = LayoutController(fps=fps)
+
     last_center: Optional[Tuple[float, float]] = None   # smoothed center
     history: List[Tuple[float, float]] = []             # recent raw detections
     HISTORY_N = 7
@@ -850,13 +862,20 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
             return 0.0
         return float(cv2.absdiff(cur, prev).mean())
 
-    def _pick_speaker(frame) -> Optional[Tuple[float, float]]:
+    def _pick_speaker(frame, faces: Optional[List[Dict]] = None) -> Optional[Tuple[float, float]]:
         """Choose the face to track. Lip detection picks the active speaker;
         without it (or when YuNet is unavailable) we fall back to the largest
-        face. Returns the detection center or None."""
+        face. Returns the detection center or None.
+
+        V12 (R-01): `faces` is the current frame's DETECTED (snapshot) list.
+        When omitted (legacy/direct calls) the detector is invoked once —
+        production never does this; the snapshot is computed exactly once per
+        frame in the main loop.
+        """
         nonlocal prev_gray, face_tracks, next_track_id, speaker_track_id, speaker_pos, speaker_conf, speaker_size
         nonlocal challenger_id, challenger_streak
-        faces = _detect_yunet_faces(frame) if tracker_mode in ("dual", "yunet") else None
+        if faces is None:
+            faces = _detect_yunet_faces(frame) if tracker_mode in ("dual", "yunet") else None
 
         if faces and lip_detect:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -868,6 +887,41 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                 prev_mouth: Optional[Tuple[float, float]] = None
                 prev_score = 0.0
                 track_id: Optional[int] = None
+                # ── V12 (R-03): the TrackStore already assigned persistent
+                # identity this frame. Use it directly — never re-derive ids
+                # from positional order or a second matcher.
+                if face.get("track_id") is not None:
+                    track_id = int(face["track_id"])
+                    prev_score = float(face.get("prev_score", 0.0) or 0.0)
+                    prev_mouth = face.get("prev_mouth")
+                    vx = float(face.get("prev_vx", 0.0) or 0.0)
+                    vy = float(face.get("prev_vy", 0.0) or 0.0)
+                    new_track_meta = {
+                        "area": float(face.get("prev_area", face["w"] * face["h"]) or 0.0),
+                        "mature": bool(face.get("mature", False)),
+                        "duplicate_of": face.get("duplicate_of"),
+                    }
+                    act = _mouth_activity(gray, face, prev_mouth)
+                    if prev_mouth is not None:
+                        score = prev_score * SCORE_EMA + act * (1 - SCORE_EMA)
+                    else:
+                        score = act
+                    (mx1, my1), (mx2, my2) = face["lm"][3], face["lm"][4]
+                    mouth = ((mx1 + mx2) / 2, (my1 + my2) / 2)
+                    new_tracks.append({
+                        "cx": face["cx"], "cy": face["cy"], "score": score, "idx": fi,
+                        "track_id": track_id,
+                        "area": new_track_meta["area"],
+                        "w": face["w"], "h": face["h"],
+                        "mouth": mouth,
+                        "vx": vx, "vy": vy,
+                        "px": face["cx"] + vx, "py": face["cy"] + vy,
+                        "last_seen": 0,
+                        "activity": act,
+                        "mature": new_track_meta["mature"],
+                        "duplicate_of": new_track_meta["duplicate_of"],
+                    })
+                    continue
                 # ── Phase 1 upgrade: combined matching cost (brief §15-16) ──
                 # Replace the fixed 80px radius with a normalized cost that
                 # works across resolutions: center distance in face-size units,
@@ -1073,6 +1127,10 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
     split_hold = 0              # frames held in active state
     split_react_streak = 0      # consecutive frames reactor mouth is open
     split_reactor_id: Optional[int] = None
+    # V12: defaults for the unified layout decision (set every frame).
+    reactor_hit = False
+    blur_second_track: Optional[Dict] = None
+    _layout_decision = None
     # Per-track mouth-open baseline (EMA) so a sharp OPEN counts as reaction.
     track_mouth_base: Dict[int, float] = {}
 
@@ -1171,7 +1229,67 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                         print(f"[track] f={frame_no} scene_change diff={diff:.2f}", flush=True)
             prev_scene_gray = small_gray
 
-        det = _pick_speaker(frame)
+        # ── V12 (R-01): ONE detection snapshot per decoded frame. The
+        # snapshot is immutable for this frame and feeds the TrackStore,
+        # speaker selection, split qualification, timeline and QC.
+        snapshot = _detection_provider.detect(
+            frame, frame_no, frame_no / max(fps, 1) if fps > 0 else 0.0, bool(scene_changed)
+        )
+        track_map: Dict[int, Dict] = {}
+        if tracker_mode in ("dual", "yunet"):
+            t_sec_now = frame_no / max(fps, 1) if fps > 0 else 0.0
+            store_tracks = _track_store.update(
+                snapshot.faces, t_sec_now, scene_changed=bool(scene_changed),
+            )
+            # Enrich snapshot faces with the store's persistent identity for
+            # speaker selection (R-03: store identity is authoritative).
+            faces_input: List[Dict] = []
+            for f in snapshot.faces:
+                best = None
+                best_d = 1e9
+                for t in store_tracks:
+                    d = ((t.cx - f["cx"]) ** 2 + (t.cy - f["cy"]) ** 2) ** 0.5
+                    if d < best_d:
+                        best_d = d
+                        best = t
+                if best is None:
+                    continue
+                d = dict(f)
+                d["track_id"] = best.track_id
+                d["prev_score"] = best.confidence_ema
+                d["prev_mouth"] = best.mouth
+                d["prev_area"] = best.area_ema
+                d["prev_vx"] = best.vx
+                d["prev_vy"] = best.vy
+                d["mature"] = best.mature
+                d["duplicate_of"] = best.duplicate_of
+                faces_input.append(d)
+            # face_tracks view for the rest of the loop (store identity).
+            face_tracks = []
+            for t in store_tracks:
+                area = max(1.0, t.area_ema or (t.w * t.h))
+                face_tracks.append({
+                    "cx": t.cx, "cy": t.cy, "score": t.confidence_ema, "idx": len(face_tracks),
+                    "track_id": t.track_id,
+                    "area": area,
+                    "w": t.w, "h": t.h,
+                    "mouth": t.mouth,
+                    "vx": t.vx, "vy": t.vy,
+                    "px": t.predicted_box[0] if len(t.predicted_box) >= 2 else t.cx,
+                    "py": t.predicted_box[1] if len(t.predicted_box) >= 2 else t.cy,
+                    "last_seen": 0,
+                    "activity": t.activity,
+                    "mature": t.mature,
+                    "duplicate_of": t.duplicate_of,
+                })
+                track_map[t.track_id] = {
+                    "cx": t.cx, "cy": t.cy, "w": t.w, "h": t.h,
+                    "score": t.confidence_ema, "track_id": t.track_id,
+                    "mature": t.mature, "duplicate_of": t.duplicate_of,
+                }
+            det = _pick_speaker(frame, faces=faces_input)
+        else:
+            det = _pick_speaker(frame)
         # Brief v7 V01/V10: feed the production planner the same per-frame
         # detections + scene signal. Its hold/reset decision is authoritative
         # for suppressing a switch inside the miss-tolerance / hold window.
@@ -1202,15 +1320,16 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
             print(f"[track] planner error: {type(exc).__name__}: {exc}", flush=True)
         # Refresh face list every frame while split is enabled — the split
         # state machine needs to know when a reactor face disappears (if only
-        # one face remains we must fade back to the single view).
+        # one face remains we must fade back to the single view). V12: uses
+        # the SAME snapshot; no second detector call (RV12-F06, QC-DET-001).
         cur_faces: Optional[List[Dict]] = (
-            _detect_yunet_faces(frame) if (split_enabled and tracker_mode in ("dual", "yunet")) else None
+            snapshot.faces if (split_enabled and tracker_mode in ("dual", "yunet")) else None
         )
 
         # Optional tracking debug: dump face positions + chosen center every
         # 12 frames so we can diagnose crop drift (e.g. nodding listener).
         if debug_track and frame_no % 12 == 0:
-            f_cur = _detect_yunet_faces(frame) if tracker_mode in ("dual", "yunet") else None
+            f_cur = snapshot.faces if tracker_mode in ("dual", "yunet") else None
             n_faces = len(f_cur) if f_cur else 0
             fc = ""
             if f_cur:
@@ -1232,7 +1351,7 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                 "t_sec": round(frame_no / fps, 3),
                 "speaker_track_id": speaker_track_id,
                 "split_alpha": round(float(split_alpha), 3),
-                "face_count": len(new_tracks) if new_tracks is not None else 0,
+                "face_count": len(face_tracks) if face_tracks else 0,
                 # Hardening v3 B3: time-indexed camera/speaker/face state so
                 # downstream (caption compositor, QC) can query state_at(t)
                 # instead of a final snapshot. Safe data only — no shared refs.
@@ -1242,17 +1361,54 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                         "box": [float(ft.get("cx", 0)), float(ft.get("cy", 0)),
                                 float(ft.get("w", 0)), float(ft.get("h", 0))],
                         "confidence": float(ft.get("score", 0) or 0),
+                        "mature": bool(ft.get("mature", False)),
+                        "duplicate_of": ft.get("duplicate_of"),
                     }
-                    for ft in (new_tracks or [])
+                    for ft in (face_tracks or [])
                 ],
                 "active_speaker_id": speaker_track_id,
                 "camera_center": (
                     [float(focus_track["cx"]), float(focus_track["cy"])]
                     if focus_track is not None else None
                 ),
+                # V12 (QC-CAM-001): normalized camera center (0..1 of source)
+                # so the timeline QC can detect discontinuity scale-free.
+                "camera_center_norm": (
+                    [float(focus_track["cx"]) / max(1, src_w),
+                     float(focus_track["cy"]) / max(1, src_h)]
+                    if focus_track is not None else None
+                ),
                 "crop_rect": None,  # filled by _capture_reframe() with source dims
                 "layout": layout_mode,
                 "safe_caption_zones": [],  # set by caption compositor via state_at
+                # ── V12 timeline fields (brief §7 QC-TL-001): filled at the
+                # write point below, after the layout decision for this frame.
+                "scene_cut": bool(scene_changed),
+                "detection_count_raw": snapshot.raw_face_count,
+                "detection_count_deduped": len(snapshot.faces),
+                "dedupe_suppression_count": snapshot.dedupe_suppression_count,
+                "mature_track_count": sum(1 for t in (face_tracks or []) if t.get("mature")),
+                "tracks": [
+                    {
+                        "id": int(ft["track_id"]),
+                        "box": [float(ft.get("cx", 0)), float(ft.get("cy", 0)),
+                                float(ft.get("w", 0)), float(ft.get("h", 0))],
+                        "mature": bool(ft.get("mature", False)),
+                        "hits": int(ft.get("hits", 0)),
+                        "misses": int(ft.get("misses", 0)),
+                        "confidence_ema": float(ft.get("score", 0) or 0),
+                    }
+                    for ft in (face_tracks or [])
+                ],
+                # Layout fields set at the frame write point.
+                "layout_state": "SINGLE",
+                "layout_alpha": 0.0,
+                "top_track_id": None,
+                "bottom_track_id": None,
+                "second_candidate_id": None,
+                "second_qualified": False,
+                "qualification_reason": None,
+                "qc_events": [],
             })
         except Exception:  # noqa: BLE001
             pass
@@ -1518,56 +1674,76 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                 # could never complete.
                 if not frame_triggered:
                     split_react_streak = 0
-            if reactor_hit and split_state == "idle":
-                split_state = "fading_in"
-                split_hold = 0
-                # Phase 2: lock the panes to stable track IDs (brief §31) —
-                # top = current speaker, bottom = the reacting track.
-                split_top_track_id = speaker_track_id
-                split_bottom_track_id = split_reactor_id
-                split_lock_frames = 0
-                if debug_track:
-                    print(
-                        f"[track] f={frame_no} split_lock top={split_top_track_id} "
-                        f"bottom={split_bottom_track_id}",
-                        flush=True,
-                    )
-            # NOTE: do NOT reset split_react_streak here when !reactor_hit —
-            # reactor_hit only turns true after the streak already reached
-            # SPLIT_REACT_FRAMES, so a reset here would wipe the confirm
-            # window every frame. The streak is reset inside the detection
-            # loop only when no track triggered this frame.
+            # ── V12 (R-05): ONE LayoutController step per decoded frame.
+        # Both split modes (reaction + blur persistent) feed the SAME
+        # deterministic state machine; rendering never infers layout.
+        # The controller enforces maturity, confirmation, panel locks,
+        # miss grace, duplicate-panel prevention and smooth alpha.
+        reactor_track: Optional[Dict] = None
+        if split_reactor_id is not None:
+            reactor_track = next((t for t in face_tracks if t["track_id"] == split_reactor_id), None)
+        cand_reason = LayoutReason.REACTION if (reactor_hit or split_react_streak > 0) else None
 
-        # Advance the split state machine with smooth fade alpha.
-        if split_state == "fading_in":
-            split_alpha = min(1.0, split_alpha + 1.0 / max(SPLIT_FADE_FRAMES, 1))
-            if split_alpha >= 1.0:
-                split_state = "active"
-                split_hold = 0
-        elif split_state == "active":
-            split_hold += 1
-            # If the reactor face disappeared (only one face remains), fade
-            # back to the single view. Use a short anti-flicker window so a
-            # single missed frame doesn't pop the layout.
-            if cur_faces is None or len(cur_faces) < 2:
-                split_single_frames += 1
-                if split_single_frames >= SPLIT_SINGLE_FRAMES:
-                    split_state = "fading_out"
-            else:
-                split_single_frames = 0
-            # Stay in split while the reactor keeps reacting; after the hold
-            # window the layout fades back to the single speaker.
-            if split_state == "active" and split_hold >= SPLIT_HOLD_FRAMES and split_react_streak == 0:
-                split_state = "fading_out"
-        elif split_state == "fading_out":
-            split_alpha = max(0.0, split_alpha - 1.0 / max(SPLIT_FADE_FRAMES, 1))
-            if split_alpha <= 0.0:
-                split_state = "idle"
-                split_reactor_id = None
-                split_single_frames = 0
-                split_top_track_id = None
-                split_bottom_track_id = None
-                split_lock_frames = 0
+        # Persistent two-person candidate for the blur layout: mature,
+        # non-duplicate, comparable size — never a raw count admission.
+        blur_second_track: Optional[Dict] = None
+        if (
+            layout_mode == "blur_background"
+            and split_enabled
+            and speaker_track_id is not None
+            and face_tracks
+        ):
+            spk_ft = next((t for t in face_tracks if t["track_id"] == speaker_track_id), None)
+            if spk_ft is not None:
+                others = [
+                    t for t in face_tracks
+                    if t["track_id"] != spk_ft["track_id"]
+                    and t.get("mature", False)
+                    and t.get("duplicate_of") is None
+                    and t["w"] >= spk_ft["w"] * 0.45
+                ]
+                if others:
+                    blur_second_track = sorted(others, key=lambda t: -t["w"] * t["h"])[0]
+
+        # Candidate preference: an active reaction wins over the persistent
+        # layout; otherwise the blur persistent second is the candidate.
+        second_candidate = reactor_track if cand_reason == LayoutReason.REACTION else blur_second_track
+        if cand_reason is None and second_candidate is not None:
+            cand_reason = LayoutReason.PERSISTENT_TWO_PERSON
+
+        speaker_track_dict = next((t for t in face_tracks if t["track_id"] == speaker_track_id), None)
+        if speaker_track_dict is None and speaker_track_id is not None and speaker_track_id in track_map:
+            speaker_track_dict = dict(track_map[speaker_track_id])
+
+        _layout_decision = _layout_ctrl.step(
+            frame_no,
+            frame_no / max(fps, 1) if fps > 0 else 0.0,
+            speaker_track_dict,
+            second_candidate,
+            cand_reason,
+            scene_cut=bool(scene_changed),
+            track_map=track_map,
+        )
+
+        # Sync the legacy reaction-split view (render + captions read it).
+        L = _layout_decision
+        split_state = {
+            LayoutState.SINGLE: "idle",
+            LayoutState.ENTERING_SPLIT: "fading_in",
+            LayoutState.SPLIT: "active",
+            LayoutState.EXITING_SPLIT: "fading_out",
+        }[L.state]
+        split_alpha = float(L.alpha)
+        split_top_track_id = L.top_track_id
+        split_bottom_track_id = L.bottom_track_id
+        if L.top_box is not None:
+            split_top_last = (L.top_box[0], L.top_box[1])
+        if L.bottom_box is not None:
+            split_bot_last = (L.bottom_box[0], L.bottom_box[1])
+        if L.state == LayoutState.SINGLE:
+            split_reactor_id = None
+            split_single_frames = 0
+            split_lock_frames = 0
 
         # Publish the current split blend weight so the caption compositor
         # (render_service) can shift captions to the center of the frame while
@@ -1579,7 +1755,10 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         # OR both flags together and write _rctx.split_ranges once, right before the
         # writer, so captions center during ANY split layout.
         _reaction_split_on = split_enabled and split_alpha >= 0.5
-        _blur_split_on = False
+        _blur_split_on = bool(
+            layout_mode == "blur_background"
+            and _layout_decision.is_split_visible()
+        )
 
         # ------------------------------------------------------------------
         # Render the frame: single view (default) or split layout.
@@ -1699,131 +1878,64 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                 # Anti-shake: position from last_center + slow EMA.
                 # Zoom-out keeps the head inside ("muka kepotong" fix).
                 fg_src = cropped
+                fg_split_candidate = None
                 try:
                     spk = next((t for t in face_tracks if t["track_id"] == speaker_track_id), None)
                     if spk is None and face_tracks:
                         spk = sorted(face_tracks, key=lambda t: -t["w"] * t["h"])[0]
                     if spk is not None:
-                        # Split only when another REAL person is persistently
-                        # tracked with comparable size (busts/statues are much
-                        # smaller or never become persistent tracks). The
-                        # second panel is LOCKED to one track so it does not
-                        # flicker between people/objects every frame.
-                        second = None
-                        if split_enabled and len(face_tracks) >= 2:
-                            others = [
-                                t for t in face_tracks
-                                if t["track_id"] != spk["track_id"]
-                                and t["w"] >= spk["w"] * 0.45  # comparable size
-                            ]
-                            if blur_second_id is not None:
-                                locked = next(
-                                    (t for t in others if t["track_id"] == blur_second_id), None
-                                )
-                                if locked is not None:
-                                    second = locked
-                                    blur_second_miss = 0
-                                else:
-                                    blur_second_miss += 1
-                                    # Grace ~0.5s before releasing the lock.
-                                    if blur_second_miss > max(1, int(fps * 0.5)):
-                                        blur_second_id = None
-                            if second is None and others:
-                                second = sorted(others, key=lambda t: -t["w"] * t["h"])[0]
-                                blur_second_id = second["track_id"]
-                                blur_second_miss = 0
-                        if second is not None:
-                            _blur_split_on = True
+                        # V12: split admission is decided by the LayoutController
+                        # (mature + confirmed + spatially distinct second person).
+                        # A raw transient second detection can NEVER flip the
+                        # layout (RV12-F01..F03). `second` is the persistent
+                        # candidate; the controller holds/grace/exit governs it.
+                        second = blur_second_track
+                        if _blur_split_on and _layout_decision.top_box is not None and _layout_decision.bottom_box is not None:
                             top_h = int(crop_h * 0.55)
                             bot_h = crop_h - top_h
+                            top_box = _layout_decision.top_box
+                            bottom_box = _layout_decision.bottom_box
                             # Panel width: tight around the FACE (2.6x face
-                            # width). The source is a 3-panel podcast where
-                            # crop_w spans nearly a full panel, so a wide crop
-                            # would include the neighbouring person
-                            # ("setengah objek 1 dan 2"). A face-sized crop
-                            # keeps exactly one person per panel.
-                            # Smooth each panel's virtual camera independently.
-                            # Dead-zone rejects detector noise; EMA remains slow
-                            # enough to suppress visible tremor while following
-                            # real head movement.
-                            split_pos_alpha = float(os.getenv("RENDER_SPLIT_POSITION_ALPHA", "0.10"))
-                            split_deadzone = float(os.getenv("RENDER_SPLIT_DEADZONE_PX", "6.0"))
-                            split_size_alpha = float(os.getenv("RENDER_SPLIT_SIZE_ALPHA", "0.05"))
-
-                            # A new locked track must not inherit the previous
-                            # person's virtual-camera position.
-                            if blur_split_top_id != spk["track_id"]:
-                                blur_split_top_id = spk["track_id"]
-                                blur_split_top_cx = None
-                                blur_split_top_cy = None
-                            if blur_split_bot_id != second["track_id"]:
-                                blur_split_bot_id = second["track_id"]
-                                blur_split_bot_cx = None
-                                blur_split_bot_cy = None
-
-                            def _smooth_split_pos(
-                                raw_cx: float,
-                                raw_cy: float,
-                                cur_cx: Optional[float],
-                                cur_cy: Optional[float],
-                            ) -> Tuple[float, float]:
-                                if cur_cx is None or cur_cy is None:
-                                    return raw_cx, raw_cy
-                                dx = raw_cx - cur_cx
-                                dy = raw_cy - cur_cy
-                                if abs(dx) <= split_deadzone:
-                                    raw_cx = cur_cx
-                                if abs(dy) <= split_deadzone:
-                                    raw_cy = cur_cy
-                                return (
-                                    cur_cx + (raw_cx - cur_cx) * split_pos_alpha,
-                                    cur_cy + (raw_cy - cur_cy) * split_pos_alpha,
-                                )
-
-                            blur_split_top_cx, blur_split_top_cy = _smooth_split_pos(
-                                spk["cx"], spk["cy"], blur_split_top_cx, blur_split_top_cy,
-                            )
-                            blur_split_bot_cx, blur_split_bot_cy = _smooth_split_pos(
-                                second["cx"], second["cy"], blur_split_bot_cx, blur_split_bot_cy,
-                            )
-                            raw_pw = max(int(spk["w"] * 2.6), 280)
+                            # width) so exactly one person per panel.
+                            raw_pw = max(int(top_box[2] * 2.6), 280)
                             raw_pw = min(raw_pw, crop_w)
                             if blur_split_pw is None:
                                 blur_split_pw = raw_pw
                             else:
-                                blur_split_pw += (raw_pw - blur_split_pw) * split_size_alpha
+                                blur_split_pw += (raw_pw - blur_split_pw) * 0.05
                             p_w = max(1, min(int(blur_split_pw), crop_w))
                             top_region = _crop_region(
-                                frame, blur_split_top_cx, blur_split_top_cy,
+                                frame, top_box[0], top_box[1],
                                 p_w, top_h, zoom=0.9,
                             )
                             bot_region = _crop_region(
-                                frame, blur_split_bot_cx, blur_split_bot_cy,
+                                frame, bottom_box[0], bottom_box[1],
                                 p_w, bot_h, zoom=0.9,
                             )
-                            fg_src = np.vstack([top_region, bot_region])
+                            fg_split_candidate = np.vstack([top_region, bot_region])
+                        # Single foreground is ALWAYS built; it is the base
+                        # layer for the alpha wipe during ENTERING/EXITING.
+                        fw = max(int(spk["w"] * 3.2), 340)
+                        if blur_fg_fw is None:
+                            blur_fg_fw = fw
                         else:
-                            fw = max(int(spk["w"] * 3.2), 340)
-                            if blur_fg_fw is None:
-                                blur_fg_fw = fw
-                            else:
-                                # Very slow EMA -> constant size -> no zoom.
-                                blur_fg_fw = blur_fg_fw + (fw - blur_fg_fw) * 0.05
-                            fw = int(blur_fg_fw)
-                            fh = int(fw / (9 / 16))
-                            fh = min(fh, src_h)
-                            if last_center is not None:
-                                raw_cx, raw_cy = last_center
-                            else:
-                                raw_cx, raw_cy = spk["cx"], spk["cy"]
-                            alpha = 0.18
-                            if blur_fg_cx is None:
-                                blur_fg_cx = raw_cx
-                                blur_fg_cy = raw_cy
-                            else:
-                                blur_fg_cx = blur_fg_cx + (raw_cx - blur_fg_cx) * alpha
-                                blur_fg_cy = blur_fg_cy + (raw_cy - blur_fg_cy) * alpha
-                            fg_src = _crop_region(frame, blur_fg_cx, blur_fg_cy, fw, fh, zoom=0.85)
+                            # Very slow EMA -> constant size -> no zoom.
+                            blur_fg_fw = blur_fg_fw + (fw - blur_fg_fw) * 0.05
+                        fw = int(blur_fg_fw)
+                        fh = int(fw / (9 / 16))
+                        fh = min(fh, src_h)
+                        if last_center is not None:
+                            raw_cx, raw_cy = last_center
+                        else:
+                            raw_cx, raw_cy = spk["cx"], spk["cy"]
+                        alpha = 0.18
+                        if blur_fg_cx is None:
+                            blur_fg_cx = raw_cx
+                            blur_fg_cy = raw_cy
+                        else:
+                            blur_fg_cx = blur_fg_cx + (raw_cx - blur_fg_cx) * alpha
+                            blur_fg_cy = blur_fg_cy + (raw_cy - blur_fg_cy) * alpha
+                        fg_src = _crop_region(frame, blur_fg_cx, blur_fg_cy, fw, fh, zoom=0.85)
                 except Exception:  # noqa: BLE001
                     fg_src = cropped
 
@@ -1831,7 +1943,21 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                 crop_ar = fg_src.shape[1] / max(fg_src.shape[0], 1)
                 fg_h = int(fg_w / crop_ar) if crop_ar > 0 else output_h
                 fg_h = min(fg_h, output_h)
-                fg = cv2.resize(fg_src, (fg_w, fg_h), interpolation=cv2.INTER_LANCZOS4)
+                if fg_split_candidate is not None:
+                    # V12: smooth vertical wipe by controller alpha — the
+                    # layout NEVER jumps a whole panel in one frame (R-05).
+                    split_fg = cv2.resize(fg_split_candidate, (fg_w, fg_h), interpolation=cv2.INTER_LANCZOS4)
+                    single_fg = cv2.resize(fg_src, (fg_w, fg_h), interpolation=cv2.INTER_LANCZOS4)
+                    a = max(0.0, min(1.0, float(_layout_decision.alpha)))
+                    reveal = int(fg_h * a)
+                    if reveal >= fg_h:
+                        fg = split_fg
+                    else:
+                        fg = single_fg.copy()
+                        if reveal > 0:
+                            fg[fg_h - reveal:, :] = split_fg[fg_h - reveal:, :]
+                else:
+                    fg = cv2.resize(fg_src, (fg_w, fg_h), interpolation=cv2.INTER_LANCZOS4)
                 x0 = (output_w - fg_w) // 2
                 y0 = (output_h - fg_h) // 2
                 bg[y0:y0 + fg_h, x0:x0 + fg_w] = fg
@@ -1855,9 +1981,50 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         elif not _cur_split_on and _rctx.split_ranges and _rctx.split_ranges[-1][1] is None:
             _rctx.split_ranges[-1][1] = frame_no / max(fps, 1)
 
+        # V12 (QC-TL-001): complete the frame's layout fields for timeline/QC.
+        try:
+            if _rctx.frames:
+                _entry = _rctx.frames[-1]
+                _entry["layout_state"] = _layout_decision.state.value
+                _entry["layout_alpha"] = round(float(_layout_decision.alpha), 4)
+                _entry["top_track_id"] = _layout_decision.top_track_id
+                _entry["bottom_track_id"] = _layout_decision.bottom_track_id
+                _entry["second_candidate_id"] = _layout_decision.second_candidate_id
+                _entry["second_qualified"] = bool(_layout_decision.second_qualified)
+                _entry["qualification_reason"] = _layout_decision.qualification_reason
+                _entry["qc_events"] = list(_layout_decision.qc_events)
+        except Exception:  # noqa: BLE001
+            pass
+
         writer.write(cropped)
 
     cap.release()
+    # V12 (RV12-F07): fail-closed timeline QC on the completed frame stream.
+    # A failing visual invariant must demote the render — logging a warning
+    # while publishing status=ok is forbidden.
+    try:
+        import sys as _sys
+        import os as _os
+        _root = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+        if _root not in _sys.path:
+            _sys.path.insert(0, _root)
+        from quality_gate import evaluate_layout_timeline  # type: ignore
+        _v12_qc = evaluate_layout_timeline(
+            list(_rctx.frames),
+            detector_call_count=_detection_provider.call_count,
+            decoded_frame_count=int(_rctx.stats.get("frames", 0) or 0),
+        )
+        _rctx.stats["v12_timeline_qc"] = _v12_qc
+        _rctx.stats["v12_layout_metrics"] = _v12_qc["metrics"]
+        if _v12_qc["status"] == "fail":
+            _rctx.stats["v12_qc_failed"] = True
+            print(
+                f"[qc:v12] FAIL {len(_v12_qc['failures'])} "
+                f"invariants: {_v12_qc['failures'][:4]}",
+                flush=True,
+            )
+    except Exception:  # noqa: BLE001 — QC availability must never crash render
+        _rctx.stats["v12_timeline_qc"] = {"status": "unavailable", "metrics": {}, "failures": []}
     # Close any split interval still open at the end of the clip.
     if _rctx.split_ranges and _rctx.split_ranges[-1][1] is None:
         _rctx.split_ranges[-1][1] = frame_no / max(fps, 1)
@@ -1947,9 +2114,13 @@ def _default_profile_version() -> str:
     return (
         f"camera-v{os.getenv('RENDER_CAMERA_VERSION', '3')}"
         f"-caption-v{os.getenv('RENDER_CAPTION_SAFE_VERSION', '2')}"
-        f"-tracker-v{os.getenv('RENDER_TRACKER_VERSION', '4')}"
+        # V12: tracker bumped 4 -> 5 (TrackStore maturity/duplicate suppression)
+        # + dedicated layout version (LayoutController state machine). Any
+        # change invalidates the faulty split cache (R-09).
+        f"-tracker-v{os.getenv('RENDER_TRACKER_VERSION', '5')}"
+        f"-layout-v{os.getenv('RENDER_LAYOUT_VERSION', '1')}"
         f"-encoder-{os.getenv('RENDER_ENCODER_VERSION', 'h264')}"
-        f"-pipeline-{os.getenv('RENDER_PIPELINE_VERSION', 'v3-1')}"
+        f"-pipeline-{os.getenv('RENDER_PIPELINE_VERSION', 'v4-0')}"
     )
 
 

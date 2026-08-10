@@ -2821,6 +2821,21 @@ def _render(request, job_id: str) -> RenderOutcome:
             try:
                 from quality_gate import quality_gate
                 qc = quality_gate(out_path)
+                # V12 (RV12-F07): fail-closed timeline QC. The frame-level
+                # layout invariants (micro-split/duplicate/toggle/detector
+                # multiplicity) are evaluated inside the cropper; when they
+                # fail, the artifact must NOT be publishable even if the
+                # file-level gate passed.
+                _v12 = (getattr(timeline, "stats", {}) or {}).get("v12_timeline_qc") or {}
+                if _v12.get("status") == "fail":
+                    qc = {
+                        "status": "fail",
+                        "quality_score": 0,
+                        "checks": qc.get("checks", {}),
+                        "warnings": list(qc.get("warnings", [])) + [
+                            f"V12 {f}" for f in _v12.get("failures", [])[:6]
+                        ],
+                    }
                 _apply_qc_to_artifact(artifact, item, qc, mode)
                 artifact.qc.upscale_factor = _estimate_upscale(source, output_w, output_h)
             except Exception as e:  # noqa: BLE001

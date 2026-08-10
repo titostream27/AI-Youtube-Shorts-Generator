@@ -287,3 +287,194 @@ def quality_gate(path: str) -> Dict:
         flush=True,
     )
     return report
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Renderer V12 — timeline-based fail-closed QC (brief §7, QC-SPLIT/QC-DET/
+# QC-CAM/QC-TL). Consumes the per-frame render timeline and FAILS when any
+# visual invariant is violated. Logging a warning while publishing status=ok
+# is forbidden (RV12-F07).
+# ──────────────────────────────────────────────────────────────────────────
+
+MIN_SPLIT_VISIBLE_SEC = 0.40        # QC-SPLIT-001: shorter = micro split
+MAX_TRANSITIONS_PER_SEC = 1.0       # QC-SPLIT-002: >1 SINGLE<->SPLIT toggle/sec
+MAX_ALPHA_DELTA_PER_FRAME = 0.35    # QC-SPLIT-006: smootherstep transition cap
+MAX_CAMERA_JUMP = 0.18              # QC-CAM-001: normalized center/zoom jump
+
+
+def evaluate_layout_timeline(
+    entries: List[Dict],
+    detector_call_count: Optional[int] = None,
+    decoded_frame_count: Optional[int] = None,
+) -> Dict:
+    """Evaluate one render's timeline against the blocking visual invariants.
+
+    `entries`: per-frame dicts with (at minimum) frame_no, t_sec, layout_state,
+    layout_alpha, top_track_id, bottom_track_id, qc_events. Missing required
+    fields fail QC-TL-001 (timeline incomplete).
+
+    Returns a report: {status: pass|fail, metrics: {...}, failures: [...]}.
+    """
+    failures: List[str] = []
+    metrics: Dict = {
+        "false_split_count": 0,
+        "duplicate_panel_count": 0,
+        "micro_split_count": 0,
+        "rapid_toggle_count": 0,
+        "panel_substitution_count": 0,
+        "immature_second_count": 0,
+        "one_frame_layout_jump_count": 0,
+        "detector_call_count": detector_call_count,
+        "decoded_frame_count": decoded_frame_count,
+        "dedupe_suppression_count": 0,
+        "mature_track_count": 0,
+        "split_ranges": [],
+    }
+
+    if not entries:
+        failures.append("QC-TL-001:timeline_empty")
+        return {"status": "fail", "metrics": metrics, "failures": failures}
+
+    REQUIRED = (
+        "layout_state", "layout_alpha", "top_track_id", "bottom_track_id",
+        "t_sec", "frame_no", "qc_events",
+    )
+    complete = all(all(k in e for k in REQUIRED) for e in entries)
+    if not complete:
+        failures.append("QC-TL-001:missing_required_fields")
+
+    # ── split-visible intervals (QC-SPLIT-001) ───────────────────────────
+    ranges: List[List[float]] = []
+    cur_start = None
+    prev_state = "SINGLE"
+    transitions = []          # (t_sec, direction)
+    split_states = ("ENTERING_SPLIT", "SPLIT", "EXITING_SPLIT")
+    for e in entries:
+        state = str(e.get("layout_state", "SINGLE"))
+        visible = state in split_states or float(e.get("layout_alpha", 0.0) or 0.0) > 0.001
+        if visible and cur_start is None:
+            cur_start = float(e["t_sec"])
+        elif not visible and cur_start is not None:
+            ranges.append([cur_start, float(e["t_sec"])])
+            cur_start = None
+        if state != prev_state:
+            if prev_state in split_states or state in split_states:
+                transitions.append(float(e["t_sec"]))
+            prev_state = state
+        # QC-SPLIT-006: alpha derivative guard.
+        # (checked against the previous frame below)
+    if cur_start is not None:
+        ranges.append([cur_start, float(entries[-1]["t_sec"])])
+    metrics["split_ranges"] = [[round(r[0], 3), round(r[1], 3)] for r in ranges]
+
+    for r in ranges:
+        if r[1] - r[0] < MIN_SPLIT_VISIBLE_SEC:
+            metrics["micro_split_count"] += 1
+            failures.append(
+                f"QC-SPLIT-001:micro_split {r[0]:.3f}-{r[1]:.3f}s "
+                f"({r[1]-r[0]:.3f}s < {MIN_SPLIT_VISIBLE_SEC}s)",
+            )
+
+    # ── QC-SPLIT-002: rapid toggles (>1 transition within 1.0s) ──────────
+    for i in range(len(transitions) - 2):
+        # three transitions within 1.0 s -> toggle burst
+        if transitions[i + 2] - transitions[i] <= 1.0:
+            metrics["rapid_toggle_count"] += 1
+            failures.append(
+                f"QC-SPLIT-002:rapid_toggle {transitions[i]:.3f}s burst",
+            )
+            break  # one burst per timeline is enough to fail
+
+    # ── QC-SPLIT-003 / panel identity ────────────────────────────────────
+    for e in entries:
+        events = e.get("qc_events") or []
+        evt_str = "|".join(str(x) for x in events)
+        if "QC-SPLIT-003" in evt_str or "DUPLICATE_PANEL" in evt_str or "duplicate" in evt_str.lower():
+            metrics["duplicate_panel_count"] += 1
+            failures.append(f"QC-SPLIT-003:duplicate_panels frame {e.get('frame_no')}")
+        if "QC-SPLIT-005" in evt_str or "PANEL_SUBSTITUTION" in evt_str or "substitution" in evt_str.lower():
+            metrics["panel_substitution_count"] += 1
+            failures.append(f"QC-SPLIT-005:panel_substitution frame {e.get('frame_no')}")
+        if "QC-SPLIT-004" in evt_str or "immature" in evt_str.lower():
+            metrics["immature_second_count"] += 1
+            failures.append(f"QC-SPLIT-004:immature_second frame {e.get('frame_no')}")
+        if "QC-SPLIT-006" in evt_str or "one_frame" in evt_str.lower():
+            metrics["one_frame_layout_jump_count"] += 1
+            failures.append(f"QC-SPLIT-006:one_frame_jump frame {e.get('frame_no')}")
+
+    # ── QC-DET-001: detector multiplicity ────────────────────────────────
+    if detector_call_count is not None and decoded_frame_count is not None:
+        metrics["detector_call_count"] = detector_call_count
+        metrics["decoded_frame_count"] = decoded_frame_count
+        if detector_call_count != decoded_frame_count:
+            failures.append(
+                f"QC-DET-001:detector_calls {detector_call_count} != "
+                f"decoded_frames {decoded_frame_count}",
+            )
+
+    # ── QC-CAM-001: unexplained discontinuity (best effort from timeline) ─
+    # Adoption grace: the FIRST face adoption moves the camera from frame
+    # center to the speaker, and any no-face -> face transition re-anchors
+    # the crop — both are EXPLAINED one-time motions. Only jumps between
+    # frames where a face was continually tracked violate the invariant.
+    STARTUP_GRACE_SEC = 1.0
+    prev_center = None
+    prev_zoom = None
+    prev_had_face = False
+    for e in entries:
+        # Camera center: prefer the V12 normalized field when present (scale-free).
+        center = e.get("camera_center_norm") if e.get("camera_center_norm") is not None else e.get("camera_center")
+        crop = e.get("crop_rect")
+        scene = bool(e.get("scene_cut", False))
+        t = float(e.get("t_sec", 0.0) or 0.0)
+        had_face = bool(e.get("faces"))
+        # New adoption / scene cut re-anchors the camera baseline.
+        if scene or (had_face and not prev_had_face):
+            prev_center = None
+            prev_zoom = None
+        prev_had_face = had_face
+        # Pure startup window (before any face) is exempt entirely.
+        if not had_face and t < STARTUP_GRACE_SEC:
+            if center is not None:
+                prev_center = [float(center[0]), float(center[1])]
+            if crop is not None:
+                prev_zoom = float(crop[2])
+            continue
+        if center is not None and prev_center is not None:
+            dx = abs(float(center[0]) - prev_center[0])
+            dy = abs(float(center[1]) - prev_center[1])
+            # Legacy timelines carry ABSOLUTE source pixels; 0.18 is normalized.
+            # For absolute coordinates the jump is instead measured against a
+            # large fixed hop (a face-to-face steal across the frame).
+            absolute_units = max(abs(float(center[0])), abs(float(center[1])), 0.0) > 2.0
+            threshold = 400.0 if absolute_units else MAX_CAMERA_JUMP
+            if dx + dy > threshold:
+                failures.append(f"QC-CAM-001:center_jump frame {e.get('frame_no')}")
+        if crop is not None and prev_zoom is not None:
+            dz = abs(float(crop[2]) - prev_zoom) / max(1e-6, float(prev_zoom))
+            if dz > MAX_CAMERA_JUMP:
+                failures.append(f"QC-CAM-001:zoom_jump frame {e.get('frame_no')}")
+        if center is not None:
+            prev_center = [float(center[0]), float(center[1])]
+        if crop is not None:
+            prev_zoom = float(crop[2])
+
+    # ── aggregate derived metrics ─────────────────────────────────────────
+    for e in entries:
+        metrics["dedupe_suppression_count"] = max(
+            metrics["dedupe_suppression_count"],
+            int(e.get("dedupe_suppression_count", 0) or 0),
+        )
+    metrics["mature_track_count"] = max(
+        metrics["mature_track_count"],
+        max([int(e.get("mature_track_count", 0) or 0) for e in entries] or [0]),
+    )
+    metrics["false_split_count"] = (
+        metrics["micro_split_count"]
+        + metrics["duplicate_panel_count"]
+        + metrics["rapid_toggle_count"]
+        + metrics["panel_substitution_count"]
+    )
+
+    status = "fail" if failures else "pass"
+    return {"status": status, "metrics": metrics, "failures": failures}

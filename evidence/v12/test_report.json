@@ -1,0 +1,18 @@
+{
+  "brief": "renderer-v12-false-split-flicker-closure",
+  "command": ".venv/Scripts/python.exe -m pytest -q",
+  "python": "3.11 (uv cpython-3.11-windows-x86_64-none)",
+  "environment": "Windows 11 host; repo AI-Youtube-Shorts-Generator",
+  "totals": {
+    "passed": 224,
+    "subtests_passed": 44,
+    "failed": 0,
+    "skipped": 0,
+    "setup_errors": 0
+  },
+  "v12_suites": {
+    "test_renderer_v12_identity.py": "T01-T10 (19 cases ran green; see live totals)",
+    "test_renderer_v12_integration.py": "T11-T15 + QC fail-closed cases"
+  },
+  "note": "Totals captured from local run before final SHA; exact-SHA CI totals recorded in ci_run_metadata.json"
+}

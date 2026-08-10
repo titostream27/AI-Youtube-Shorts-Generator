@@ -1,0 +1,146 @@
+{
+  "source": "short_01.mp4",
+  "width": 1080,
+  "height": 1920,
+  "fps": 24.964689265536723,
+  "decode_frames": 707,
+  "events": [
+    {
+      "id": "E1",
+      "t_start": 5.127,
+      "t_end": 5.127,
+      "duration_s": 0.04,
+      "frames": [
+        128
+      ],
+      "kinds": [
+        "micro"
+      ],
+      "dup_likelihood": 0.08,
+      "severity": "FAIL"
+    },
+    {
+      "id": "E2",
+      "t_start": 10.375,
+      "t_end": 10.415,
+      "duration_s": 0.08,
+      "frames": [
+        259,
+        260
+      ],
+      "kinds": [
+        "micro"
+      ],
+      "dup_likelihood": 0.041,
+      "severity": "FAIL"
+    },
+    {
+      "id": "E3",
+      "t_start": 10.655,
+      "t_end": 10.695,
+      "duration_s": 0.08,
+      "frames": [
+        266,
+        267
+      ],
+      "kinds": [
+        "micro"
+      ],
+      "dup_likelihood": 0.163,
+      "severity": "FAIL"
+    },
+    {
+      "id": "E4",
+      "t_start": 18.706,
+      "t_end": 18.706,
+      "duration_s": 0.04,
+      "frames": [
+        467
+      ],
+      "kinds": [
+        "micro"
+      ],
+      "dup_likelihood": 0.002,
+      "severity": "FAIL"
+    },
+    {
+      "id": "E5",
+      "t_start": 21.871,
+      "t_end": 21.911,
+      "duration_s": 0.08,
+      "frames": [
+        546,
+        547
+      ],
+      "kinds": [
+        "micro"
+      ],
+      "dup_likelihood": 0.12,
+      "severity": "FAIL"
+    },
+    {
+      "id": "E6",
+      "t_start": 22.111,
+      "t_end": 22.111,
+      "duration_s": 0.04,
+      "frames": [
+        552
+      ],
+      "kinds": [
+        "micro"
+      ],
+      "dup_likelihood": 0.068,
+      "severity": "FAIL"
+    },
+    {
+      "id": "E7",
+      "t_start": 24.234,
+      "t_end": 24.234,
+      "duration_s": 0.04,
+      "frames": [
+        605
+      ],
+      "kinds": [
+        "micro"
+      ],
+      "dup_likelihood": 0.102,
+      "severity": "FAIL"
+    }
+  ],
+  "metrics": {
+    "false_split_count": 8,
+    "micro_split_count": 7,
+    "rapid_toggle_count": 1,
+    "duplicate_panel_count": 0,
+    "split_ranges": [
+      [
+        5.127,
+        5.127
+      ],
+      [
+        10.375,
+        10.415
+      ],
+      [
+        10.655,
+        10.695
+      ],
+      [
+        18.706,
+        18.706
+      ],
+      [
+        21.871,
+        21.911
+      ],
+      [
+        22.111,
+        22.111
+      ],
+      [
+        24.234,
+        24.234
+      ]
+    ]
+  }
+}
