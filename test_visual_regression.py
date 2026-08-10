@@ -16,9 +16,15 @@ import os
 import sys
 import unittest
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import cv2
+try:
+    import cv2
+    HAS_CV2 = True
+except Exception:  # noqa: BLE001
+    HAS_CV2 = False
 
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "visual")
 EXPECTED_SCENARIOS = [
@@ -45,6 +51,7 @@ def _probe(path: str):
     return {"fps": fps, "frames": frames, "width": width, "height": height}
 
 
+@pytest.mark.skipif(not HAS_CV2, reason="opencv-python not installed (CI parity: requirements.txt only)")
 class TestVisualFixtures(unittest.TestCase):
     def test_all_scenarios_exist_and_are_valid_video(self):
         for name in EXPECTED_SCENARIOS:

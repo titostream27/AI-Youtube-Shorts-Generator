@@ -1,2 +1,16 @@
 requests>=2.31
 python-dotenv>=1.0
+# shorts_generator.local.clipper imports numpy at module load (Phase split
+# commit e72d107). Without it, CI (pip install -r requirements.txt) fails at
+# pytest collection with ModuleNotFoundError: numpy. This is a production
+# dependency, not a test-only one.
+numpy>=1.26
+# V12 (RV12-F09/G1): pytest was NOT in requirements and new runner images no
+# longer preinstall it — "Run all discovered tests" failed with
+# ModuleNotFoundError. The CI must install its own test runner.
+pytest>=8.0
+# V12 (RV12-F09/G1): the discovery suite imports the FastAPI service modules;
+# new runner images no longer preinstall fastapi/pydantic.
+fastapi>=0.110
+pydantic>=2.0
+httpx>=0.27

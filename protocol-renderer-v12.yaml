@@ -1,0 +1,78 @@
+# Brief Renderer V12 — False Split Flicker Closure: frozen protocol
+# Document version 1.0 | Review 2026-08-10 Asia/Jakarta
+# Scope: renderer tracking/layout/QC/CI only. Miner timestamps and semantic
+# boundaries are immutable.
+
+protocol:
+  id: renderer-v12-false-split-flicker-closure
+  scope: [tracking, layout, qc, ci]
+  immutable: [miner_timestamps, miner_semantic_boundaries]
+
+baseline:
+  reviewed_sha: 1a04a5e155a643ac415336dfce4be1d544e0570d
+  evidence_mp4: 8742824594050385273.mp4   # 28.388 s; 512x910; H.264
+  public_shorts: https://www.youtube.com/shorts/OBKLg6JKvio
+  clusters_approx_sec: [10.4, 16.0, 17.9, 22.1, 24.0]
+
+architecture:
+  authority:
+    detection: DetectionSnapshot      # one YuNet call per decoded frame (R-01)
+    identity:  TrackStore             # persistent IDs, maturity, TTL (R-03)
+    layout:    LayoutController       # SINGLE/ENTERING/SPLIT/EXITING (R-05)
+    camera:    CameraPlanner          # consumes layout + stable boxes only
+    qc:        quality_gate.evaluate_layout_timeline  # fail-closed (RV12-F07)
+  forbidden:
+    - separate immediate split logic inside blur_background
+    - second face-detection call for cur_faces
+    - inferring two people from raw list length
+    - threshold-only patches
+
+thresholds:                       # frozen defaults (env-overridable)
+  dedupe_iou: 0.35                # R-02
+  dedupe_center_ratio: 0.60       # R-02 (center_distance / max face width)
+  mature_hit_ratio: 0.20          # R-03 consecutive_hits >= max(3, ceil(.2*fps))
+  split_confirm_sec: 0.45         # R-04/R-05 qualification window
+  split_transition_sec: 0.30      # R-05 smootherstep (0.25..0.35 window)
+  split_lost_grace_sec: 0.60      # R-06 miss hold
+  min_center_sep: 0.80            # R-04 center separation (face-width units)
+  max_panel_iou: 0.15             # R-04/R-07
+  size_min_ratio: 0.45            # R-04 comparable size
+  size_max_ratio: 2.2             # R-04 comparable size
+  reaction_hold_sec: 2.5          # R-05 min hold for REACTION reason
+
+states:
+  - SINGLE
+  - ENTERING_SPLIT
+  - SPLIT
+  - EXITING_SPLIT
+
+reasons:
+  - REACTION
+  - PERSISTENT_TWO_PERSON
+  - DUPLICATE_PANEL_IDENTITY
+  - PANEL_SUBSTITUTION
+  - SECOND_LOST
+  - SCENE_CUT_RESET
+
+qc_invariants:                    # all blocking (fail-closed)
+  QC-SPLIT-001: micro_split < 0.40 s
+  QC-SPLIT-002: more than one SINGLE<->SPLIT transition within 1.0 s
+  QC-SPLIT-003: duplicate panels (same ID or geometric duplicate)
+  QC-SPLIT-004: split entered before maturity/confirmation
+  QC-SPLIT-005: locked panel ID changes without full exit+re-entry
+  QC-SPLIT-006: one-frame layout jump (alpha derivative / missing transition)
+  QC-DET-001:  YuNet call count != decoded frame count
+  QC-CAM-001:  unexplained crop center/zoom discontinuity
+  QC-TL-001:   timeline incomplete (missing required per-frame fields)
+
+regression_tests:
+  - T01..T18  # see section 8 of the brief; T01-T10 identity/state,
+              # T11-T15 production path, T16-T18 evidence/CI
+
+cache:
+  profile_bump: true              # tracker-v4 -> tracker-v5, +layout-v1, pipeline v4-0
+  sidecar_policy: missing-or-old timeline sidecar invalidates the entry
+
+ci:
+  requirements_working_directory: AI-Youtube-Shorts-Generator  # RV12-F09 fix
+  discovery: pytest auto-collects all test_*.py

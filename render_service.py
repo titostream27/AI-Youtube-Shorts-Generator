@@ -1142,12 +1142,14 @@ def readyz():
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
         out_ok = True
-        import ctypes
-        fb = ctypes.c_ulonglong(0)
-        ok = ctypes.windll.kernel32.GetDiskFreeSpaceExW(
-            str(RENDER_ROOT.resolve()), None, None, ctypes.byref(fb),
-        )
-        free_bytes = int(fb.value) if ok else None
+        # V12 (RV12-F09): ctypes.windll is Windows-only and broke the
+        # readiness probe on Linux runners. shutil.disk_usage is portable.
+        try:
+            import shutil
+            free_bytes = int(shutil.disk_usage(str(RENDER_ROOT.resolve())).free)
+        except Exception as exc:  # noqa: BLE001
+            free_bytes = None
+            out_error = f"disk_usage:{type(exc).__name__}: {exc}"
     except Exception as exc:  # noqa: BLE001
         out_error = f"{type(exc).__name__}: {exc}"
         ready = False
@@ -2821,6 +2823,21 @@ def _render(request, job_id: str) -> RenderOutcome:
             try:
                 from quality_gate import quality_gate
                 qc = quality_gate(out_path)
+                # V12 (RV12-F07): fail-closed timeline QC. The frame-level
+                # layout invariants (micro-split/duplicate/toggle/detector
+                # multiplicity) are evaluated inside the cropper; when they
+                # fail, the artifact must NOT be publishable even if the
+                # file-level gate passed.
+                _v12 = (getattr(timeline, "stats", {}) or {}).get("v12_timeline_qc") or {}
+                if _v12.get("status") == "fail":
+                    qc = {
+                        "status": "fail",
+                        "quality_score": 0,
+                        "checks": qc.get("checks", {}),
+                        "warnings": list(qc.get("warnings", [])) + [
+                            f"V12 {f}" for f in _v12.get("failures", [])[:6]
+                        ],
+                    }
                 _apply_qc_to_artifact(artifact, item, qc, mode)
                 artifact.qc.upscale_factor = _estimate_upscale(source, output_w, output_h)
             except Exception as e:  # noqa: BLE001
@@ -3148,13 +3165,12 @@ def render_health():
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
         out_ok = True
-        import ctypes
-        free_bytes = ctypes.c_ulonglong(0)
-        ok = ctypes.windll.kernel32.GetDiskFreeSpaceExW(
-            str(RENDER_ROOT.resolve()),
-            None, None, ctypes.byref(free_bytes),
-        )
-        free_bytes = int(free_bytes.value) if ok else None
+        # V12 (RV12-F09): portable disk usage (ctypes.windll is Windows-only).
+        try:
+            free_bytes = int(shutil.disk_usage(str(RENDER_ROOT.resolve())).free)
+        except Exception as exc:  # noqa: BLE001
+            free_bytes = None
+            out_error = f"disk_usage:{type(exc).__name__}: {exc}"
     except Exception as e:  # noqa: BLE001
         out_error = f"{type(e).__name__}: {e}"
     # 5. Contract version + build id.
