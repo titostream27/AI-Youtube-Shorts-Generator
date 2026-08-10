@@ -3,16 +3,26 @@
   "command": ".venv/Scripts/python.exe -m pytest -q",
   "python": "3.11 (uv cpython-3.11-windows-x86_64-none)",
   "environment": "Windows 11 host; repo AI-Youtube-Shorts-Generator",
-  "totals": {
+  "totals_local_full_venv": {
     "passed": 224,
     "subtests_passed": 44,
     "failed": 0,
-    "skipped": 0,
-    "setup_errors": 0
+    "skipped": 0
+  },
+  "totals_ci_minimal_venv": {
+    "passed": 220,
+    "subtests_passed": 28,
+    "failed": 0,
+    "skipped": 4,
+    "note": "4 skipped = cv2/ffmpeg-dependent visual suites (not installed in CI requirements)"
   },
   "v12_suites": {
-    "test_renderer_v12_identity.py": "T01-T10 (19 cases ran green; see live totals)",
-    "test_renderer_v12_integration.py": "T11-T15 + QC fail-closed cases"
+    "test_renderer_v12_identity.py": "T01-T10 (10 tests)",
+    "test_renderer_v12_integration.py": "T11-T15 + QC fail-closed cases (9 tests)"
   },
-  "note": "Totals captured from local run before final SHA; exact-SHA CI totals recorded in ci_run_metadata.json"
+  "final_ci": {
+    "run_id": "31354729422",
+    "conclusion": "success",
+    "totals": "220 passed, 4 skipped, 1 warning, 28 subtests passed"
+  }
 }

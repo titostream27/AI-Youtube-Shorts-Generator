@@ -71,17 +71,25 @@ Corrected render metrics (renderer-owned):
 
 ## Tests
 
-- Local full suite: **224 passed + 44 subtests passed, 0 failed, 0 skipped** (includes the new
-  `test_renderer_v12_identity.py` T01–T10 and `test_renderer_v12_integration.py` T11–T15).
+- Local full suite (host venv): **224 passed + 44 subtests passed, 0 failed, 0 skipped**.
+- CI-mirror venv (requirements.txt only, no opencv): **220 passed + 28 subtests passed, 4 skipped**
+  (the 4 skips are the cv2/ffmpeg-dependent visual suites, identical to CI behavior).
+- Exact-SHA CI run **31354729422 — SUCCESS**: 220 passed, 4 skipped, 28 subtests passed.
 - Negative fixtures T02/T03/T04/T06/T14/T15 fail on the OLD behavior (duplicate detections
   admitted instantly; injected micro-splits pass) and pass after the implementation.
-- `evidence/v12/test_report.json` and `evidence/v12/ci_run_metadata.json` track env/CI totals.
+- `evidence/v12/test_report.json` and `evidence/v12/ci_run_metadata.json` record env/CI totals.
 
 ## CI
 
 - Requirement step now runs `python -m pip install -r requirements.txt` with
-  `working-directory: AI-Youtube-Shorts-Generator`; discovery-based `pytest -q`.
-- Exact final SHA + run URL: recorded in `evidence/v12/ci_run_metadata.json` after the run finishes.
+  `working-directory: AI-Youtube-Shorts-Generator` (RV12-F09).
+- Discovery-based `pytest -q`; `requirements.txt` gained pytest/fastapi/pydantic/httpx because the
+  new GitHub runner images no longer preinstall them.
+- Miner contract pin moved to the FULL SHA `84c5e3e80a3381ce0e85bc8e6f9a09c3f4353047` (the short
+  ref became unresolvable after a miner force-push; the commit was restored as
+  `refs/tags/renderer-pinned-contracts-v11`).
+- Readiness/health probes now use `shutil.disk_usage` instead of Windows-only `ctypes.windll`.
+- Final main SHA `16a89dadb18193acc52946757eaca15f83d342ac` (PR #2 merged).
 
 ## Cache (R-09)
 
@@ -102,8 +110,10 @@ Corrected render metrics (renderer-owned):
 
 ## Verdict
 
-Every automated gate (G0–G10, G12) is green on local evidence; G11 (full human playback) and G13
-(exact-SHA CI) complete after the CI run referenced above. When those land: **Renderer V12 false
-split closure complete for the locked regression corpus**; single-person false split is structurally
-impossible in the blur-background + reaction paths, while genuine two-person splits still enter after
-confirmation (T05), hold through misses (T06/T08), and exit smoothly (T07).
+G0–G10, G12, G13 green: evidence JSONs, timeline sidecar QC, and exact-SHA CI run
+31354729422 (SUCCESS, 220 passed / 4 skipped / 28 subtests) support closure. G11 (full human
+0.25×/1× playback) remains for the human reviewer before publishing the corrected clip. With that:
+**Renderer V12 false split closure complete for the locked regression corpus** — single-person
+false split is structurally impossible in the blur-background + reaction paths, while genuine
+two-person splits still enter after confirmation (T05), hold through misses (T06/T08), and exit
+smoothly (T07).
