@@ -63,7 +63,7 @@ jobs:
         working-directory: AI-Youtube-Shorts-Generator
         run: |
           mkdir -p evidence/v12r/tests
-          python -m pytest -q --junitxml=evidence/v12r/tests/pytest-junit.xml -rs > evidence/v12r/tests/pytest-run.log 2>&1
+          python -m pytest -q --junitxml=evidence/v12r/tests/pytest-junit.xml -rs --tb=short 2>&1 | tee evidence/v12r/tests/pytest-run.log
           tail -5 evidence/v12r/tests/pytest-run.log
           python - <<'EOF'
           import xml.etree.ElementTree as ET, json, os
