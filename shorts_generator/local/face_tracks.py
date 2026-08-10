@@ -22,7 +22,10 @@ from typing import Dict, List, Optional
 # Frozen defaults (protocol-renderer-v12.yaml).
 FACE_MATCH_DISTANCE = float(os.getenv("RENDER_FACE_MATCH_DISTANCE", "1.65"))
 TRACK_ASSIGNMENT_MARGIN = float(os.getenv("RENDER_TRACK_ASSIGNMENT_MARGIN", "0.12"))
-FACE_TRACK_TTL_S = float(os.getenv("RENDER_FACE_TRACK_TTL_S", "0.45"))
+# V12R: TTL must be >= the split miss-grace (0.60 s) so a locked panel's
+# identity + last-valid box survive the whole grace window (R-06). 0.45 s
+# pruned the track mid-grace, silently substituting panel identity.
+FACE_TRACK_TTL_S = float(os.getenv("RENDER_FACE_TRACK_TTL_S", "0.75"))
 FACE_BOX_EMA = float(os.getenv("RENDER_FACE_BOX_EMA", "0.28"))
 MATURE_HIT_RATIO = float(os.getenv("RENDER_TRACK_MATURE_RATIO", "0.20"))
 MIN_MATURE_HITS = int(os.getenv("RENDER_TRACK_MIN_MATURE_HITS", "3"))

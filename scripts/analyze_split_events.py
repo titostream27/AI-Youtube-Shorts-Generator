@@ -27,11 +27,18 @@ MIN_SPLIT_VISIBLE_SEC = 0.40
 RAPID_TOGGLE_WINDOW_SEC = 1.0
 MIN_FACE_H = 60        # ignore tiny detector blobs
 MIN_FACE_SCORE = 0.5
+MIN_SPLIT_FRAMES = 2   # V12R: panel signature must persist >= 2 frames
 
 
 def _split_visible(faces, frame_h):
-    """Heuristic: two comparable faces, one in the top half, one in the
-    bottom half, roughly aligned horizontally (the false-split signature)."""
+    """Heuristic: the SPLIT-PANEL signature (V12R — tightened).
+
+    A true (false-)split render shows TWO boxes at panel scale: top panel
+    face center in the top band, bottom panel face in the bottom band, x
+    aligned, and — critically — NEARLY EQUAL face sizes, because split
+    panels render both crops at the same scale. A natural multi-person
+    single view (speaker + smaller guest) fails the equality test.
+    """
     if len(faces) < 2:
         return False
     big = [f for f in faces if f["h"] >= MIN_FACE_H and f["score"] >= MIN_FACE_SCORE]
@@ -39,15 +46,20 @@ def _split_visible(faces, frame_h):
         return False
     top = min(big, key=lambda f: f["cy"])
     bottom = max(big, key=lambda f: f["cy"])
-    if top["cy"] > frame_h * 0.45 or bottom["cy"] < frame_h * 0.55:
+    # Panel bands: top panel's face center lives in the upper 42%, the
+    # bottom panel's face in the lower 58% (55/45 split, centered).
+    if top["cy"] > frame_h * 0.42 or bottom["cy"] < frame_h * 0.58:
         return False
-    # Horizontal alignment: x-centers within 1.5x the larger face width.
+    # Panel alignment: both panels share the frame's horizontal center, so
+    # the two face x-centers must be ALMOST equal (<= 0.25 face width). A
+    # natural two-person view has people at different horizontal positions.
     max_w = max(top["w"], bottom["w"])
-    if abs(top["cx"] - bottom["cx"]) > max_w * 1.5:
+    if abs(top["cx"] - bottom["cx"]) > max_w * 0.25:
         return False
-    # Comparable size: ratio within [0.55, 1.8].
+    # Panel equality: both panels scale faces EQUALLY. A guest sitting in
+    # frame is smaller or bigger by a lot — reject that as a split.
     ratio = max(top["w"], bottom["w"]) / max(1.0, min(top["w"], bottom["w"]))
-    if not (0.55 <= ratio <= 1.8):
+    if not (0.72 <= ratio <= 1.39):
         return False
     return True
 
@@ -138,6 +150,9 @@ def analyze(path, fps_hint=None):
             cur = None
     if cur is not None:
         ranges.append([cur, len(per_frame) - 1])
+    # V12R: a panel signature must PERSIST >= MIN_SPLIT_FRAMES; single-frame
+    # detector blips are not evidence of a rendered layout.
+    ranges = [r for r in ranges if (r[1] - r[0] + 1) >= MIN_SPLIT_FRAMES]
 
     events = []
     micro = 0

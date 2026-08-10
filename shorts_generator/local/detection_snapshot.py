@@ -121,6 +121,61 @@ def dedupe_detections(
     return kept, suppressed
 
 
+class ScriptedDetectionProvider:
+    """V12R-F03: deterministic detection seam for visual scenario tests.
+
+    Reads a JSON file: {frame_no: [face...]} where each face is
+    {"cx","cy","w","h","score"} (lm optional). Used ONLY when the env var
+    RENDER_DETECTION_SCRIPT points at it — production never sets it. The
+    provider keeps the same single-call-per-frame contract (call_count) and
+    applies the same geometric de-duplication, so scenario tests exercise the
+    REAL decoder/tracker/layout/timeline path deterministically.
+    """
+
+    def __init__(self, script_path: str, src_w: int = 0, src_h: int = 0) -> None:
+        import json as _json
+
+        with open(script_path, "r", encoding="utf-8") as _f:
+            self._script: Dict[str, List[Dict]] = _json.load(_f)
+        self.src_w = src_w
+        self.src_h = src_h
+        self.call_count = 0
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    def detect(self, frame, frame_no: int, t_sec: float, scene_cut: bool) -> DetectionSnapshot:
+        self.call_count += 1
+        raw = self._script.get(str(frame_no), [])
+        faces: List[Dict] = []
+        for f in raw:
+            cx = float(f.get("cx", 0))
+            cy = float(f.get("cy", 0))
+            w = float(f.get("w", 0))
+            h = float(f.get("h", 0))
+            lm = f.get("lm")
+            if lm is not None:
+                lm = [(float(p[0]), float(p[1])) for p in lm]
+            faces.append({
+                "cx": cx,
+                "cy": cy,
+                "w": w,
+                "h": h,
+                "lm": lm,
+                "score": float(f.get("score", 0.9)),
+            })
+        deduped, suppressed = dedupe_detections(faces)
+        return DetectionSnapshot(
+            frame_no=frame_no,
+            t_sec=t_sec,
+            scene_cut=scene_cut,
+            faces=deduped,
+            raw_face_count=len(faces),
+            dedupe_suppression_count=suppressed,
+        )
+
+
 def _yunet_min_score() -> float:
     return float(os.getenv("RENDER_YUNET_MIN_SCORE", str(YUNET_MIN_SCORE)))
 

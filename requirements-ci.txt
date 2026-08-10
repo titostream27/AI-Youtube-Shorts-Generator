@@ -1,0 +1,9 @@
+# Brief Renderer V12R — CI/test dependency set (V12R-F03).
+# Pinned and reviewed; the visual path must EXECUTE in CI, so OpenCV is a
+# hard test dependency here. The main requirements.txt (deployment) stays
+# lean; CI installs this file instead.
+-r requirements.txt
+
+# opencv-python-headless bundles an FFmpeg build usable by cv2.VideoCapture/
+# VideoWriter. Pinned for deterministic CI behavior (visual scenario suite).
+opencv-python-headless==4.10.0.84

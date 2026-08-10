@@ -191,6 +191,7 @@ class LayoutController:
         self.bottom_last_box: Optional[List[float]] = None
         self.pending_reason: Optional[LayoutReason] = None
         self.pending_candidate_id: Optional[int] = None
+        self.pending_active_id: Optional[int] = None
         self.confirm_streak = 0
         self.grace_miss = 0
         self.hold_frames = 0
@@ -231,8 +232,10 @@ class LayoutController:
             dt = 1.0 / self.fps
         events: List[str] = []
 
-        # T09 / R-05: hard scene cut -> reset tracks; never inherit a panel.
-        if scene_cut and self.state != LayoutState.SINGLE:
+        # V12R-F05 / R-05: a hard scene cut unconditionally resets the
+        # controller — pending confirmation, streaks, locks, boxes and
+        # transition counters MUST NOT survive the cut, regardless of state.
+        if scene_cut:
             events.append(f"{QC_SPLIT_005_PANEL_SUBSTITUTION}:scene_cut_reset")
             self._reset(LayoutReason.SCENE_CUT_RESET, events)
 
@@ -255,14 +258,24 @@ class LayoutController:
     ) -> LayoutDecision:
         # ── SINGLE ─────────────────────────────────────────────────────────
         if self.state == LayoutState.SINGLE:
-            # REQUIREMENT: qualification must persist the full confirmation
-            # window before entry (T03/T04: transient duplicates never admit).
+            # V12R-F04: confirmation is bound to ONE identity pair
+            # (candidate track_id, reason) AND to the active speaker.
+            # Any change resets the streak (reference logic, brief §2).
+            active_id = active_track.get("track_id") if active_track else None
+            if active_id != self.pending_active_id:
+                self.confirm_streak = 0
+                self.pending_candidate_id = None
+                self.pending_reason = None
+                self.pending_active_id = active_id
             if second_candidate is not None and reason is not None:
                 ok, why = self._qualify(active_track, second_candidate, reason)
-                if ok:
+                cand_key = (second_candidate.get("track_id"), reason)
+                if ok and cand_key == (self.pending_candidate_id, self.pending_reason):
                     self.confirm_streak += 1
+                elif ok:
                     self.pending_candidate_id = second_candidate.get("track_id")
                     self.pending_reason = reason
+                    self.confirm_streak = 1
                 else:
                     self.confirm_streak = 0
                     self.pending_candidate_id = None
@@ -289,18 +302,37 @@ class LayoutController:
 
         # ── ENTERING_SPLIT ────────────────────────────────────────────────
         if self.state == LayoutState.ENTERING_SPLIT:
-            # If qualification is lost before entry completes -> back to SINGLE.
+            # V12R-F04/ENTERING: locked panel identities are IMMUTABLE —
+            # revalidate that the active speaker and the second candidate
+            # still ARE the locked top/bottom tracks. Candidate substitution
+            # aborts entry (controlled return to SINGLE), never continues.
             ok = True
             why = ""
             if second_candidate is not None and reason is not None:
                 ok, why = self._qualify(active_track, second_candidate, reason)
-            if not ok or self.top_track_id is None or self.bottom_track_id is None:
+            if self.top_track_id is None or self.bottom_track_id is None:
+                ok = False
+                why = "unlocked_identity"
+            elif active_track is None or active_track.get("track_id") != self.top_track_id:
+                ok = False
+                why = "active_substituted"
+            elif second_candidate is None or second_candidate.get("track_id") != self.bottom_track_id:
+                ok = False
+                why = "candidate_substituted"
+            if not ok:
                 self.confirm_streak = 0
                 self.state = LayoutState.SINGLE
                 self.alpha = 0.0
                 self.pending_candidate_id = None
                 self.pending_reason = None
-                events.append("QC-SPLIT-006:entering_aborted")
+                # Full identity hygiene: no locked panel survives the abort.
+                self.top_track_id = None
+                self.bottom_track_id = None
+                self.top_last_box = None
+                self.bottom_last_box = None
+                self.locked_reason = None
+                self._transition_progress = 0
+                events.append(f"QC-SPLIT-005:entering_aborted:{why}")
                 return self._decision(active_track, second_candidate, events)
             self.alpha = smootherstep(self._transition_progress / self.transition_frames)
             if self.alpha >= 1.0:
@@ -417,6 +449,7 @@ class LayoutController:
         self.bottom_last_box = None
         self.pending_candidate_id = None
         self.pending_reason = None
+        self.pending_active_id = None
         self.locked_reason = None
         self.confirm_streak = 0
         self.grace_miss = 0

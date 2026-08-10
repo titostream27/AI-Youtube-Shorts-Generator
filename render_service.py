@@ -100,6 +100,47 @@ def _aspect_ratio_from(request) -> str:
     return ratio or "9:16"
 
 
+def merge_qc_verdict(qc: dict, v12: Optional[dict], mode: str) -> dict:
+    """V12R-F02: merge the renderer timeline-QC verdict into the artifact QC.
+
+    Truth table (FINAL / clip modes):
+      v12 status  -> result
+      pass        -> keep existing qc
+      (anything else: fail, unavailable, missing, empty, malformed)
+                  -> qc status=fail (blocking; not publishable)
+    Preview mode downgrades to warn and marks the artifact not publishable.
+    Returns a NEW dict; the input dict is not mutated.
+    """
+    qc = {**qc}
+    warnings = list(qc.get("warnings", []) or [])
+    v12 = v12 or {}
+    status = v12.get("status")
+    failures = list(v12.get("failures", []) or [])
+    blocking = status != "pass"
+    if mode != "final" and mode != "clip":
+        # preview: degrade instead of hard fail
+        if status == "pass":
+            return qc
+        if status is None:
+            warnings.append("timeline QC malformed (not publishable)")
+        elif status == "unavailable":
+            warnings.append("timeline QC unavailable (not publishable)")
+        else:
+            warnings.append(f"timeline QC {status} (not publishable)")
+        out = {**qc, "warnings": warnings}
+        out["publishable"] = False
+        return out
+    if blocking:
+        failures = failures or [f"QC-TL-001:missing_status ({status!r})"]
+        return {
+            "status": "fail",
+            "quality_score": 0,
+            "checks": qc.get("checks", {}),
+            "warnings": warnings + [f"V12 {f}" for f in failures[:6]],
+        }
+    return {**qc, "warnings": warnings}
+
+
 def _estimate_upscale(source_path: str, out_w: int, out_h: int) -> float:
     """Approximate the upscale factor from source to output (brief §23)."""
     try:
@@ -2823,21 +2864,11 @@ def _render(request, job_id: str) -> RenderOutcome:
             try:
                 from quality_gate import quality_gate
                 qc = quality_gate(out_path)
-                # V12 (RV12-F07): fail-closed timeline QC. The frame-level
-                # layout invariants (micro-split/duplicate/toggle/detector
-                # multiplicity) are evaluated inside the cropper; when they
-                # fail, the artifact must NOT be publishable even if the
-                # file-level gate passed.
-                _v12 = (getattr(timeline, "stats", {}) or {}).get("v12_timeline_qc") or {}
-                if _v12.get("status") == "fail":
-                    qc = {
-                        "status": "fail",
-                        "quality_score": 0,
-                        "checks": qc.get("checks", {}),
-                        "warnings": list(qc.get("warnings", [])) + [
-                            f"V12 {f}" for f in _v12.get("failures", [])[:6]
-                        ],
-                    }
+                # V12R-F02: fail-closed merge — ANY timeline QC state other
+                # than pass blocks the FINAL artifact (missing, malformed,
+                # unavailable, fail all demote to status=fail).
+                _v12 = (getattr(timeline, "stats", {}) or {}).get("v12_timeline_qc")
+                qc = merge_qc_verdict(qc, _v12, mode)
                 _apply_qc_to_artifact(artifact, item, qc, mode)
                 artifact.qc.upscale_factor = _estimate_upscale(source, output_w, output_h)
             except Exception as e:  # noqa: BLE001

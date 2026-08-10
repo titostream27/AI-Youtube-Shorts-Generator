@@ -1,0 +1,48 @@
+{
+  "generator": "scripts/gen_visual_fixtures.py",
+  "command": "python scripts/gen_visual_fixtures.py",
+  "generated_at_utc": "2026-08-10T14:37:20.483490+00:00",
+  "fps": 30,
+  "size": [
+    1280,
+    720
+  ],
+  "files": {
+    "single_speaker.mp4": {
+      "sha256": "163812ebc6666b1fda4cf85e66c62e1585b40f9e32e7493a98677bac978d4432",
+      "detections_sha256": "dd8eabe0a954a226acbeacc288d581469712e22daa18ec1778efa80884f57398"
+    },
+    "duplicate_box_burst.mp4": {
+      "sha256": "908ae4d22e13438172b8fb90f4b7891111bca515daf0159a7f50f7dd765c5c72",
+      "detections_sha256": "47ed0a42b6222f6034eb602bae304363b58722707b3c4d2dd4c3efc112be53c0"
+    },
+    "rotating_false_ids.mp4": {
+      "sha256": "ed25ae5f83dc67f53b80482cccaf4dc0d4ef78bb61ff54b65d79a4f2cd66bf2e",
+      "detections_sha256": "f992876f1b92390ce69db6c531395f6cbd1bab02a46dd50c7d345674ff9f354b"
+    },
+    "two_real_speakers.mp4": {
+      "sha256": "146ed53160855e97f8fa8edf900a2322b7fb2d43d4b7225eb2c332ea20c930a8",
+      "detections_sha256": "3b58d11deb5218b8605c04a9b8d47581e9d2e60936104e72cbb7321f1ba3bb3a"
+    },
+    "miss_and_return.mp4": {
+      "sha256": "d73e031191dfaa3d8afe0ac9f4841ed781e954fa01b0548e93623dcf74e3294e",
+      "detections_sha256": "f0cb45bcc4936d49815518bd15b7ebead820ab1a64e818f5f00f60147f8e9ab8"
+    },
+    "hard_cut_during_pending.mp4": {
+      "sha256": "249f0d5a414447cecea12dbf5c32d123272af5e4de5a9b55285fae807e0a055e",
+      "detections_sha256": "5e394906dd0290312c11b9858797e47ecb93e33d80117efe23fb278c934035cf"
+    },
+    "hard_cut_during_split.mp4": {
+      "sha256": "7b71d70d8354d44d1df824d524ff2c0a1f2c3d8830301dc46a3ddd1e21dcd831",
+      "detections_sha256": "48705bff44aa7a7921505d3f1670a0ceddf8a7b05ecd0cbcfbaddd14f55009eb"
+    },
+    "reaction_positive.mp4": {
+      "sha256": "56f48cb41b9b9462c3bf722befa081b40210afafc266c032fcebd1eb231839f6",
+      "detections_sha256": "c516daf6d03011d9cf4be436dcef9a91c6d105e0776c45b3b76ceb5c9925cffe"
+    },
+    "low_light.mp4": {
+      "sha256": "33c99951b1a962e3631269e9c5950104d083c320478cc8dc24d06c8b4473b12a",
+      "detections_sha256": "dd8eabe0a954a226acbeacc288d581469712e22daa18ec1778efa80884f57398"
+    }
+  }
+}

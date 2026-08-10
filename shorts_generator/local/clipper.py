@@ -14,7 +14,10 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 # ── Brief Renderer V12: single-detection / track-store / layout-controller ──
-from .detection_snapshot import YuNetDetectionProvider  # noqa: E402
+from .detection_snapshot import (
+    YuNetDetectionProvider,
+    ScriptedDetectionProvider,  # V12R-F03 deterministic CI seam
+)
 from .face_tracks import TrackStore  # noqa: E402
 from .layout_controller import LayoutController, LayoutReason, LayoutState  # noqa: E402
 
@@ -624,7 +627,14 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
     # ── Brief Renderer V12: one detection snapshot per frame (R-01). The
     # provider is the ONLY caller of YuNet inside the frame loop; TrackStore
     # owns persistent identity + maturity; LayoutController owns layout.
-    _detection_provider = YuNetDetectionProvider(yunet, src_w, src_h, min_score=YUNET_MIN_SCORE)
+    # V12R-F03: deterministic CI seam — RENDER_DETECTION_SCRIPT=<json>
+    # substitutes scripted detections (frame_no -> faces) so visual scenario
+    # tests run the REAL decoder/tracker/layout/timeline path in CI.
+    _script_path = os.getenv("RENDER_DETECTION_SCRIPT")
+    if _script_path:
+        _detection_provider = ScriptedDetectionProvider(_script_path, src_w, src_h)
+    else:
+        _detection_provider = YuNetDetectionProvider(yunet, src_w, src_h, min_score=YUNET_MIN_SCORE)
     _track_store = TrackStore(fps=fps)
     _layout_ctrl = LayoutController(fps=fps)
 
@@ -1568,7 +1578,7 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         # cx,cy is the TARGET (from focus/anti-shake). The virtual camera is a
         # smoothed current position with time-based easing, dead zone, and a
         # per-second speed limit. Normalize by crop size so it scales.
-        now_t = time.time()
+        now_t = frame_no / max(fps, 1)  # V12R-F07: deterministic media time
         dt = 0.0 if prev_frame_time is None else min(0.2, max(0.001, now_t - prev_frame_time))
         prev_frame_time = now_t
 
@@ -2023,8 +2033,19 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
                 f"invariants: {_v12_qc['failures'][:4]}",
                 flush=True,
             )
-    except Exception:  # noqa: BLE001 — QC availability must never crash render
-        _rctx.stats["v12_timeline_qc"] = {"status": "unavailable", "metrics": {}, "failures": []}
+    except Exception as exc:  # noqa: BLE001 — QC availability must never
+        # crash the render, BUT V12R-F02: a crashed/absent timeline QC is
+        # a BLOCKING failure. Record state=fail (never unavailable-as-pass).
+        _rctx.stats["v12_qc_failed"] = True
+        _rctx.stats["v12_timeline_qc"] = {
+            "status": "fail",
+            "metrics": {},
+            "failures": [f"QC-TL-001:unavailable {type(exc).__name__}: {exc}"],
+        }
+        print(
+            f"[qc:v12] FAIL QC-TL-001 unavailable ({type(exc).__name__}: {exc})",
+            flush=True,
+        )
     # Close any split interval still open at the end of the clip.
     if _rctx.split_ranges and _rctx.split_ranges[-1][1] is None:
         _rctx.split_ranges[-1][1] = frame_no / max(fps, 1)
@@ -2117,10 +2138,15 @@ def _default_profile_version() -> str:
         # V12: tracker bumped 4 -> 5 (TrackStore maturity/duplicate suppression)
         # + dedicated layout version (LayoutController state machine). Any
         # change invalidates the faulty split cache (R-09).
-        f"-tracker-v{os.getenv('RENDER_TRACKER_VERSION', '5')}"
-        f"-layout-v{os.getenv('RENDER_LAYOUT_VERSION', '1')}"
+        # V12R: tracker 5 -> 6 (TTL >= miss-grace 0.75 s keeps panel
+        # identity through the whole grace window), layout 1 -> 2
+        # (identity-contiguous confirmation, unconditional scene-cut reset,
+        # ENTERING revalidation, deterministic dt), pipeline v4-0 -> v4-1
+        # (alpha-derivative QC, fail-closed merge, zero-skip visual CI).
+        f"-tracker-v{os.getenv('RENDER_TRACKER_VERSION', '6')}"
+        f"-layout-v{os.getenv('RENDER_LAYOUT_VERSION', '2')}"
         f"-encoder-{os.getenv('RENDER_ENCODER_VERSION', 'h264')}"
-        f"-pipeline-{os.getenv('RENDER_PIPELINE_VERSION', 'v4-0')}"
+        f"-pipeline-{os.getenv('RENDER_PIPELINE_VERSION', 'v4-1')}"
     )
 
 

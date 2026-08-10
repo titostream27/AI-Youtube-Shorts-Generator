@@ -358,11 +358,12 @@ def evaluate_layout_timeline(
             ranges.append([cur_start, float(e["t_sec"])])
             cur_start = None
         if state != prev_state:
-            if prev_state in split_states or state in split_states:
+            # V12R-F10: QC-SPLIT-002 counts ONLY SINGLE <-> visible toggles.
+            # Internal ENTERING->SPLIT / SPLIT->EXITING transitions are part
+            # of one smooth motion and must not be counted as toggles.
+            if (state == "SINGLE") != (prev_state == "SINGLE"):
                 transitions.append(float(e["t_sec"]))
             prev_state = state
-        # QC-SPLIT-006: alpha derivative guard.
-        # (checked against the previous frame below)
     if cur_start is not None:
         ranges.append([cur_start, float(entries[-1]["t_sec"])])
     metrics["split_ranges"] = [[round(r[0], 3), round(r[1], 3)] for r in ranges]
@@ -374,6 +375,40 @@ def evaluate_layout_timeline(
                 f"QC-SPLIT-001:micro_split {r[0]:.3f}-{r[1]:.3f}s "
                 f"({r[1]-r[0]:.3f}s < {MIN_SPLIT_VISIBLE_SEC}s)",
             )
+
+    # ── QC-SPLIT-006 (V12R-F06): per-frame alpha derivative guard ────────
+    # Any |d alpha| per frame above the smootherstep cap fails, EXCEPT a
+    # documented scene reset (entry flag scene_cut=True). ENTERING must be
+    # monotone non-decreasing, EXITING monotone non-increasing.
+    prev_alpha: Optional[float] = None
+    prev_s_state: Optional[str] = None
+    for e in entries:
+        state = str(e.get("layout_state", "SINGLE"))
+        alpha = float(e.get("layout_alpha", 0.0) or 0.0)
+        if state == "SINGLE" and alpha <= 0.001:
+            prev_alpha = None
+            prev_s_state = None
+            continue
+        if prev_alpha is not None and not e.get("scene_cut", False):
+            delta = abs(alpha - prev_alpha)
+            if delta > MAX_ALPHA_DELTA_PER_FRAME:
+                metrics["one_frame_layout_jump_count"] += 1
+                failures.append(
+                    f"QC-SPLIT-006:alpha_jump frame {e.get('frame_no')} "
+                    f"delta={delta:.3f}",
+                )
+            if prev_s_state == state and state == "ENTERING_SPLIT" and alpha < prev_alpha - 1e-6:
+                metrics["one_frame_layout_jump_count"] += 1
+                failures.append(
+                    f"QC-SPLIT-006:entering_not_monotone frame {e.get('frame_no')}",
+                )
+            if prev_s_state == state and state == "EXITING_SPLIT" and alpha > prev_alpha + 1e-6:
+                metrics["one_frame_layout_jump_count"] += 1
+                failures.append(
+                    f"QC-SPLIT-006:exiting_not_monotone frame {e.get('frame_no')}",
+                )
+        prev_alpha = alpha
+        prev_s_state = state
 
     # ── QC-SPLIT-002: rapid toggles (>1 transition within 1.0s) ──────────
     for i in range(len(transitions) - 2):
@@ -393,6 +428,10 @@ def evaluate_layout_timeline(
             metrics["duplicate_panel_count"] += 1
             failures.append(f"QC-SPLIT-003:duplicate_panels frame {e.get('frame_no')}")
         if "QC-SPLIT-005" in evt_str or "PANEL_SUBSTITUTION" in evt_str or "substitution" in evt_str.lower():
+            # V12R: DOCUMENTED legal transitions are NOT substitutions —
+            # scene-cut reset (brief §3) and second-lost-after-grace (R-06).
+            if "scene_cut_reset" in evt_str.lower() or "second_lost_after_grace" in evt_str.lower():
+                continue
             metrics["panel_substitution_count"] += 1
             failures.append(f"QC-SPLIT-005:panel_substitution frame {e.get('frame_no')}")
         if "QC-SPLIT-004" in evt_str or "immature" in evt_str.lower():

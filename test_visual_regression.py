@@ -51,7 +51,9 @@ def _probe(path: str):
     return {"fps": fps, "frames": frames, "width": width, "height": height}
 
 
-@pytest.mark.skipif(not HAS_CV2, reason="opencv-python not installed (CI parity: requirements.txt only)")
+# V12R-F03: the visual suite must NEVER skip on missing cv2 in CI.
+# Import failure == test failure (opencv comes from requirements-ci.txt).
+# noqa: F401,E402  — used by _probe and subTests below.
 class TestVisualFixtures(unittest.TestCase):
     def test_all_scenarios_exist_and_are_valid_video(self):
         for name in EXPECTED_SCENARIOS:

@@ -35,19 +35,48 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install production requirements FAIL-FAST (brief v5 9.1 / V12 RV12-F09)
+      - name: Install test requirements FAIL-FAST (brief v5 9.1 / V12R-F03)
         working-directory: AI-Youtube-Shorts-Generator
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-ci.txt
+
+      # V12R-F03: media binaries MUST be present before pytest. A missing
+      # binary fails setup — visual suites never skip.
+      - name: Verify ffmpeg/ffprobe (fail setup, not skip)
+        working-directory: AI-Youtube-Shorts-Generator
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
+      # V12R-F03: deterministic visual fixtures generated before pytest.
+      - name: Generate deterministic visual fixtures
+        working-directory: AI-Youtube-Shorts-Generator
+        run: python scripts/gen_visual_fixtures.py
 
       # Brief v7 C13: discovery-based CI — pytest auto-collects every
       # test_*.py instead of a hand-maintained list that silently misses
       # new suites (test_hardening_v7, test_state_v7, test_visual_v7,
       # test_ops_v7, ...).
-      - name: Run all discovered tests
+      - name: Run all discovered tests (JUnit + skip report)
         working-directory: AI-Youtube-Shorts-Generator
-        run: python -m pytest -q
+        run: |
+          mkdir -p evidence/v12r/tests
+          python -m pytest -q --junitxml=evidence/v12r/tests/pytest-junit.xml -rs > evidence/v12r/tests/pytest-run.log 2>&1
+          tail -5 evidence/v12r/tests/pytest-run.log
+          python - <<'EOF'
+          import xml.etree.ElementTree as ET, json, os
+          p = "evidence/v12r/tests/pytest-junit.xml"
+          t = ET.parse(p).getroot()
+          tot = {k: int(t.attrib.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          skipped = [tc.attrib.get("name") for ts in t.iter("testsuite") for tc in ts.iter("testcase") if tc.find("skipped") is not None]
+          with open("evidence/v12r/tests/pytest-summary.json", "w") as f:
+              json.dump({"totals": tot, "skipped": skipped}, f, indent=2)
+          with open("evidence/v12r/tests/skip-report.txt", "w") as f:
+              f.write("\n".join(skipped) or "(no skips)")
+          EOF
+          test "$(python -c 'import json;print(json.load(open(\"evidence/v12r/tests/pytest-summary.json\"))[\"totals\"][\"skipped\"])')" -eq 0
 
       - name: Shared contract fixtures must be present (fail, not skip)
         working-directory: AI-Youtube-Shorts-Generator

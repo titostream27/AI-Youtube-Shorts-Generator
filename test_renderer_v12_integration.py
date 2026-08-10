@@ -107,9 +107,11 @@ class TestV12Integration(unittest.TestCase):
 
     def test_t13_cache_profile_bump_and_sidecar_parity(self):
         from shorts_generator.local import clipper
-        # R-09: profile bump invalidates the faulty cached split output.
-        self.assertIn("tracker-v5", clipper._default_profile_version())
-        self.assertIn("layout-v1", clipper._default_profile_version())
+        # R-09 / V12R-6: profile bump invalidates the faulty cached output;
+        # V12R bumped tracker-v5->v6, layout-v1->v2, pipeline v4-0->v4-1.
+        self.assertIn("tracker-v6", clipper._default_profile_version())
+        self.assertIn("layout-v2", clipper._default_profile_version())
+        self.assertIn("pipeline-v4-1", clipper._default_profile_version())
         # Timeline sidecar round-trip is total (decisions/QC preserved).
         import json
         import tempfile
