@@ -2,9 +2,30 @@
   "brief": "renderer-v12-false-split-flicker-closure",
   "branch": "fix/renderer-v12-false-split-flicker-closure (merged to main)",
   "pr": "https://github.com/titostream27/AI-Youtube-Shorts-Generator/pull/2",
-  "final_main_sha": "16a89dadb18193acc52946757eaca15f83d342ac",
-  "ci_run_id": "31354729422",
-  "ci_run_url": "https://github.com/titostream27/AI-Youtube-Shorts-Generator/actions/runs/31354729422",
-  "job_conclusions": "success",
-  "test_totals_from_ci": "220 passed, 4 skipped, 1 warning, 28 subtests passed"
+  "code_head_tested": "0bfffdef (final main after merge + evidence; code identical to CI-verified df81d270)",
+  "final_main_sha": "0bfffdef",
+  "ci_runs": [
+    {
+      "run_id": "31354729422",
+      "sha": "df81d270",
+      "event": "pull_request",
+      "conclusion": "success",
+      "totals": "220 passed, 4 skipped, 1 warning, 28 subtests passed",
+      "url": "https://github.com/titostream27/AI-Youtube-Shorts-Generator/actions/runs/31354729422"
+    },
+    {
+      "run_id": "31354977263",
+      "sha": "16a89dad",
+      "event": "push (merge to main)",
+      "conclusion": "success"
+    },
+    {
+      "run_id": "31355112596",
+      "sha": "0bfffdef",
+      "event": "push (final main head)",
+      "conclusion": "success",
+      "url": "https://github.com/titostream27/AI-Youtube-Shorts-Generator/actions/runs/31355112596"
+    }
+  ],
+  "job_conclusions": "success (all three runs)"
 }
