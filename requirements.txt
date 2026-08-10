@@ -9,3 +9,7 @@ numpy>=1.26
 # longer preinstall it — "Run all discovered tests" failed with
 # ModuleNotFoundError. The CI must install its own test runner.
 pytest>=8.0
+# V12 (RV12-F09/G1): the discovery suite imports the FastAPI service modules;
+# new runner images no longer preinstall fastapi/pydantic.
+fastapi>=0.110
+pydantic>=2.0
