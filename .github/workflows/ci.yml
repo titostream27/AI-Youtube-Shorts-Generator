@@ -24,7 +24,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: titostream27/youtube-content-miner
-          ref: 84c5e3e
+          # V12 (RV12-F09/G1): pin the FULL SHA. The miner history was
+          # force-pushed on 2026-08-10 and the short ref 84c5e3e became
+          # unresolvable; the commit is restored as the tag
+          # refs/tags/renderer-pinned-contracts-v11 so this checkout works.
+          ref: 84c5e3e80a3381ce0e85bc8e6f9a09c3f4353047
           path: content-miner
 
       - uses: actions/setup-python@v5
