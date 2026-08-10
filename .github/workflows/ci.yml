@@ -50,10 +50,13 @@ jobs:
           ffmpeg -version | head -1
           ffprobe -version | head -1
 
-      # V12R-F03: deterministic visual fixtures generated before pytest.
+      # V12R-F03: deterministic visual fixtures generated before pytest
+      # (both the legacy suite and the V12R scenario suite).
       - name: Generate deterministic visual fixtures
         working-directory: AI-Youtube-Shorts-Generator
-        run: python scripts/gen_visual_fixtures.py
+        run: |
+          python scripts/make_visual_fixtures.py fixtures/visual
+          python scripts/gen_visual_fixtures.py
 
       # Brief v7 C13: discovery-based CI — pytest auto-collects every
       # test_*.py instead of a hand-maintained list that silently misses
@@ -63,6 +66,7 @@ jobs:
         working-directory: AI-Youtube-Shorts-Generator
         run: |
           mkdir -p evidence/v12r/tests
+          set -o pipefail
           python -m pytest -q --junitxml=evidence/v12r/tests/pytest-junit.xml -rs --tb=short 2>&1 | tee evidence/v12r/tests/pytest-run.log
           tail -5 evidence/v12r/tests/pytest-run.log
           python - <<'EOF'
@@ -76,7 +80,9 @@ jobs:
           with open("evidence/v12r/tests/skip-report.txt", "w") as f:
               f.write("\n".join(skipped) or "(no skips)")
           EOF
-          test "$(python -c 'import json;print(json.load(open(\"evidence/v12r/tests/pytest-summary.json\"))[\"totals\"][\"skipped\"])')" -eq 0
+          SKIPS=$(python -c "import json;print(json.load(open('evidence/v12r/tests/pytest-summary.json'))['totals']['skipped'])")
+          echo "blocking skips: ${SKIPS}"
+          test "${SKIPS}" -eq 0
 
       - name: Shared contract fixtures must be present (fail, not skip)
         working-directory: AI-Youtube-Shorts-Generator
