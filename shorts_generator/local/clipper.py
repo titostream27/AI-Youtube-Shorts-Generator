@@ -1613,6 +1613,19 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, emphasis_e
         cx = camera_cur[0] * crop_w
         cy = camera_cur[1] * crop_h
 
+        # QC-CAM-001 (V12R-FIX): the timeline must record the SMOOTHED camera
+        # position actually used for this frame's crop, not the raw face
+        # target. A disappearing secondary face snaps the TARGET, but the
+        # rendered crop glides (speed-limited EMA) — flagging the target
+        # produced spurious QC-CAM-001 failures on multi-speaker podcasts.
+        if _rctx.frames:
+            _fw = max(1, frame.shape[1])
+            _fh = max(1, frame.shape[0])
+            _rctx.frames[-1]["camera_center_norm"] = [
+                float(cx) / _fw, float(cy) / _fh
+            ]
+            _rctx.frames[-1]["camera_center"] = [float(cx), float(cy)]
+
 
         # Phase: reaction-gated split screen.
         # ------------------------------------------------------------------
