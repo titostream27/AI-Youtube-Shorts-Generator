@@ -460,6 +460,7 @@ def evaluate_layout_timeline(
     prev_center = None
     prev_zoom = None
     prev_had_face = False
+    prev_speaker_id = None
     for e in entries:
         # Camera center: prefer the V12 normalized field when present (scale-free).
         center = e.get("camera_center_norm") if e.get("camera_center_norm") is not None else e.get("camera_center")
@@ -467,8 +468,17 @@ def evaluate_layout_timeline(
         scene = bool(e.get("scene_cut", False))
         t = float(e.get("t_sec", 0.0) or 0.0)
         had_face = bool(e.get("faces"))
-        # New adoption / scene cut re-anchors the camera baseline.
-        if scene or (had_face and not prev_had_face):
+        # V12R-FIX: a focus/speaker switch re-anchors the crop the same way a
+        # scene cut does — the camera follows a DIFFERENT person by design.
+        # Without this, multi-speaker podcasts fail QC-CAM-001 spuriously.
+        speaker_switched = (
+            e.get("active_speaker_id") is not None
+            and prev_speaker_id is not None
+            and e.get("active_speaker_id") != prev_speaker_id
+        )
+        prev_speaker_id = e.get("active_speaker_id")
+        # New adoption / scene cut / speaker switch re-anchors the camera.
+        if scene or speaker_switched or (had_face and not prev_had_face):
             prev_center = None
             prev_zoom = None
         prev_had_face = had_face

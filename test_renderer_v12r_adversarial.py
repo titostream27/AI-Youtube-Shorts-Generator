@@ -308,6 +308,50 @@ class TestVisualCiNotSkipped:
         assert gen.exists(), "deterministic fixture generator missing"
 
 
+class TestQcCameraFocusSwitch:
+    """V12R-FIX: a legitimate speaker switch must NOT fail QC-CAM-001."""
+
+    def _entries_with_switch(self):
+        entries = []
+        for i in range(60):
+            speaker = 0 if i < 30 else 1
+            entries.append({
+                "frame_no": i,
+                "t_sec": round(i / 30.0, 4),
+                "layout_state": "SINGLE",
+                "layout_alpha": 0.0,
+                "top_track_id": None,
+                "bottom_track_id": None,
+                "qc_events": [],
+                "scene_cut": False,
+                "faces": [{"track_id": speaker}],
+                "active_speaker_id": speaker,
+                "camera_center_norm": [0.3, 0.4] if i < 30 else [0.65, 0.55],
+            })
+        return entries
+
+    def test_speaker_switch_does_not_fail_camera_jump(self):
+        from quality_gate import evaluate_layout_timeline
+
+        entries = self._entries_with_switch()
+        r = evaluate_layout_timeline(entries, detector_call_count=60, decoded_frame_count=60)
+        assert not any("QC-CAM-001" in f for f in r["failures"]), r["failures"]
+
+    def test_unexplained_jump_still_fails_camera_jump(self):
+        from quality_gate import evaluate_layout_timeline
+
+        entries = self._entries_with_switch()
+        # Frame 30 = speaker 1 (post-switch). Frame 31 stays speaker 1 but
+        # the center jumps enormously WITHOUT a scene cut/adoption — that is
+        # an unexplained discontinuity and must still fail.
+        entries[30]["active_speaker_id"] = 1
+        entries[30]["camera_center_norm"] = [0.65, 0.55]
+        entries[31]["active_speaker_id"] = 1
+        entries[31]["camera_center_norm"] = [0.95, 0.95]
+        r = evaluate_layout_timeline(entries, detector_call_count=60, decoded_frame_count=60)
+        assert any("QC-CAM-001" in f for f in r["failures"]), r["failures"]
+
+
 class TestCorrectedMediaEvidence:
     """V12R-F08: corrected media must reconcile sidecar and pixels."""
 
