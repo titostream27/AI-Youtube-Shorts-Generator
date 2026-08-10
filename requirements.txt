@@ -5,3 +5,7 @@ python-dotenv>=1.0
 # pytest collection with ModuleNotFoundError: numpy. This is a production
 # dependency, not a test-only one.
 numpy>=1.26
+# V12 (RV12-F09/G1): pytest was NOT in requirements and new runner images no
+# longer preinstall it — "Run all discovered tests" failed with
+# ModuleNotFoundError. The CI must install its own test runner.
+pytest>=8.0
