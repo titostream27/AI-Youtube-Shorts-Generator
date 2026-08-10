@@ -1,0 +1,32 @@
+{
+  "gate": "G11",
+  "procedure": "brief V12R section 6 — must be performed on the EXACT file whose SHA-256 is in the evidence manifest (evidence/v12r/corrected/final_output_probe.json). Reviewing a YouTube transcode, proxy, timeline JSON, or another encode does NOT close this gate.",
+  "output_file": "rendered/acfb043f5a/short_01.mp4",
+  "output_sha256": "f42708dfcd8e10bfc78f143feba27135a5ef1b589489c3767e8de668f5b7b659",
+  "playback_steps": ["0.25x full playback", "1x full playback", "anchor replay around mapped anchors", "frame stepping around every automated transition"],
+  "anchors_corrected_timebase": {
+    "a1_from_baseline_5.177s_upload": "4.36s (5.177/28.388*23.92)",
+    "a2_from_baseline_10.487s_upload": "8.84s (10.487/28.388*23.92)",
+    "a3_mid": "12.0s",
+    "a4_end": "23.5s",
+    "frames": "evidence/v12r/review/anchor-frames/"
+  },
+  "automated_transitions": "NONE — timeline reports 717 frames, all SINGLE (split_ranges [])",
+  "reject_if": [
+    "any one-frame panel flash, duplicate person, focus loss, abrupt crop/zoom, stale panel, black frame, unexplained layout change",
+    "any visible blink, identity swap, caption collision, A/V sync defect",
+    "any recurrence/ambiguous frame around anchors",
+    "alpha/layout changes outside the state machine, or pixels disagree with the sidecar"
+  ],
+  "review_record": {
+    "reviewer": "",
+    "timestamp_utc": "",
+    "player": "",
+    "frame_stepping_available": false,
+    "result_0_25x": "PENDING",
+    "result_1x": "PENDING",
+    "result_anchors": "PENDING",
+    "result_frame_step": "PENDING",
+    "defects": []
+  }
+}

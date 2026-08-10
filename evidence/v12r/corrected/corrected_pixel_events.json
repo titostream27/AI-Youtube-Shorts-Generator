@@ -1,0 +1,15 @@
+{
+  "source": "short_01.mp4",
+  "width": 1080,
+  "height": 1920,
+  "fps": 29.97,
+  "decode_frames": 717,
+  "events": [],
+  "metrics": {
+    "false_split_count": 0,
+    "micro_split_count": 0,
+    "rapid_toggle_count": 0,
+    "duplicate_panel_count": 0,
+    "split_ranges": []
+  }
+}

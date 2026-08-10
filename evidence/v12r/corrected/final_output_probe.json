@@ -1,0 +1,14 @@
+{
+  "path": "rendered/acfb043f5a/short_01.mp4",
+  "codec_fourcc": "h264",
+  "width": 1080,
+  "height": 1920,
+  "fps": 29.97,
+  "fps_num": 29970,
+  "fps_den": 1000,
+  "decoded_frames": 717,
+  "duration_s": 23.923924,
+  "sha256": "f42708dfcd8e10bfc78f143feba27135a5ef1b589489c3767e8de668f5b7b659",
+  "timebase_note": "encoder converts 30 fps source cadence to constant 29.97 fps; frame count preserved (717)",
+  "renderer_sha_note": "final renderer SHA recorded in manifest after push (V12R-10)"
+}

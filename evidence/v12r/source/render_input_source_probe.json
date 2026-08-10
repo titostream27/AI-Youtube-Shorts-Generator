@@ -1,0 +1,12 @@
+{
+  "path": "rendered/source/source_vif8NQcjVf0_2160p.mp4",
+  "codec_fourcc": "AV01",
+  "width": 1920,
+  "height": 1080,
+  "fps": 29.97003,
+  "fps_num": 29970,
+  "fps_den": 1000,
+  "decoded_frames": 262488,
+  "duration_s": 8758.3496,
+  "sha256": "34a74ea5baa60e5ebc59b749df4bda684253caa380adb6b6d531d51d0abd3495"
+}

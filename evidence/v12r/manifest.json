@@ -1,0 +1,55 @@
+{
+  "source_file": "rendered/source/source_vif8NQcjVf0_2160p.mp4",
+  "source_sha256": "34a74ea5baa60e5ebc59b749df4bda684253caa380adb6b6d531d51d0abd3495",
+  "source_media": {
+    "width": 1920,
+    "height": 1080,
+    "fps": 29.97003,
+    "decoded_frames": 262488,
+    "duration_s": 8758.3496
+  },
+  "semantic_window": {
+    "clip_id": 1228,
+    "start_sec": 2050.5,
+    "end_sec": 2074.42,
+    "window_s": 23.92,
+    "immutable": "miner timestamps unchanged"
+  },
+  "uploaded_regression": {
+    "filename": "8742824594050385273.mp4",
+    "sha256": "7d04e1f566271f2d4dd61d816c031c789483a42ec64b0ac28e3d1d54403d41d7",
+    "media": "512x910, 850 frames, 28.388333 s, nominal 30 fps",
+    "status": "LOCKED from review brief; exact bytes await user re-upload for local re-hash"
+  },
+  "renderer": {
+    "profile": "camera-v3-caption-v2-tracker-v6-layout-v2-encoder-h264-pipeline-v4-1",
+    "cache_miss_proof": "cache key includes tracker-v6/layout-v2/pipeline-v4-1; previous outputs cached under tracker-v5/layout-v1/pipeline-v4-0 \u2014 key differs => cache miss (fresh render job acfb043f5a)"
+  },
+  "output": {
+    "file": "rendered/acfb043f5a/short_01.mp4",
+    "sha256": "f42708dfcd8e10bfc78f143feba27135a5ef1b589489c3767e8de668f5b7b659",
+    "probe": "evidence/v12r/corrected/final_output_probe.json"
+  },
+  "timeline": {
+    "file": "evidence/v12r/corrected/final_timeline.json",
+    "sha256": "64d55d1d25b0f260e4748cde511d6fe6a6a1f5ad4ec45b26f45ca7280ddf08ba",
+    "qc": "evidence/v12r/corrected/corrected_timeline_qc.json"
+  },
+  "detector_accounting": {
+    "call_count": 717,
+    "decoded_frame_count": 717,
+    "equal": true
+  },
+  "analyzers": {
+    "sidecar_qc": "evidence/v12r/corrected/corrected_timeline_qc.json",
+    "pixel": "evidence/v12r/corrected/corrected_pixel_events.json",
+    "pixel_false_split_count": 0,
+    "sidecar_false_split_count": 0,
+    "frame_counts": {
+      "output": 717,
+      "pixel_analyzer": 717,
+      "sidecar": 717
+    }
+  },
+  "renderer_sha": "7277cdf16dc2bc0ec75b4ff52df3e48bc70df71c"
+}

@@ -1,0 +1,36 @@
+{
+  "source": "clip-1228-microwave-ai.mp4",
+  "width": 1080,
+  "height": 1920,
+  "fps": 24.964689265536723,
+  "decode_frames": 707,
+  "events": [
+    {
+      "id": "E1",
+      "t_start": 10.375,
+      "t_end": 10.415,
+      "duration_s": 0.08,
+      "frames": [
+        259,
+        260
+      ],
+      "kinds": [
+        "micro"
+      ],
+      "dup_likelihood": 0.041,
+      "severity": "FAIL"
+    }
+  ],
+  "metrics": {
+    "false_split_count": 1,
+    "micro_split_count": 1,
+    "rapid_toggle_count": 0,
+    "duplicate_panel_count": 0,
+    "split_ranges": [
+      [
+        10.375,
+        10.415
+      ]
+    ]
+  }
+}

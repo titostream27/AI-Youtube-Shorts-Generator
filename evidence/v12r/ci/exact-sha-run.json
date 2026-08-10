@@ -1,0 +1,7 @@
+{
+  "brief": "renderer-v12r-closure-repair",
+  "renderer_sha": "7277cdf16dc2bc0ec75b4ff52df3e48bc70df71c",
+  "evidence_commit_sha": "PENDING (final pushed main head — recorded externally after CI)",
+  "ci_run": "PENDING — recorded externally after the run finishes (brief V12R sect 8 order 10: no endless evidence-only commit loop)",
+  "expected": "244 passed + 44 subtests, 0 skipped, 0 failed (local full venv, V12R code)"
+}

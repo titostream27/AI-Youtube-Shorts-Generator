@@ -1,0 +1,18 @@
+{
+  "status": "pass",
+  "metrics": {
+    "false_split_count": 0,
+    "duplicate_panel_count": 0,
+    "micro_split_count": 0,
+    "rapid_toggle_count": 0,
+    "panel_substitution_count": 0,
+    "immature_second_count": 0,
+    "one_frame_layout_jump_count": 0,
+    "detector_call_count": 717,
+    "decoded_frame_count": 717,
+    "dedupe_suppression_count": 0,
+    "mature_track_count": 1,
+    "split_ranges": []
+  },
+  "failures": []
+}
