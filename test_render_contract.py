@@ -88,11 +88,13 @@ class TestV2Contract(unittest.TestCase):
             CaptionCue(start_sec=124.3, end_sec=125.48, text="a"),
             CaptionCue(start_sec=124.6, end_sec=126.12, text="b"),
             CaptionCue(start_sec=125.48, end_sec=127.88, text="c"),
+            CaptionCue(start_sec=127.0, end_sec=127.0, text="instant"),  # dropped
         ]
         req = RenderRequestV2(**req.model_dump())
         cues = req.clips[0].caption_plan.cues
         self.assertEqual(cues[1].start_sec, 125.48)  # clamped to prev end
         self.assertEqual(cues[2].start_sec, 126.12)  # clamped to max prev end
+        self.assertEqual(len(cues), 3)  # degenerate dropped
 
     def test_clip_boundary_overlap_still_rejected(self):
         req = make_v2()

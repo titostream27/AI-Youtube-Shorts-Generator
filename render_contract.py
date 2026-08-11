@@ -279,6 +279,7 @@ class RenderRequestV2(BaseModel):
                     f"{clip.layout_plan.preferred_layout!r}"
                 )
             last_cue_end = None
+            kept: List[CaptionCue] = []
             for cue in clip.caption_plan.cues:
                 if cue.start_sec < clip.start_sec or cue.end_sec > clip.end_sec:
                     raise ValueError(
@@ -287,6 +288,11 @@ class RenderRequestV2(BaseModel):
                         f"[{clip.start_sec},{clip.end_sec}]"
                     )
                 if cue.end_sec <= cue.start_sec:
+                    # Instantaneous cue (end==start) or inverted: drop it.
+                    # ASR occasionally emits zero-length artifacts and the
+                    # clamp below can collapse a cue to a point.
+                    if abs(cue.end_sec - cue.start_sec) < 0.001:
+                        continue
                     raise ValueError(
                         f"clip {clip.clip_id}: cue end_sec ({cue.end_sec}) must be > "
                         f"start_sec ({cue.start_sec})"
@@ -297,7 +303,12 @@ class RenderRequestV2(BaseModel):
                     # rejecting the whole clip: caption timing is a soft
                     # signal, clip boundaries stay strict.
                     cue.start_sec = last_cue_end
+                if cue.start_sec >= cue.end_sec - 0.001:
+                    # Degenerate after clamping (instantaneous cue): drop it.
+                    continue
                 last_cue_end = max(last_cue_end or 0, cue.end_sec)
+                kept.append(cue)
+            clip.caption_plan.cues = kept
             last_event_sec = None
             for ev in clip.editing_events:
                 if ev.time_sec < clip.start_sec or ev.time_sec > clip.end_sec:
