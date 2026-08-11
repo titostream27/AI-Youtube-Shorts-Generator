@@ -17,13 +17,14 @@ set RENDER_DEBUG_TRACK=1
 set RENDER_SPLIT=1
 set RENDER_SPLIT_FADE_S=0.3
 set RENDER_SPLIT_HOLD_S=2.5
+set RENDER_SPLIT_CONFIRM_SEC=0.8
 set RENDER_SPLIT_MOUTH_DELTA=0.15
 set RENDER_SPLIT_SINGLE_S=0.45
 
 REM ── Phase 1 (Correctness): persistent tracking + focus hysteresis ──
 set RENDER_FACE_MATCH_DISTANCE=1.65
 set RENDER_TRACK_ASSIGNMENT_MARGIN=0.12
-set RENDER_FACE_TRACK_TTL_S=0.45
+set RENDER_FACE_TRACK_TTL_S=1.0
 set RENDER_FACE_BOX_EMA=0.28
 set RENDER_FOCUS_SWITCH_CONFIRM_S=0.55
 set RENDER_FOCUS_MIN_HOLD_S=1.20
@@ -65,5 +66,7 @@ set RENDER_VIDEO_CRF=17
 set RENDER_VIDEO_PRESET=slow
 set RENDER_QC_MIN_SCORE=80
 set RENDER_QC_BLOCK_UPLOAD=1
+
+echo [env] TTL=%RENDER_FACE_TRACK_TTL_S% CONFIRM=%RENDER_SPLIT_CONFIRM_SEC% TASKSTARTED >> D:\homelab\hermes-workspace\AI-Youtube-Shorts-Generator\render-service.log
 
 ".venv\Scripts\python.exe" render_service.py >> D:\homelab\hermes-workspace\AI-Youtube-Shorts-Generator\render-service.log 2>&1

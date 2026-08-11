@@ -79,6 +79,31 @@ class TestV2Contract(unittest.TestCase):
         req = make_v2(mode="preview")
         self.assertEqual(req.mode, "preview")
 
+    def test_overlapping_asr_cues_are_clamped_not_rejected(self):
+        # YouTube ASR cues overlap slightly in real transcripts. The
+        # validator must clamp starts (soft signal), never reject the clip.
+        req = make_v2()
+        req.clips[0].end_sec = 130.0
+        req.clips[0].caption_plan.cues = [
+            CaptionCue(start_sec=124.3, end_sec=125.48, text="a"),
+            CaptionCue(start_sec=124.6, end_sec=126.12, text="b"),
+            CaptionCue(start_sec=125.48, end_sec=127.88, text="c"),
+        ]
+        req = RenderRequestV2(**req.model_dump())
+        cues = req.clips[0].caption_plan.cues
+        self.assertEqual(cues[1].start_sec, 125.48)  # clamped to prev end
+        self.assertEqual(cues[2].start_sec, 126.12)  # clamped to max prev end
+
+    def test_clip_boundary_overlap_still_rejected(self):
+        req = make_v2()
+        req.clips[0].caption_plan.cues = [
+            CaptionCue(start_sec=1.0, end_sec=5.0, text="a"),
+            CaptionCue(start_sec=4.0, end_sec=9.0, text="b"),
+        ]
+        req.clips[0].end_sec = 8.0
+        with self.assertRaises(ValueError):
+            RenderRequestV2(**req.model_dump())
+
     def test_v2_serializes_to_json(self):
         req = make_v2()
         data = req.model_dump_json()

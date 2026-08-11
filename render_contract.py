@@ -292,10 +292,11 @@ class RenderRequestV2(BaseModel):
                         f"start_sec ({cue.start_sec})"
                     )
                 if last_cue_end is not None and cue.start_sec < last_cue_end - 0.05:
-                    raise ValueError(
-                        f"clip {clip.clip_id}: cue [{cue.start_sec}] out of order "
-                        f"(previous ended {last_cue_end})"
-                    )
+                    # ASR (YouTube auto-captions) frequently has slightly
+                    # overlapping cue windows. Clamp the start instead of
+                    # rejecting the whole clip: caption timing is a soft
+                    # signal, clip boundaries stay strict.
+                    cue.start_sec = last_cue_end
                 last_cue_end = max(last_cue_end or 0, cue.end_sec)
             last_event_sec = None
             for ev in clip.editing_events:
